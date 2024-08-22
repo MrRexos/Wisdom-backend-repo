@@ -1,83 +1,63 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
-const mysql2 = require('mysql2');
-const bcrypt = require('bcrypt');
-const bodyParser = require('body-parser');
+const mysql = require('mysql2');
+require('dotenv').config();
+
 const app = express();
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
-// Crear el pool de conexiones a la base de datos
-const myPool = mysql2.createPool({
-    user: process.env.USER,
-    password: process.env.PASSWORD,
-    database: process.env.DATABASE,
-    host: process.env.HOST,
-    connectionLimit: 10
+// Configuración de la conexión a la base de datos
+const connection = mysql.createConnection({
+  host: process.env.HOST,
+  user: process.env.USER,
+  password: process.env.PASSWORD,
+  database: process.env.NAME
 });
 
-// Middleware para manejar JSON y URL encoded
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: false }));
-
-// Ruta de registro
-app.post('/signup', (req, res) => {
-    const email = req.body.email;
-    const password = req.body.password;
-
-    myPool.getConnection((err, poolConnection) => {
-        if (err) {
-            return res.status(500).send({ message: "Error connecting to the database" });
-        }
-
-        poolConnection.query('SELECT COUNT(*) AS EmailCount FROM user WHERE email = ?', [email], (err, results) => {
-            if (err) {
-                poolConnection.release();
-                console.error('Error selecting email count:', err);
-                return res.status(500).send({ message: "Error checking email" });
-            }
-
-            const emailCount = results[0].EmailCount;
-
-            if (emailCount > 0) {
-                poolConnection.release();
-                return res.status(400).send({ message: 'This email address is already associated with an account' });
-            }
-
-            const saltRounds = 10;
-            bcrypt.hash(password, saltRounds, (err, hashedPassword) => {
-                if (err) {
-                    poolConnection.release();
-                    console.error('Error hashing password:', err);
-                    return res.status(500).send({ message: "Error hashing password" });
-                }
-
-                poolConnection.query('INSERT INTO user (email, password, isActive) VALUES (?, ?, 1)', [email, hashedPassword], (err, insertResults) => {
-                    poolConnection.release();
-                    if (err) {
-                        console.error('Error inserting data into database:', err);
-                        return res.status(500).send({ message: "Error inserting user" });
-                    }
-
-                    res.status(201).send({ message: 'User registered successfully!' });
-                });
-            });
-        });
-    });
+// Conexión a la base de datos
+connection.connect((err) => {
+  if (err) {
+    console.error('Error al conectar a la base de datos:', err);
+    return;
+  }
+  console.log('Conectado a la base de datos MySQL.');
 });
 
-app.listen(PORT, () => {
-    console.log(`Server is listening on PORT: ${PORT}`);
+// Middleware para parsear JSON
+app.use(express.json());
+
+// Ruta de prueba
+app.get('/api/test', (req, res) => {
+  res.send('El backend está funcionando.');
 });
 
-
-
-app.get('/',function(req,res){
-    res.send({
-        message:'Default route'
-    });
+// Ruta para obtener usuarios
+app.get('/api/users', (req, res) => {
+  connection.query('SELECT * FROM user_account', (err, results) => {
+    if (err) {
+      console.error('Error al obtener usuarios:', err);
+      res.status(500).send('Error al obtener usuarios.');
+      return;
+    }
+    res.json(results);
+  });
 });
 
-app.listen(PORT,()=>{
-    console.log(`Listening on PORT: ${PORT}`)
+// Ruta para crear un nuevo usuario
+app.post('/api/users', (req, res) => {
+  const { first_name, last_name, username, email, password, profile_picture, language, allowNotis } = req.body;
+  const query = 'INSERT INTO user_account (first_name, last_name, username, email, password, profile_picture, language, allowNotis) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+  const values = [first_name, last_name, username, email, password, profile_picture, language, allowNotis];
+  connection.query(query, values, (err, results) => {
+    if (err) {
+      console.error('Error al crear el usuario:', err);
+      res.status(500).send('Error al crear el usuario.');
+      return;
+    }
+    res.status(201).send('Usuario creado.');
+  });
 });
 
+// Inicia el servidor
+app.listen(port, () => {
+  console.log(`Servidor escuchando en el puerto ${port}`);
+});
