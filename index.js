@@ -3,7 +3,7 @@ const mysql = require('mysql2');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3306;
 
 // Configuración de la conexión a la base de datos
 const connection = mysql.createConnection({
@@ -32,15 +32,15 @@ app.get('/api/test', (req, res) => {
 
 // Ruta para obtener usuarios
 app.get('/api/users', (req, res) => {
-  connection.query('SELECT * FROM user_account', (err, results) => {
-    if (err) {
-      console.error('Error al obtener usuarios:', err);
-      res.status(500).send('Error al obtener usuarios.');
-      return;
-    }
-    res.json(results);
+    connection.query('SELECT * FROM user_account', (err, results) => {
+      if (err) {
+        console.error('Error al obtener usuarios:', err);
+        res.status(500).json({ error: 'Error al obtener usuarios.' });
+        return;
+      }
+      res.json(results);
+    });
   });
-});
 
 // Ruta para crear un nuevo usuario
 app.post('/api/users', (req, res) => {
