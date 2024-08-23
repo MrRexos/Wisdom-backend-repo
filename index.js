@@ -1,9 +1,12 @@
+const bodyParser = require('body-parser');
 const express = require('express');
 const mysql = require('mysql2');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 3306;
+const port = process.env.PORT || 3000;
+
+app.use(bodyParser.json());
 
 // Configuración de la conexión a la base de datos
 const connection = mysql.createConnection({
