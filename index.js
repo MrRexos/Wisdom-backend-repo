@@ -6,7 +6,9 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Middleware para parsear JSON
 app.use(bodyParser.json());
+app.use(express.json());
 
 // Configuración de la conexión a la base de datos
 const connection = mysql.createConnection({
@@ -25,8 +27,7 @@ connection.connect((err) => {
   console.log('Conectado a la base de datos MySQL.');
 });
 
-// Middleware para parsear JSON
-app.use(express.json());
+
 
 // Ruta de prueba
 app.get('/', (req, res) => {
