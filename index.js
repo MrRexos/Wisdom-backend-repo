@@ -29,7 +29,7 @@ connection.connect((err) => {
 app.use(express.json());
 
 // Ruta de prueba
-app.get('/api/test', (req, res) => {
+app.get('/', (req, res) => {
   res.send('El backend está funcionando.');
 });
 
