@@ -25,6 +25,12 @@ app.get('/',function(req,res){
     });
 });
 
+app.post('/signup',function(req,res){
+    res.send({
+        message:'Signup method here!'
+    });
+}); 
+
 app.listen(PORT,()=>{
     console.log(`Listening on PORT: ${PORT}`)
 });
