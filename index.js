@@ -3,6 +3,8 @@ import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
 import mysql from 'mysql2';
 
+dotenv.config();
+
 const db = mysql.createPool({
   host: process.env.HOST,
   user: process.env.USER,
@@ -13,7 +15,6 @@ const db = mysql.createPool({
   queueLimit: 0
 });
 
-dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
