@@ -10,24 +10,16 @@ const port = process.env.PORT || 3000;
 app.use(bodyParser.json());
 app.use(express.json());
 
-// Configuración de la conexión a la base de datos
-const connection = mysql.createConnection({
+// Configuración del pool de conexiones a la base de datos
+const pool = mysql.createPool({
   host: process.env.HOST,
   user: process.env.USER,
   password: process.env.PASSWORD,
-  database: process.env.NAME
+  database: process.env.NAME,
+  waitForConnections: true,
+  connectionLimit: 10, // Número máximo de conexiones
+  queueLimit: 0 // Número máximo de solicitudes en cola
 });
-
-// Conexión a la base de datos
-connection.connect((err) => {
-  if (err) {
-    console.error('Error al conectar a la base de datos:', err);
-    return;
-  }
-  console.log('Conectado a la base de datos MySQL.');
-});
-
-
 
 // Ruta de prueba
 app.get('/', (req, res) => {
@@ -36,22 +28,23 @@ app.get('/', (req, res) => {
 
 // Ruta para obtener usuarios
 app.get('/api/users', (req, res) => {
-    connection.query('SELECT * FROM user_account', (err, results) => {
-      if (err) {
-        console.error('Error al obtener usuarios:', err);
-        res.status(500).json({ error: 'Error al obtener usuarios.' });
-        return;
-      }
-      res.json(results);
-    });
+  pool.query('SELECT * FROM user_account', (err, results) => {
+    if (err) {
+      console.error('Error al obtener usuarios:', err);
+      res.status(500).json({ error: 'Error al obtener usuarios.' });
+      return;
+    }
+    res.json(results);
   });
+});
 
 // Ruta para crear un nuevo usuario
 app.post('/api/users', (req, res) => {
   const { first_name, last_name, username, email, password, profile_picture, language, allowNotis } = req.body;
   const query = 'INSERT INTO user_account (first_name, last_name, username, email, password, profile_picture, language, allowNotis) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
   const values = [first_name, last_name, username, email, password, profile_picture, language, allowNotis];
-  connection.query(query, values, (err, results) => {
+  
+  pool.query(query, values, (err, results) => {
     if (err) {
       console.error('Error al crear el usuario:', err);
       res.status(500).send('Error al crear el usuario.');
