@@ -3,7 +3,7 @@ const jwt = require('jsonwebtoken');
 const mysql = require('mysql2');
 const bodyParser = require('body-parser');
 
-mysql.createPool({
+const myPool =   mysql.createPool({
     user:process.env.USER,
     password:process.env.PASSWORD,
     database:process.env.DATABASE,
@@ -25,10 +25,31 @@ app.get('/',function(req,res){
     });
 });
 
-app.post('/signup',function(req,res){
-    res.send({
-        message:'Signup method here!'
-    });
+app.post('/api/users',function(req,res){
+    //res.send({
+    //    message:'Signup method here!'
+    //});
+
+    var email = req.body.email;
+    var password = req.body.password;
+
+    myPool.getConnection(function(err, poolConnection){
+        if(err){
+            res.send({message:"Error making signup connection"});
+            poolConnection.release();
+        } else {
+            myPool.query('INSERT INTO user(email,password,isActive)VALUES(?,?,1)', [email, password], function (err, insertResults, insertFields){
+                if(err){
+                    console.log(err + ' when inserting data into db');
+                }else{
+                    res.send({
+                        message:'User inserted!'
+                    });
+                }  
+            });
+        }
+    })
+
 }); 
 
 app.listen(PORT,()=>{
