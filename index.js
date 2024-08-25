@@ -24,6 +24,20 @@ app.get('/', (req, res) => {
   });
 });
 
+app.get('/api/users', async (req, res) => {
+    const promise = db.promise();
+    const selectUserQuery = 'SELECT * FROM user_account';
+
+    try {
+        const [rows, fields] = await promise.execute(selectUserQuery);
+        res.status(200).json({ users: rows });
+    } catch (err) {
+        console.error('Error al obtener usuarios:', err);
+        res.status(500).json({ error: 'Error al obtener usuarios.' });
+    }
+});
+
+
 app.post('/api/users', (req, res) => {
   const { email, password } = req.body;
 
