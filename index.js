@@ -35,7 +35,7 @@ app.post('/api/users', (req, res) => {
     }
 
     poolConnection.query(
-      'INSERT INTO user (email, password, isActive) VALUES (?, ?, 1)',
+      'INSERT INTO user (email, password) VALUES (?, ?)',
       [email, password],
       (err, insertResults) => {
         poolConnection.release(); // Liberar la conexión en todos los casos
