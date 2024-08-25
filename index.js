@@ -1,7 +1,17 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { db } from './db.js';  // Importa el pool de conexiones
 import dotenv from 'dotenv';
+import mysql from 'mysql2';
+
+const db = mysql.createPool({
+  host: process.env.HOST,
+  user: process.env.USER,
+  password: process.env.PASSWORD,
+  database: process.env.NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
 dotenv.config();
 
