@@ -48,9 +48,9 @@ app.get('/api/users', (req, res) => {
 
 // Ruta para crear un nuevo usuario
 app.post('/api/users', (req, res) => {
-  const { first_name, last_name, username, email, password, profile_picture, language, allowNotis } = req.body;
-  const query = 'INSERT INTO user_account (first_name, last_name, username, email, password, profile_picture, language, allowNotis) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-  const values = [first_name, last_name, username, email, password, profile_picture, language, allowNotis];
+  const { email, password } = req.body;
+  const query = 'INSERT INTO user_account (email, password) VALUES (?, ?)';
+  const values = [email, password];
   connection.query(query, values, (err, results) => {
     if (err) {
       console.error('Error al crear el usuario:', err);
