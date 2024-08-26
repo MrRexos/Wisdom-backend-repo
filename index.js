@@ -10,24 +10,16 @@ const port = process.env.PORT || 3000;
 app.use(bodyParser.json());
 app.use(express.json());
 
-// Configuración de la conexión a la base de datos
-const connection = mysql.createConnection({
+// Configuración del pool de conexiones a la base de datos
+const pool = mysql.createPool({
   host: process.env.HOST,
   user: process.env.USER,
   password: process.env.PASSWORD,
-  database: process.env.DATABASE
+  database: process.env.DATABASE,
+  waitForConnections: true,
+  connectionLimit: 10,  // Número máximo de conexiones en el pool
+  queueLimit: 0
 });
-
-// Conexión a la base de datos
-connection.connect((err) => {
-  if (err) {
-    console.error('Error al conectar a la base de datos:', err);
-    return;
-  }
-  console.log('Conectado a la base de datos MySQL.');
-});
-
-
 
 // Ruta de prueba
 app.get('/', (req, res) => {
@@ -36,7 +28,7 @@ app.get('/', (req, res) => {
 
 // Ruta para obtener usuarios
 app.get('/api/users', (req, res) => {
-    connection.query('SELECT * FROM user_account', (err, results) => {
+    pool.query('SELECT * FROM user_account', (err, results) => {
       if (err) {
         console.error('Error al obtener usuarios:', err);
         res.status(500).json({ error: 'Error al obtener usuarios.' });
@@ -51,7 +43,7 @@ app.post('/api/users', (req, res) => {
   const { email, password } = req.body;
   const query = 'INSERT INTO user_account (email, password) VALUES (?, ?)';
   const values = [email, password];
-  connection.query(query, values, (err, results) => {
+  pool.query(query, values, (err, results) => {
     if (err) {
       console.error('Error al crear el usuario:', err);
       res.status(500).send('Error al crear el usuario.');
