@@ -101,15 +101,30 @@ app.get('/api/check-username', (req, res) => {
 // Ruta para hacer login
 app.post('/api/login', (req, res) => {
   const { usernameOrEmail, password } = req.body;
-  const query = 'SELECT * FROM user_account WHERE (username = ? OR email = ?) AND password = ?';
-  pool.query(query, [usernameOrEmail, usernameOrEmail, password], (err, results) => {
+
+  // Buscar al usuario en la base de datos por nombre de usuario o correo electrónico
+  const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
+  pool.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
     if (err) {
       console.error('Error al iniciar sesión:', err);
       res.status(500).json({ error: 'Error al iniciar sesión.' });
       return;
     }
     if (results.length > 0) {
-      res.json({ success: true, message: 'Inicio de sesión exitoso.' });
+      const user = results[0];
+      
+      // Comparar la contraseña proporcionada con el hash almacenado en la base de datos
+      try {
+        const match = await bcrypt.compare(password, user.password);
+        if (match) {
+          res.json({ success: true, message: 'Inicio de sesión exitoso.' });
+        } else {
+          res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
+        }
+      } catch (error) {
+        console.error('Error al comparar la contraseña:', error);
+        res.status(500).json({ error: 'Error al procesar la solicitud.' });
+      }
     } else {
       res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
     }
