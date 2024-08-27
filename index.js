@@ -1,6 +1,8 @@
 const bodyParser = require('body-parser');
 const express = require('express');
 const mysql = require('mysql2');
+const bcrypt = require('bcrypt');
+
 require('dotenv').config();
 
 const app = express();
@@ -39,18 +41,30 @@ app.get('/api/users', (req, res) => {
   });
 
 // Ruta para crear un nuevo usuario
-app.post('/api/signup', (req, res) => {
+app.post('/api/signup', async (req, res) => {
   const { email, username, password, first_name, surname, language, allow_notis } = req.body;
-  const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?)';
-  const values = [ email, username, password, first_name, surname, language, allow_notis];
-  pool.query(query, values, (err, results) => {
-    if (err) {
-      console.error('Error al crear el usuario:', err);
-      res.status(500).send('Error al crear el usuario.');
-      return;
-    }
-    res.status(201).send('Usuario creado.');
-  });
+
+  try {
+    // Hashear la contraseña antes de guardarla en la base de datos
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?)';
+    const values = [email, username, hashedPassword, first_name, surname, language, allow_notis];
+
+    // Ejecutar la consulta para insertar el nuevo usuario
+    pool.query(query, values, (err, results) => {
+      if (err) {
+        console.error('Error al crear el usuario:', err);
+        res.status(500).send('Error al crear el usuario.');
+        return;
+      }
+      res.status(201).send('Usuario creado.');
+    });
+  } catch (err) {
+    console.error('Error al hashear la contraseña:', err);
+    res.status(500).send('Error al procesar la solicitud.');
+  }
 });
 
 
