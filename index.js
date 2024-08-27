@@ -53,6 +53,55 @@ app.post('/api/signup', (req, res) => {
   });
 });
 
+
+// Ruta para verificar si un email ya existe
+app.get('/api/check-email', (req, res) => {
+  const { email } = req.query;
+  const query = 'SELECT COUNT(*) AS count FROM user_account WHERE email = ?';
+  pool.query(query, [email], (err, results) => {
+    if (err) {
+      console.error('Error al verificar el email:', err);
+      res.status(500).json({ error: 'Error al verificar el email.' });
+      return;
+    }
+    const count = results[0].count;
+    res.json({ exists: count > 0 });
+  });
+});
+
+// Ruta para verificar si un usuario ya existe
+app.get('/api/check-username', (req, res) => {
+  const { username } = req.query;
+  const query = 'SELECT COUNT(*) AS count FROM user_account WHERE username = ?';
+  pool.query(query, [username], (err, results) => {
+    if (err) {
+      console.error('Error al verificar el nombre de usuario:', err);
+      res.status(500).json({ error: 'Error al verificar el nombre de usuario.' });
+      return;
+    }
+    const count = results[0].count;
+    res.json({ exists: count > 0 });
+  });
+});
+
+// Ruta para hacer login
+app.post('/api/login', (req, res) => {
+  const { usernameOrEmail, password } = req.body;
+  const query = 'SELECT * FROM user_account WHERE (username = ? OR email = ?) AND password = ?';
+  pool.query(query, [usernameOrEmail, usernameOrEmail, password], (err, results) => {
+    if (err) {
+      console.error('Error al iniciar sesión:', err);
+      res.status(500).json({ error: 'Error al iniciar sesión.' });
+      return;
+    }
+    if (results.length > 0) {
+      res.json({ success: true, message: 'Inicio de sesión exitoso.' });
+    } else {
+      res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
+    }
+  });
+});
+
 // Inicia el servidor
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
