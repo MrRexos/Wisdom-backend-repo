@@ -119,7 +119,7 @@ app.post('/api/login', (req, res) => {
         if (match) {
           res.json({ success: true, message: 'Inicio de sesión exitoso.' });
         } else {
-          res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
+          res.status(401).json({ success: false, message: 'Credenciales incorrectas.', user.password });
         }
       } catch (error) {
         console.error('Error al comparar la contraseña:', error);
