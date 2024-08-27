@@ -103,8 +103,8 @@ app.post('/api/login', (req, res) => {
   const { usernameOrEmail, password } = req.body;
 
   // Buscar al usuario en la base de datos por nombre de usuario o correo electrónico
-  const query = 'SELECT * FROM user_account WHERE (username = ? OR email = ?) AND password = ?';
-  pool.query(query, [usernameOrEmail, usernameOrEmail, password], async (err, results) => {
+  const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
+  pool.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
     if (err) {
       console.error('Error al iniciar sesión:', err);
       res.status(500).json({ error: 'Error al iniciar sesión.' });
@@ -119,7 +119,7 @@ app.post('/api/login', (req, res) => {
         if (match) {
           res.json({ success: true, message: 'Inicio de sesión exitoso.' });
         } else {
-          res.status(401).json({ success: false, message: 'Credenciales incorrectas.', user });
+          res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
         }
       } catch (error) {
         console.error('Error al comparar la contraseña:', error);
