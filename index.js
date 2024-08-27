@@ -39,10 +39,10 @@ app.get('/api/users', (req, res) => {
   });
 
 // Ruta para crear un nuevo usuario
-app.post('/api/users', (req, res) => {
-  const { email, password } = req.body;
-  const query = 'INSERT INTO user_account (email, password) VALUES (?, ?)';
-  const values = [email, password];
+app.post('/api/signup', (req, res) => {
+  const { email, username, password, first_name, surname, language, allow_notis } = req.body;
+  const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?)';
+  const values = [ email, username, password, first_name, surname, language, allow_notis];
   pool.query(query, values, (err, results) => {
     if (err) {
       console.error('Error al crear el usuario:', err);
