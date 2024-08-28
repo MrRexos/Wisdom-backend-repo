@@ -117,7 +117,8 @@ app.post('/api/login', (req, res) => {
       try {
         const match = await bcrypt.compare(password, user.password);
         if (match) {
-          res.json({ success: true, message: 'Inicio de sesión exitoso.' });
+          delete user.password;
+          res.json({ success: true, message: 'Inicio de sesión exitoso.', user });
         } else {
           res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
         }
