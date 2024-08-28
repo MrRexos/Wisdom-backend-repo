@@ -120,7 +120,7 @@ app.post('/api/login', (req, res) => {
           delete user.password;
           res.json({ success: true, message: 'Inicio de sesión exitoso.', user });
         } else {
-          res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
+          res.json({ success: false, message: 'Credenciales incorrectas.' });
         }
       } catch (error) {
         console.error('Error al comparar la contraseña:', error);
