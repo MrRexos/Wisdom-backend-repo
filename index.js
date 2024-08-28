@@ -120,14 +120,14 @@ app.post('/api/login', (req, res) => {
           delete user.password;
           res.json({ success: true, message: 'Inicio de sesión exitoso.', user });
         } else {
-          res.json({ success: false, message: 'Credenciales incorrectas.' });
+          res.json({ success: false, message: 'Password incorrect.' });
         }
       } catch (error) {
         console.error('Error al comparar la contraseña:', error);
         res.status(500).json({ error: 'Error al procesar la solicitud.' });
       }
     } else {
-      res.status(401).json({ success: false, message: 'Credenciales incorrectas.' });
+      res.json({ success: null, message: "Wrong user or password." });
     }
   });
 });
