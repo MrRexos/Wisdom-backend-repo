@@ -31,7 +31,7 @@ const credentials = JSON.parse(process.env.GCLOUD_KEYFILE_JSON);
 // Configura el almacenamiento de Google Cloud
 const storage = new Storage({
   projectId: credentials.project_id,
-  credentials: credentials, //------
+  credentials: credentials, 
 });
 
 const bucket = storage.bucket(process.env.GCLOUD_BUCKET_NAME);
@@ -44,7 +44,7 @@ const multerMid = multer({
   },
 });
 
-app.use(multerMid.single('file')); //-----
+app.use(multerMid.single('file')); 
 
 // Ruta de prueba
 app.get('/', (req, res) => {
@@ -150,7 +150,7 @@ app.post('/api/login', (req, res) => {
 });
 
 // Nueva ruta para subir imágenes a Google Cloud Storage
-app.post('/upload', async (req, res, next) => {
+app.post('api/upload-image', async (req, res, next) => {
   console.log('Archivo recibido:', req.file);
   try {
     if (!req.file) {
@@ -160,7 +160,7 @@ app.post('/upload', async (req, res, next) => {
     console.log(req.file);
 
     const blob = bucket.file(req.file.originalname);
-    const blobStream = blob.createWriteStream(); //----reomve
+    const blobStream = blob.createWriteStream(); //--removed somethig
 
     blobStream.on('error', err => {
       next(err);
