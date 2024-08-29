@@ -41,7 +41,7 @@ const bucket = storage.bucket(process.env.GCLOUD_BUCKET_NAME);
 const multerMid = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 5 * 1024 * 1024, // Límite de 5MB por archivo
+    fileSize: 10 * 1024 * 1024, // Límite de 10MB por archivo
   },
 });
 
@@ -174,17 +174,17 @@ app.post('/api/upload-image', async (req, res, next) => {
     } else if (format === 'png') {
       compressedImage = await image
         .resize({ width: 800 })
-        .png({ quality: 80 })    // Comprime la imagen PNG
+        .png({ quality: 60 })    // Comprime la imagen PNG
         .toBuffer();
     } else if (format === 'webp') {
       compressedImage = await image
         .resize({ width: 800 })
-        .webp({ quality: 80 })   // Comprime la imagen WebP
+        .webp({ quality: 60 })   // Comprime la imagen WebP
         .toBuffer();
     } else if (format === 'heif') {
       compressedImage = await image
         .resize({ width: 800 })
-        .tiff({ quality: 80 })   // Comprime la imagen HEIC
+        .tiff({ quality: 60 })   // Comprime la imagen HEIC
         .toBuffer();
     } else {
       // Si el formato no es compatible, puedes devolver un error
