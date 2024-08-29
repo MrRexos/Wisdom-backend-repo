@@ -5,6 +5,7 @@ const bcrypt = require('bcrypt');
 const { Storage } = require('@google-cloud/storage');
 const multer = require('multer');
 const path = require('path');
+const sharp = require('sharp');
 
 require('dotenv').config();
 
@@ -157,7 +158,39 @@ app.post('/api/upload-image', async (req, res, next) => {
       res.status(400).send('No se subió ningún archivo.');
       return;
     }
-    console.log(req.file);
+    
+    // Detecta el formato de la imagen
+    const image = sharp(req.file.buffer);
+    const metadata = await image.metadata();
+    let format = metadata.format;
+
+    // Procesa la imagen según el formato
+    let compressedImage;
+    if (format === 'jpeg' || format === 'jpg') {
+      compressedImage = await image
+        .resize({ width: 800 })  // Ajusta el tamaño si es necesario
+        .jpeg({ quality: 80 })   // Comprime la imagen JPEG
+        .toBuffer();
+    } else if (format === 'png') {
+      compressedImage = await image
+        .resize({ width: 800 })
+        .png({ quality: 80 })    // Comprime la imagen PNG
+        .toBuffer();
+    } else if (format === 'webp') {
+      compressedImage = await image
+        .resize({ width: 800 })
+        .webp({ quality: 80 })   // Comprime la imagen WebP
+        .toBuffer();
+    } else if (format === 'heif') {
+      compressedImage = await image
+        .resize({ width: 800 })
+        .tiff({ quality: 80 })   // Comprime la imagen HEIC
+        .toBuffer();
+    } else {
+      // Si el formato no es compatible, puedes devolver un error
+      res.status(415).send('Formato de archivo no soportado.');
+      return;
+    }
 
     const blob = bucket.file(req.file.originalname);
     const blobStream = blob.createWriteStream(); //--removed somethig
