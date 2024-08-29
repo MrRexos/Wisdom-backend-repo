@@ -66,14 +66,14 @@ app.get('/api/users', (req, res) => {
 
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
-  const { email, username, password, first_name, surname, language, allow_notis, image } = req.body;
+  const { email, username, password, first_name, surname, language, allow_notis, profile_picture } = req.body;
 
   try {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis, image) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?)';
-    const values = [email, username, hashedPassword, first_name, surname, language, allow_notis, image];
+    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis, profile_picture) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?)';
+    const values = [email, username, hashedPassword, first_name, surname, language, allow_notis, profile_picture];
 
     pool.query(query, values, (err, results) => {
       if (err) {
