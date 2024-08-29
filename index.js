@@ -150,7 +150,7 @@ app.post('/api/login', (req, res) => {
 });
 
 // Nueva ruta para subir imágenes a Google Cloud Storage
-app.post('api/upload-image', async (req, res, next) => {
+app.post('/api/upload-image', async (req, res, next) => {
   console.log('Archivo recibido:', req.file);
   try {
     if (!req.file) {
