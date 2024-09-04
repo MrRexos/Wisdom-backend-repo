@@ -89,27 +89,6 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-app.post('/auth/google', async (req, res) => {
-  const { email, name, googleId } = req.body;
-
-  try {
-    // Verificar si el usuario ya existe
-    const [rows] = await pool.query('SELECT * FROM oauth_credentials WHERE provider_id = ?', [googleId]);
-
-    if (rows.length === 0) {
-      // Si el usuario no existe, insertarlo en la base de datos
-      await pool.query('INSERT INTO user_account (email, first_name) VALUES (?, ?, ?)', [email, name]);
-      //AÑADIR ID!!!
-    }
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error en la autenticación de Google:', error);
-    res.status(500).json({ success: false, message: 'Error en el servidor' });
-  }
-});
-
-
 // Ruta para verificar si un email ya existe
 app.get('/api/check-email', (req, res) => {
   const { email } = req.query;
@@ -230,6 +209,26 @@ app.post('/api/upload-image', async (req, res, next) => {
     res.status(500).send(error);
   }
 });
+
+// app.post('/auth/google', async (req, res) => {
+//   const { email, name, googleId } = req.body;
+
+//   try {
+//     // Verificar si el usuario ya existe
+//     const [rows] = await pool.query('SELECT * FROM oauth_credentials WHERE provider_id = ?', [googleId]);
+
+//     if (rows.length === 0) {
+//       // Si el usuario no existe, insertarlo en la base de datos
+//       await pool.query('INSERT INTO user_account (email, first_name) VALUES (?, ?, ?)', [email, name]);
+//       //AÑADIR ID!!!
+//     }
+
+//     res.json({ success: true });
+//   } catch (error) {
+//     console.error('Error en la autenticación de Google:', error);
+//     res.status(500).json({ success: false, message: 'Error en el servidor' });
+//   }
+// });
 
 // Inicia el servidor
 app.listen(port, () => {
