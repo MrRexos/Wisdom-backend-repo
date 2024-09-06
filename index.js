@@ -24,7 +24,8 @@ const pool = mysql.createPool({
   database: process.env.DATABASE,
   waitForConnections: true,
   connectionLimit: 100,  // Número máximo de conexiones en el pool
-  queueLimit: 0
+  acquireTimeout: 10000,  // Tiempo máximo para adquirir una conexión
+  idleTimeout: 60000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada
 });
 
 const credentials = JSON.parse(process.env.GCLOUD_KEYFILE_JSON);
@@ -54,13 +55,23 @@ app.get('/', (req, res) => {
 
 // Ruta para obtener usuarios
 app.get('/api/users', (req, res) => {
-  pool.query('SELECT * FROM user_account', (err, results) => {
+  pool.getConnection((err, connection) => {
     if (err) {
-      console.error('Error al obtener usuarios:', err);
-      res.status(500).json({ error: 'Error al obtener usuarios.' });
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
       return;
     }
-    res.json(results);
+
+    connection.query('SELECT * FROM user_account', (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener usuarios:', err);
+        res.status(500).json({ error: 'Error al obtener usuarios.' });
+        return;
+      }
+      res.json(results);
+    });
   });
 });
 
@@ -75,13 +86,23 @@ app.post('/api/signup', async (req, res) => {
     const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis, profile_picture) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?)';
     const values = [email, username, hashedPassword, first_name, surname, language, allow_notis, profile_picture];
 
-    pool.query(query, values, (err, results) => {
+    pool.getConnection((err, connection) => {
       if (err) {
-        console.error('Error al crear el usuario:', err);
-        res.status(500).send('Error al crear el usuario.');
+        console.error('Error al obtener la conexión:', err);
+        res.status(500).json({ error: 'Error al obtener la conexión.' });
         return;
       }
-      res.status(201).send('Usuario creado.');
+
+      connection.query(query, values, (err, results) => {
+        connection.release(); // Libera la conexión después de usarla
+
+        if (err) {
+          console.error('Error al crear el usuario:', err);
+          res.status(500).send('Error al crear el usuario.');
+          return;
+        }
+        res.status(201).send('Usuario creado.');
+      });
     });
   } catch (err) {
     console.error('Error al hashear la contraseña:', err);
@@ -93,14 +114,25 @@ app.post('/api/signup', async (req, res) => {
 app.get('/api/check-email', (req, res) => {
   const { email } = req.query;
   const query = 'SELECT COUNT(*) AS count FROM user_account WHERE email = ?';
-  pool.query(query, [email], (err, results) => {
+
+  pool.getConnection((err, connection) => {
     if (err) {
-      console.error('Error al verificar el email:', err);
-      res.status(500).json({ error: 'Error al verificar el email.' });
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
       return;
     }
-    const count = results[0].count;
-    res.json({ exists: count > 0 });
+
+    connection.query(query, [email], (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al verificar el email:', err);
+        res.status(500).json({ error: 'Error al verificar el email.' });
+        return;
+      }
+      const count = results[0].count;
+      res.json({ exists: count > 0 });
+    });
   });
 });
 
@@ -108,45 +140,66 @@ app.get('/api/check-email', (req, res) => {
 app.get('/api/check-username', (req, res) => {
   const { username } = req.query;
   const query = 'SELECT COUNT(*) AS count FROM user_account WHERE username = ?';
-  pool.query(query, [username], (err, results) => {
+
+  pool.getConnection((err, connection) => {
     if (err) {
-      console.error('Error al verificar el nombre de usuario:', err);
-      res.status(500).json({ error: 'Error al verificar el nombre de usuario.' });
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
       return;
     }
-    const count = results[0].count;
-    res.json({ exists: count > 0 });
+
+    connection.query(query, [username], (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al verificar el nombre de usuario:', err);
+        res.status(500).json({ error: 'Error al verificar el nombre de usuario.' });
+        return;
+      }
+      const count = results[0].count;
+      res.json({ exists: count > 0 });
+    });
   });
 });
 
 // Ruta para hacer login
 app.post('/api/login', (req, res) => {
   const { usernameOrEmail, password } = req.body;
-
   const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
-  pool.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
+
+  pool.getConnection((err, connection) => {
     if (err) {
-      console.error('Error al iniciar sesión:', err);
-      res.status(500).json({ error: 'Error al iniciar sesión.' });
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
       return;
     }
-    if (results.length > 0) {
-      const user = results[0];
-      try {
-        const match = await bcrypt.compare(password, user.password);
-        if (match) {
-          delete user.password;
-          res.json({ success: true, message: 'Inicio de sesión exitoso.', user });
-        } else {
-          res.json({ success: false, message: 'Password incorrect.' });
-        }
-      } catch (error) {
-        console.error('Error al comparar la contraseña:', error);
-        res.status(500).json({ error: 'Error al procesar la solicitud.' });
+
+    connection.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al iniciar sesión:', err);
+        res.status(500).json({ error: 'Error al iniciar sesión.' });
+        return;
       }
-    } else {
-      res.json({ success: null, message: "Wrong user or password." });
-    }
+      if (results.length > 0) {
+        const user = results[0];
+        try {
+          const match = await bcrypt.compare(password, user.password);
+          if (match) {
+            delete user.password;
+            res.json({ success: true, message: 'Inicio de sesión exitoso.', user });
+          } else {
+            res.json({ success: false, message: 'Password incorrect.' });
+          }
+        } catch (error) {
+          console.error('Error al comparar la contraseña:', error);
+          res.status(500).json({ error: 'Error al procesar la solicitud.' });
+        }
+      } else {
+        res.json({ success: null, message: "Wrong user or password." });
+      }
+    });
   });
 });
 
@@ -193,7 +246,7 @@ app.post('/api/upload-image', async (req, res, next) => {
     }
 
     const blob = bucket.file(req.file.originalname);
-    const blobStream = blob.createWriteStream(); //--removed somethig
+    const blobStream = blob.createWriteStream();
 
     blobStream.on('error', err => {
       next(err);
@@ -204,31 +257,11 @@ app.post('/api/upload-image', async (req, res, next) => {
       res.status(200).send({ url: publicUrl });
     });
 
-    blobStream.end(req.file.buffer);
+    blobStream.end(compressedImage);
   } catch (error) {
     res.status(500).send(error);
   }
 });
-
-// app.post('/auth/google', async (req, res) => {
-//   const { email, name, googleId } = req.body;
-
-//   try {
-//     // Verificar si el usuario ya existe
-//     const [rows] = await pool.query('SELECT * FROM oauth_credentials WHERE provider_id = ?', [googleId]);
-
-//     if (rows.length === 0) {
-//       // Si el usuario no existe, insertarlo en la base de datos
-//       await pool.query('INSERT INTO user_account (email, first_name) VALUES (?, ?, ?)', [email, name]);
-//       //AÑADIR ID!!!
-//     }
-
-//     res.json({ success: true });
-//   } catch (error) {
-//     console.error('Error en la autenticación de Google:', error);
-//     res.status(500).json({ success: false, message: 'Error en el servidor' });
-//   }
-// });
 
 // Inicia el servidor
 app.listen(port, () => {
