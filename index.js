@@ -263,6 +263,33 @@ app.post('/api/upload-image', async (req, res, next) => {
   }
 });
 
+app.get('/api/user/:userId/lists', async (req, res) => {
+  const { userId } = req.params;
+
+  try {
+    // Obtener las listas del usuario
+    const [lists] = await pool.query('SELECT id, list_name FROM service_list WHERE user_id = ?', [userId]);
+    
+    // Iterar sobre las listas para obtener el número de items y la fecha del último item
+    const listsWithDetails = await Promise.all(lists.map(async (list) => {
+      const [itemCountResult] = await pool.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id]);
+      const [lastItemDateResult] = await pool.query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
+      
+      return {
+        id: list.id,
+        title: list.title_name,
+        item_count: itemCountResult[0].item_count,
+        last_item_date: lastItemDateResult[0].last_item_date
+      };
+    }));
+
+    res.json(listsWithDetails);
+  } catch (error) {
+    console.error('Error al obtener las listas:', error);
+    res.status(500).json({ error: 'Error al obtener las listas' });
+  }
+});
+
 // Inicia el servidor
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
