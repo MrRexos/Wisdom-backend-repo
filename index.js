@@ -332,11 +332,16 @@ app.get('/api/lists/:id/items', (req, res) => {
       return;
     }
 
-    // Usar una sola consulta con JOIN para obtener los ítems y los datos de la tabla service
+    // Usar una sola consulta con JOIN para obtener los ítems, datos de la tabla service, price y user_account
     const query = `
-      SELECT item_list.*, service.*
+      SELECT item_list.*, 
+             service.*, 
+             price.*, 
+             user_account.*
       FROM item_list
       JOIN service ON item_list.service_id = service.id
+      JOIN price ON service.price_id = price.id
+      JOIN user_account ON service.user_id = user_account.id
       WHERE item_list.list_id = ?
     `;
 
