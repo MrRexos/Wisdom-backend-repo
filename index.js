@@ -334,20 +334,50 @@ app.get('/api/lists/:id/items', (req, res) => {
 
     // Consultar todos los ítems de la lista con el ID proporcionado
     connection.query('SELECT * FROM item_list WHERE list_id = ?', [id], (err, items) => {
-      connection.release(); // Liberar la conexión después de usarla
-
       if (err) {
+        connection.release(); // Liberar la conexión después de usarla
         console.error('Error al obtener los ítems de la lista:', err);
         res.status(500).json({ error: 'Error al obtener los ítems de la lista.' });
         return;
       }
 
-      // Comprobar si la lista tiene ítems
-      if (items.length > 0) {
-        res.status(200).json(items);
-      } else {
+      if (items.length === 0) {
+        connection.release(); // Liberar la conexión después de usarla
         res.status(404).json({ message: 'No se encontraron ítems para esta lista.' });
+        return;
       }
+
+      // Crear un array de promesas para consultar el service correspondiente a cada item
+      const itemsWithServicePromises = items.map(item => {
+        return new Promise((resolve, reject) => {
+          // Consultar la tabla service usando el service_id de cada item
+          connection.query('SELECT * FROM service WHERE id = ?', [item.service_id], (err, serviceRows) => {
+            if (err) {
+              return reject(err);
+            }
+
+            // Si se encuentra el servicio, sustituir el service_id con la fila completa del servicio
+            if (serviceRows.length > 0) {
+              item.service = serviceRows[0]; // Agregar la fila del servicio al item
+            }
+
+            resolve(item); // Resolver la promesa con el item modificado
+          });
+        });
+      });
+
+      // Esperar a que todas las consultas de servicios terminen
+      Promise.all(itemsWithServicePromises)
+        .then(itemsWithService => {
+          res.status(200).json(itemsWithService);
+        })
+        .catch(err => {
+          console.error('Error al obtener los servicios:', err);
+          res.status(500).json({ error: 'Error al obtener los servicios.' });
+        })
+        .finally(() => {
+          connection.release(); // Liberar la conexión después de usarla
+        });
     });
   });
 });
