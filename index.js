@@ -321,31 +321,32 @@ app.get('/api/user/:userId/lists', (req, res) => {
   });
 });
 
-app.delete('/api/lists/:id', async (req, res) => {
+app.delete('/api/lists/:id', (req, res) => {
   const { id } = req.params;
 
-  try {
-    // Obtener una conexión del pool
-    const connection = await pool.getConnection();
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
 
-    try {
-      // Eliminar la lista de la tabla service_list
-      const [result] = await connection.query('DELETE FROM service_list WHERE id = ?', [id]);
+    connection.query('DELETE FROM service_list WHERE id = ?', [id], (err, result) => {
+      connection.release(); // Libera la conexión después de usarla
 
-      // Comprobar si se eliminó alguna fila
+      if (err) {
+        console.error('Error al eliminar la lista:', err);
+        res.status(500).json({ error: 'Error al eliminar la lista.' });
+        return;
+      }
+
       if (result.affectedRows > 0) {
         res.status(200).json({ message: 'Lista eliminada con éxito' });
       } else {
         res.status(404).json({ message: 'Lista no encontrada' });
       }
-    } finally {
-      // Asegurarse de liberar la conexión después de usarla
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Error al eliminar la lista:', error);
-    res.status(500).json({ error: 'Error al eliminar la lista' });
-  }
+    });
+  });
 });
 
 // Inicia el servidor
