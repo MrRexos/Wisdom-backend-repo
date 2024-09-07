@@ -263,32 +263,64 @@ app.post('/api/upload-image', async (req, res, next) => {
   }
 });
 
-app.get('/api/user/:userId/lists', async (req, res) => {
+app.get('/api/user/:userId/lists', (req, res) => {
   const { userId } = req.params;
 
-  try {
-    // Obtener las listas del usuario
-    const [lists] = await connection.query('SELECT id, list_name FROM service_list WHERE user_id = ?', [userId]);
-    
-    // Iterar sobre las listas para obtener el número de items y la fecha del último item
-    const listsWithDetails = await Promise.all(lists.map(async (list) => {
-      const [itemCountResult] = await connection.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id]);
-      const [lastItemDateResult] = await connection.query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
-      
-      return {
-        id: list.id,
-        title: list.title_name,
-        item_count: itemCountResult[0].item_count,
-        last_item_date: lastItemDateResult[0].last_item_date
-      };
-    }));
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
 
-    res.json(listsWithDetails);
-  } catch (error) {
-    console.error('Error al obtener las listas:', error);
-    res.status(500).json({ error: 'Error al obtener las listas' });
-  }
+    // Obtener las listas del usuario
+    connection.query('SELECT id, list_name FROM service_list WHERE user_id = ?', [userId], (err, lists) => {
+      if (err) {
+        console.error('Error al obtener las listas:', err);
+        res.status(500).json({ error: 'Error al obtener las listas.' });
+        connection.release();  // Libera la conexión
+        return;
+      }
+
+      // Iterar sobre las listas para obtener el número de items y la fecha del último item
+      const listsWithDetailsPromises = lists.map(list => {
+        return new Promise((resolve, reject) => {
+          connection.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id], (err, itemCountResult) => {
+            if (err) {
+              return reject(err);
+            }
+
+            connection.query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id], (err, lastItemDateResult) => {
+              if (err) {
+                return reject(err);
+              }
+
+              resolve({
+                id: list.id,
+                title: list.list_name, // Cambié title_name a list_name
+                item_count: itemCountResult[0].item_count,
+                last_item_date: lastItemDateResult[0].last_item_date
+              });
+            });
+          });
+        });
+      });
+
+      Promise.all(listsWithDetailsPromises)
+        .then(listsWithDetails => {
+          res.json(listsWithDetails);
+        })
+        .catch(error => {
+          console.error('Error al obtener detalles de las listas:', error);
+          res.status(500).json({ error: 'Error al obtener detalles de las listas.' });
+        })
+        .finally(() => {
+          connection.release(); // Libera la conexión después de completar todas las consultas
+        });
+    });
+  });
 });
+
 
 // Inicia el servidor
 app.listen(port, () => {
