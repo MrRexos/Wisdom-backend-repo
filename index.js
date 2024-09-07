@@ -322,36 +322,35 @@ app.get('/api/user/:userId/lists', (req, res) => {
 });
 
 // Ruta para obtener todos los items de una lista por su ID
-app.get('/api/lists/:id/items', async (req, res) => {
+app.get('/api/lists/:id/items', (req, res) => {
   const { id } = req.params;
 
-  try {
-    // Obtener una conexión del pool
-    const connection = await pool.getConnection();
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
 
-    try {
-      // Consultar todos los items de la lista con el ID proporcionado
-      const [items] = await connection.query(
-        'SELECT * FROM item_list WHERE list_id = ?',
-        [id]
-      );
+    // Consultar todos los ítems de la lista con el ID proporcionado
+    connection.query('SELECT * FROM item_list WHERE list_id = ?', [id], (err, items) => {
+      connection.release(); // Liberar la conexión después de usarla
 
-      // Comprobar si la lista tiene items
+      if (err) {
+        console.error('Error al obtener los ítems de la lista:', err);
+        res.status(500).json({ error: 'Error al obtener los ítems de la lista.' });
+        return;
+      }
+
+      // Comprobar si la lista tiene ítems
       if (items.length > 0) {
         res.status(200).json(items);
       } else {
-        res.status(404).json({ message: 'No se encontraron items para esta lista.' });
+        res.status(404).json({ message: 'No se encontraron ítems para esta lista.' });
       }
-    } finally {
-      // Asegurarse de liberar la conexión después de usarla
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Error al obtener los items de la lista:', error);
-    res.status(500).json({ error: 'Error al obtener los items de la lista.' });
-  }
+    });
+  });
 });
-
 
 app.delete('/api/lists/:id', (req, res) => {
   const { id } = req.params;
