@@ -268,12 +268,12 @@ app.get('/api/user/:userId/lists', async (req, res) => {
 
   try {
     // Obtener las listas del usuario
-    const [lists] = await pool.query('SELECT id, list_name FROM service_list WHERE user_id = ?', [userId]);
+    const [lists] = await connection.query('SELECT id, list_name FROM service_list WHERE user_id = ?', [userId]);
     
     // Iterar sobre las listas para obtener el número de items y la fecha del último item
     const listsWithDetails = await Promise.all(lists.map(async (list) => {
-      const [itemCountResult] = await pool.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id]);
-      const [lastItemDateResult] = await pool.query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
+      const [itemCountResult] = await connection.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id]);
+      const [lastItemDateResult] = await connection.query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
       
       return {
         id: list.id,
