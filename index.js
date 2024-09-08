@@ -282,7 +282,7 @@ app.get('/api/user/:userId/lists', (req, res) => {
         return;
       }
 
-      // Iterar sobre las listas para obtener el número de items, la fecha del último item y las imágenes
+      // Iterar sobre las listas para obtener los detalles
       const listsWithDetailsPromises = lists.map(list => {
         return new Promise((resolve, reject) => {
           connection.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id], (err, itemCountResult) => {
@@ -295,37 +295,36 @@ app.get('/api/user/:userId/lists', (req, res) => {
                 return reject(err);
               }
 
-              // Obtener todos los items de la lista para luego obtener las imágenes
-              connection.query('SELECT id, service_id FROM item_list WHERE list_id = ?', [list.id], (err, items) => {
+              // Obtener los tres primeros servicios (service_id) de la lista
+              connection.query('SELECT service_id FROM item_list WHERE list_id = ? ORDER BY id LIMIT 3', [list.id], (err, services) => {
                 if (err) {
                   return reject(err);
                 }
 
-                const itemsWithImagesPromises = items.map(item => {
+                const servicesWithImagesPromises = services.map(service => {
                   return new Promise((resolve, reject) => {
-                    // Obtener las 3 primeras imágenes para cada service_id del item
-                    connection.query('SELECT image_url FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 3', [item.service_id], (err, images) => {
+                    // Obtener la primera imagen para cada service_id
+                    connection.query('SELECT image_url FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1', [service.service_id], (err, images) => {
                       if (err) {
                         return reject(err);
                       }
 
                       resolve({
-                        item_id: item.id,
-                        service_id: item.service_id,
-                        images: images.map(image => image.image_url)
+                        service_id: service.service_id,
+                        image_url: images.length > 0 ? images[0].image_url : null // Si no hay imagen, devuelve null
                       });
                     });
                   });
                 });
 
-                Promise.all(itemsWithImagesPromises)
-                  .then(itemsWithImages => {
+                Promise.all(servicesWithImagesPromises)
+                  .then(servicesWithImages => {
                     resolve({
                       id: list.id,
                       title: list.list_name, 
                       item_count: itemCountResult[0].item_count,
                       last_item_date: lastItemDateResult[0].last_item_date,
-                      items: itemsWithImages
+                      services: servicesWithImages
                     });
                   })
                   .catch(error => reject(error));
