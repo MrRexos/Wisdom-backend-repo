@@ -335,11 +335,43 @@ app.get('/api/lists/:id/items', (req, res) => {
     // Usar una sola consulta con JOIN para obtener los ítems y datos adicionales de la tabla service, price, user_account y review
     const query = `
       SELECT 
-        item_list.*, 
-        service.*, 
-        price.*, 
-        user_account.*,
-        user_account.id AS user_id,
+        item_list.id AS item_id, 
+        item_list.list_id, 
+        item_list.service_id, 
+        item_list.note, 
+        item_list.order, 
+        item_list.added_datetime,
+        service.title AS service_title,
+        service.description,
+        service.service_category_id,
+        service.price_id,
+        service.postal_code,
+        service.action_rate,
+        service.user_can_ask,
+        service.user_can_consult,
+        service.price_consult,
+        service.consult_via_id,
+        service.is_individual,
+        service.created_datetime AS service_created_datetime,
+        price.price,
+        price.price_type,
+        user_account.email,
+        user_account.username,
+        user_account.password,
+        user_account.first_name,
+        user_account.surname,
+        user_account.profile_picture,
+        user_account.joined_datetime,
+        user_account.is_professional,
+        user_account.language,
+        user_account.allow_notis,
+        user_account.currency,
+        user_account.money_in_wallet,
+        user_account.professional_started_datetime,
+        user_account.is_expert,
+        user_account.is_verified,
+        user_account.strikes_num,
+        user_account.hobbies,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating
       FROM item_list
@@ -354,8 +386,9 @@ app.get('/api/lists/:id/items', (req, res) => {
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
-      WHERE item_list.list_id = ?
+      WHERE item_list.list_id = ?;
     `;
+
 
     connection.query(query, [id], (err, itemsWithService) => {
       connection.release(); // Liberar la conexión después de usarla
