@@ -282,7 +282,7 @@ app.get('/api/user/:userId/lists', (req, res) => {
         return;
       }
 
-      // Iterar sobre las listas para obtener el número de items y la fecha del último item
+      // Iterar sobre las listas para obtener el número de items, la fecha del último item y las imágenes
       const listsWithDetailsPromises = lists.map(list => {
         return new Promise((resolve, reject) => {
           connection.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id], (err, itemCountResult) => {
@@ -295,11 +295,40 @@ app.get('/api/user/:userId/lists', (req, res) => {
                 return reject(err);
               }
 
-              resolve({
-                id: list.id,
-                title: list.list_name, // Cambié title_name a list_name
-                item_count: itemCountResult[0].item_count,
-                last_item_date: lastItemDateResult[0].last_item_date
+              // Obtener todos los items de la lista para luego obtener las imágenes
+              connection.query('SELECT id, service_id FROM item_list WHERE list_id = ?', [list.id], (err, items) => {
+                if (err) {
+                  return reject(err);
+                }
+
+                const itemsWithImagesPromises = items.map(item => {
+                  return new Promise((resolve, reject) => {
+                    // Obtener las 3 primeras imágenes para cada service_id del item
+                    connection.query('SELECT image_url FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 3', [item.service_id], (err, images) => {
+                      if (err) {
+                        return reject(err);
+                      }
+
+                      resolve({
+                        item_id: item.id,
+                        service_id: item.service_id,
+                        images: images.map(image => image.image_url)
+                      });
+                    });
+                  });
+                });
+
+                Promise.all(itemsWithImagesPromises)
+                  .then(itemsWithImages => {
+                    resolve({
+                      id: list.id,
+                      title: list.list_name, 
+                      item_count: itemCountResult[0].item_count,
+                      last_item_date: lastItemDateResult[0].last_item_date,
+                      items: itemsWithImages
+                    });
+                  })
+                  .catch(error => reject(error));
               });
             });
           });
