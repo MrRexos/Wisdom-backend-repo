@@ -23,7 +23,7 @@ const pool = mysql.createPool({
   password: process.env.PASSWORD,
   database: process.env.DATABASE,
   waitForConnections: true,
-  connectionLimit: 100,  // Número máximo de conexiones en el pool
+  connectionLimit: 20,  // Número máximo de conexiones en el pool
   acquireTimeout: 10000,  // Tiempo máximo para adquirir una conexión
   idleTimeout: 60000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada
 });
