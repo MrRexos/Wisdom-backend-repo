@@ -374,6 +374,41 @@ app.get('/api/lists/:id/items', (req, res) => {
   });
 });
 
+app.put('/api/items/:id/note', (req, res) => {
+  const { id } = req.params;
+  const { note } = req.body;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para actualizar la columna 'note' en la tabla 'item_list'
+    const query = `
+      UPDATE item_list
+      SET note = ?
+      WHERE id = ?
+    `;
+
+    connection.query(query, [note, id], (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al actualizar la nota del ítem:', err);
+        res.status(500).json({ error: 'Error al actualizar la nota del ítem.' });
+        return;
+      }
+
+      if (result.affectedRows > 0) {
+        res.status(200).json({ message: 'Nota actualizada con éxito.' });
+      } else {
+        res.status(404).json({ message: 'Ítem no encontrado.' });
+      }
+    });
+  });
+});
 
 app.delete('/api/lists/:id', (req, res) => {
   const { id } = req.params;
