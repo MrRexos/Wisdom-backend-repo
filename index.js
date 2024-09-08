@@ -339,6 +339,7 @@ app.get('/api/lists/:id/items', (req, res) => {
         service.*, 
         price.*, 
         user_account.*,
+        user_account.id AS user_id,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating
       FROM item_list
