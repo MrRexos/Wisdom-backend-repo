@@ -441,7 +441,6 @@ app.post('/api/list/share', (req, res) => {
   });
 });
 
-
 // Ruta para obtener todos los items de una lista por su ID
 app.get('/api/lists/:id/items', (req, res) => {
   const { id } = req.params;
@@ -476,6 +475,7 @@ app.get('/api/lists/:id/items', (req, res) => {
         service.service_created_datetime,
         price.price,
         price.price_type,
+        user_account.id AS user_id,
         user_account.email,
         user_account.username,
         user_account.password,
