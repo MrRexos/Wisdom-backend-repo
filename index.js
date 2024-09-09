@@ -417,6 +417,31 @@ app.delete('/api/list/:listId', (req, res) => {
   });
 });
 
+app.post('/api/list/share', (req, res) => {
+  const { listId, userId, permissions } = req.body;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Insertar una nueva fila en shared_list
+    const query = 'INSERT INTO shared_list (list_id, user_id, permissions) VALUES (?, ?, ?)';
+    connection.query(query, [listId, userId, permissions], (err, result) => {
+      if (err) {
+        console.error('Error al añadir el usuario a la lista compartida:', err);
+        connection.release(); // Libera la conexión
+        return res.status(500).json({ error: 'Error al añadir el usuario a la lista compartida.' });
+      }
+
+      res.status(201).json({ message: 'Usuario añadido a la lista compartida con éxito.' });
+      connection.release(); // Libera la conexión
+    });
+  });
+});
+
+
 // Ruta para obtener todos los items de una lista por su ID
 app.get('/api/lists/:id/items', (req, res) => {
   const { id } = req.params;
