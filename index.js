@@ -273,8 +273,17 @@ app.get('/api/user/:userId/lists', (req, res) => {
       return;
     }
 
-    // Obtener las listas del usuario
-    connection.query('SELECT id, list_name FROM service_list WHERE user_id = ?', [userId], (err, lists) => {
+    // Obtener las listas del usuario en service_list y las listas compartidas en shared_list
+    const query = `
+      SELECT id, list_name, 'owner' AS role FROM service_list WHERE user_id = ?
+      UNION
+      SELECT service_list.id, service_list.list_name, 'shared' AS role 
+      FROM service_list
+      JOIN shared_list ON service_list.id = shared_list.list_id
+      WHERE shared_list.user_id = ?;
+    `;
+
+    connection.query(query, [userId, userId], (err, lists) => {
       if (err) {
         console.error('Error al obtener las listas:', err);
         res.status(500).json({ error: 'Error al obtener las listas.' });
@@ -321,7 +330,8 @@ app.get('/api/user/:userId/lists', (req, res) => {
                   .then(servicesWithImages => {
                     resolve({
                       id: list.id,
-                      title: list.list_name, 
+                      title: list.list_name,
+                      role: list.role,  // Rol del usuario en la lista (propietario o compartido)
                       item_count: itemCountResult[0].item_count,
                       last_item_date: lastItemDateResult[0].last_item_date,
                       services: servicesWithImages
@@ -339,15 +349,16 @@ app.get('/api/user/:userId/lists', (req, res) => {
           res.json(listsWithDetails);
         })
         .catch(error => {
-          console.error('Error al obtener detalles de las listas:', error);
-          res.status(500).json({ error: 'Error al obtener detalles de las listas.' });
+          console.error('Error al obtener los detalles de las listas:', error);
+          res.status(500).json({ error: 'Error al obtener los detalles de las listas.' });
         })
         .finally(() => {
-          connection.release(); // Libera la conexión después de completar todas las consultas
+          connection.release();  // Libera la conexión
         });
     });
   });
 });
+
 
 app.put('/api/list/:listId', (req, res) => {
   const { listId } = req.params;
