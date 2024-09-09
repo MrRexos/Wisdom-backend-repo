@@ -418,7 +418,7 @@ app.delete('/api/list/:listId', (req, res) => {
 });
 
 app.post('/api/list/share', (req, res) => {
-  const { listId, userId, permissions } = req.body;
+  const { listId, user, permissions } = req.body;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -426,17 +426,34 @@ app.post('/api/list/share', (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    // Insertar una nueva fila en shared_list
-    const query = 'INSERT INTO shared_list (list_id, user_id, permissions) VALUES (?, ?, ?)';
-    connection.query(query, [listId, userId, permissions], (err, result) => {
+    // Verificar si el usuario existe y obtener su ID
+    const getUserIdQuery = 'SELECT id FROM user_account WHERE username = ? OR email = ?';
+    connection.query(getUserIdQuery, [user, user], (err, results) => {
       if (err) {
-        console.error('Error al añadir el usuario a la lista compartida:', err);
+        console.error('Error al consultar el usuario:', err);
         connection.release(); // Libera la conexión
-        return res.status(500).json({ error: 'Error al añadir el usuario a la lista compartida.' });
+        return res.status(500).json({ error: 'Error al consultar el usuario.' });
       }
 
-      res.status(201).json({ message: 'Usuario añadido a la lista compartida con éxito.' });
-      connection.release(); // Libera la conexión
+      if (results.length === 0) {
+        connection.release(); // Libera la conexión
+        return res.status(404).json({ error: 'Usuario no encontrado.' });
+      }
+
+      const userId = results[0].id;
+
+      // Insertar una nueva fila en shared_list
+      const insertQuery = 'INSERT INTO shared_list (list_id, user_id, permissions) VALUES (?, ?, ?)';
+      connection.query(insertQuery, [listId, userId, permissions], (err, result) => {
+        if (err) {
+          console.error('Error al añadir el usuario a la lista compartida:', err);
+          connection.release(); // Libera la conexión
+          return res.status(500).json({ error: 'Error al añadir el usuario a la lista compartida.' });
+        }
+
+        res.status(201).json({ message: 'Usuario añadido a la lista compartida con éxito.' });
+        connection.release(); // Libera la conexión
+      });
     });
   });
 });
@@ -523,7 +540,7 @@ app.get('/api/lists/:id/items', (req, res) => {
       if (itemsWithService.length > 0) {
         res.status(200).json(itemsWithService);
       } else {
-        res.status(404).json({ message: 'No se encontraron ítems para esta lista.' });
+        res.status(200).json({empty: true,  message: 'No se encontraron ítems para esta lista.' });
       }
     });
   });
