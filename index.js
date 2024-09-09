@@ -437,7 +437,7 @@ app.post('/api/list/share', (req, res) => {
 
       if (results.length === 0) {
         connection.release(); // Libera la conexión
-        return res.status(404).json({ error: 'Usuario no encontrado.' });
+        return res.status(201).json({ notFound:true });
       }
 
       const userId = results[0].id;
