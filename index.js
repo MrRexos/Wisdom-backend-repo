@@ -349,6 +349,74 @@ app.get('/api/user/:userId/lists', (req, res) => {
   });
 });
 
+app.put('/api/list/:listId', (req, res) => {
+  const { listId } = req.params;
+  const { newName } = req.body;
+
+  if (!newName) {
+    return res.status(400).json({ error: 'El nuevo nombre de la lista es requerido.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Actualizar el nombre de la lista
+    connection.query('UPDATE service_list SET list_name = ? WHERE id = ?', [newName, listId], (err, result) => {
+      if (err) {
+        console.error('Error al actualizar el nombre de la lista:', err);
+        connection.release(); // Libera la conexión
+        return res.status(500).json({ error: 'Error al actualizar el nombre de la lista.' });
+      }
+
+      if (result.affectedRows === 0) {
+        connection.release(); // Libera la conexión
+        return res.status(404).json({ error: 'Lista no encontrada.' });
+      }
+
+      res.json({ message: 'Nombre de la lista actualizado con éxito.' });
+      connection.release(); // Libera la conexión
+    });
+  });
+});
+
+app.delete('/api/list/:listId', (req, res) => {
+  const { listId } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Eliminar la lista
+    connection.query('DELETE FROM service_list WHERE id = ?', [listId], (err, result) => {
+      if (err) {
+        console.error('Error al eliminar la lista:', err);
+        connection.release(); // Libera la conexión
+        return res.status(500).json({ error: 'Error al eliminar la lista.' });
+      }
+
+      if (result.affectedRows === 0) {
+        connection.release(); // Libera la conexión
+        return res.status(404).json({ error: 'Lista no encontrada.' });
+      }
+
+      // Opcional: eliminar los items asociados a la lista
+      connection.query('DELETE FROM item_list WHERE list_id = ?', [listId], (err) => {
+        if (err) {
+          console.error('Error al eliminar los items de la lista:', err);
+        }
+        connection.release(); // Libera la conexión
+      });
+
+      res.json({ message: 'Lista eliminada con éxito.' });
+    });
+  });
+});
+
 // Ruta para obtener todos los items de una lista por su ID
 app.get('/api/lists/:id/items', (req, res) => {
   const { id } = req.params;
