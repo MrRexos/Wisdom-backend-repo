@@ -359,7 +359,6 @@ app.get('/api/user/:userId/lists', (req, res) => {
   });
 });
 
-
 app.put('/api/list/:listId', (req, res) => {
   const { listId } = req.params;
   const { newName } = req.body;
