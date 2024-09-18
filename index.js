@@ -645,6 +645,39 @@ app.get('/api/service-family', (req, res) => {
   });
 });
 
+app.get('/api/service-family/:id/categories', (req, res) => {
+  const { id } = req.params; // ID del service_family
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para obtener las categorías asociadas a un service_family
+    const query = `
+      SELECT sct.id, sct.service_category_type_name, sct.description
+      FROM service_category sc
+      JOIN service_category_type sct ON sc.service_category_type_id = sct.id
+      WHERE sc.service_family_id = ?
+    `;
+
+    connection.query(query, [id], (err, results) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener las categorías:', err);
+        res.status(500).json({ error: 'Error al obtener las categorías.' });
+        return;
+      }
+
+      res.status(200).json(results); // Devolver las categorías
+    });
+  });
+});
+
+
 
 // Inicia el servidor
 app.listen(port, () => {
