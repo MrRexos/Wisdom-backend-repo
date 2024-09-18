@@ -657,7 +657,7 @@ app.get('/api/service-family/:id/categories', (req, res) => {
 
     // Consulta para obtener las categorías asociadas a un service_family
     const query = `
-      SELECT sct.id, sct.service_category_type_name, sct.description
+      SELECT sct.id, sct.service_category_name, sct.description
       FROM service_category sc
       JOIN service_category_type sct ON sc.service_category_type_id = sct.id
       WHERE sc.service_family_id = ?
