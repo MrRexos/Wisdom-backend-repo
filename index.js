@@ -620,6 +620,32 @@ app.delete('/api/lists/:id', (req, res) => {
   });
 });
 
+app.get('/api/service-family', (req, res) => {
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para obtener todos los registros de la tabla 'service_family'
+    const query = 'SELECT * FROM service_family';
+
+    connection.query(query, (err, results) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener los valores de la tabla service_family:', err);
+        res.status(500).json({ error: 'Error al obtener los valores.' });
+        return;
+      }
+
+      res.status(200).json(results); // Devolver los resultados
+    });
+  });
+});
+
+
 // Inicia el servidor
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
