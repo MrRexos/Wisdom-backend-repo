@@ -47,7 +47,7 @@ const multerMid = multer({
   },
 });
 
-app.use(multerMid.single('file')); 
+
 
 // Ruta de prueba
 app.get('/', (req, res) => {
@@ -205,9 +205,12 @@ app.post('/api/login', (req, res) => {
 });
 
 // Nueva ruta para subir imágenes a Google Cloud Storage
-app.post('/api/upload-image', async (req, res, next) => {
+app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) => {
+
   console.log('Archivo recibido:', req.file);
+
   try {
+    
     if (!req.file) {
       res.status(400).send('No se subió ningún archivo.');
       return;
@@ -761,11 +764,12 @@ app.get('/api/category/:id/service', (req, res) => {
 
 
 app.post('/api/upload-images', upload.array('files'), async (req, res, next) => {
+
   if (!req.files || req.files.length === 0) {
       return res.status(400).send('No se subió ningún archivo.');
   }
 
-  console.log(req.files);
+  console.log('hola');
 
   try {
       const results = await Promise.all(req.files.map(async (file, index) => {
