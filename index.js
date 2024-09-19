@@ -759,58 +759,83 @@ app.get('/api/category/:id/service', (req, res) => {
   });
 });
 
+const uploadImages = async (images) => {
+  if (images.length === 0) {
+      Alert.alert('Por favor selecciona al menos una imagen');
+      return;
+  }
+
+  const formData = new FormData();
+  images.forEach((image, index) => {
+      formData.append('files', {
+          uri: image.uri,
+          type: image.mimeType,
+          name: image.fileName,  // Usa el nombre original del archivo
+      });
+  });
+
+  try {
+      const res = await axios.post('https://wisdom-app-34b3fb420f18.herokuapp.com/api/upload-images', formData, {
+          headers: {
+              'Content-Type': 'multipart/form-data',
+          },
+      });
+      return res.data;
+  } catch (error) {
+      console.error(error);
+  }
+};
+
 app.post('/api/upload-images', upload.array('files'), async (req, res, next) => {
   if (!req.files || req.files.length === 0) {
-    return res.status(400).send('No se subió ningún archivo.');
+      return res.status(400).send('No se subió ningún archivo.');
   }
 
   try {
-    const results = await Promise.all(req.files.map(async (file, index) => {
-      const image = sharp(file.buffer);
-      const metadata = await image.metadata();
-      let compressedImage;
+      const results = await Promise.all(req.files.map(async (file, index) => {
+          const image = sharp(file.buffer);
+          const metadata = await image.metadata();
+          let compressedImage;
 
-      // Procesa la imagen según el formato
-      if (metadata.format === 'jpeg' || metadata.format === 'jpg') {
-        compressedImage = await image
-          .resize({ width: 800 })  // Ajusta el tamaño si es necesario
-          .jpeg({ quality: 80 })   // Comprime la imagen JPEG
-          .toBuffer();
-      } else if (metadata.format === 'png') {
-        compressedImage = await image
-          .resize({ width: 800 })
-          .png({ quality: 60 })    // Comprime la imagen PNG
-          .toBuffer();
-      } else if (metadata.format === 'webp') {
-        compressedImage = await image
-          .resize({ width: 800 })
-          .webp({ quality: 60 })   // Comprime la imagen WebP
-          .toBuffer();
-      } else if (metadata.format === 'heif') {
-        compressedImage = await image
-          .resize({ width: 800 })
-          .tiff({ quality: 60 })   // Comprime la imagen HEIC
-          .toBuffer();
-      } else {
-        throw new Error('Formato de archivo no soportado.');
-      }
+          if (metadata.format === 'jpeg' || metadata.format === 'jpg') {
+              compressedImage = await image
+                  .resize({ width: 800 })
+                  .jpeg({ quality: 80 })
+                  .toBuffer();
+          } else if (metadata.format === 'png') {
+              compressedImage = await image
+                  .resize({ width: 800 })
+                  .png({ quality: 60 })
+                  .toBuffer();
+          } else if (metadata.format === 'webp') {
+              compressedImage = await image
+                  .resize({ width: 800 })
+                  .webp({ quality: 60 })
+                  .toBuffer();
+          } else if (metadata.format === 'heif') {
+              compressedImage = await image
+                  .resize({ width: 800 })
+                  .toBuffer();  // Usar toBuffer() para HEIF si no soporta compresión
+          } else {
+              throw new Error('Formato de archivo no soportado.');
+          }
 
-      const blob = bucket.file(`${Date.now()}_${file.originalname}`);
-      const blobStream = blob.createWriteStream();
+          const blob = bucket.file(`${Date.now()}_${file.originalname}`);
+          const blobStream = blob.createWriteStream();
 
-      return new Promise((resolve, reject) => {
-        blobStream.on('error', reject);
-        blobStream.on('finish', () => {
-          const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
-          resolve({ url: publicUrl, order: index + 1 });
-        });
-        blobStream.end(compressedImage);
-      });
-    }));
+          return new Promise((resolve, reject) => {
+              blobStream.on('error', reject);
+              blobStream.on('finish', () => {
+                  const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
+                  resolve({ url: publicUrl, order: index + 1 });
+              });
+              blobStream.end(compressedImage);
+          });
+      }));
 
-    res.status(200).send(results);
+      res.status(200).send(results);
   } catch (error) {
-    res.status(500).send(error.message);
+      res.status(500).send(error.message);
   }
 });
 
@@ -969,7 +994,7 @@ app.post('/api/service', (req, res) => {
         };
 
         if (user_can_consult) {
-          const consultViaQuery = 'INSERT INTO consult_via (provide, username, url) VALUES (?, ?, ?)';
+          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
           connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
             if (err) {
               return connection.rollback(() => {
