@@ -808,7 +808,7 @@ app.post('/api/service', (req, res) => {
 
         // 2. Condicional: si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
         if (user_can_consult) {
-          const consultViaQuery = 'INSERT INTO consult_via (provide, username, url) VALUES (?, ?, ?)';
+          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
           connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
             if (err) {
               return connection.rollback(() => {
