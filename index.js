@@ -944,7 +944,7 @@ app.post('/api/service', (req, res) => {
               const experienceQuery = 'INSERT INTO experience_place (service_id, experience_title, place_name, experience_started_date, experience_end_date) VALUES ?';
               const experienceValues = experiences.map(exp => [
                 service_id, exp.experience_title, exp.place_name, exp.experience_started_date, exp.experience_end_date
-              ]); //CUIDADOOO
+              ]);
 
               connection.query(experienceQuery, [experienceValues], err => {
                 if (err) {
@@ -958,7 +958,7 @@ app.post('/api/service', (req, res) => {
 
             // 7. Insertar imágenes en 'service_image'
             if (images && images.length > 0) {
-              const imageQuery = 'INSERT INTO service_image (service_id, image_url, `order`) VALUES ?';
+              const imageQuery = 'INSERT INTO service_image (service_id, image_url, order) VALUES ?';
               const imageValues = images.map(img => [service_id, img.url, img.order]);
 
               connection.query(imageQuery, [imageValues], err => {
