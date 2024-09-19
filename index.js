@@ -835,6 +835,7 @@ app.post('/api/upload-images', upload.array('files'), async (req, res, next) => 
 
       res.status(200).send(results);
   } catch (error) {
+      console.error('Error en la carga de imágenes:', error);
       res.status(500).send(error.message);
   }
 });
