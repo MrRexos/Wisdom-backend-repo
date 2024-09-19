@@ -870,8 +870,20 @@ app.post('/api/service', (req, res) => {
         // 2. Si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
         let consult_via_id = null;
         if (user_can_consult) {
-          const [consultResult] = connection.query('INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)', [consult_via_provide, consult_via_username, consult_via_url]);
-          consult_via_id = consultResult.insertId;
+          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
+          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
+            if (err) {
+              return connection.rollback(() => {
+                console.error('Error al insertar en la tabla consult_via:', err);
+                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
+              });
+            }
+
+            consult_via_id = result.insertId;
+            insertService(); // Llama a insertService después de haber obtenido el consult_via_id
+          });
+        } else {
+          insertService(); // Llama a insertService directamente si user_can_consult es false
         }
         
         const insertService = () => {
