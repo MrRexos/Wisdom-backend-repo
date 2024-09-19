@@ -764,11 +764,6 @@ app.get('/api/category/:id/service', (req, res) => {
 
 app.post('/api/upload-images', upload.array('files'), async (req, res, next) => {
 
-  if (!req.files || req.files.length === 0) {
-      return res.status(400).send('No se subió ningún archivo.');
-  }
-
-  console.log('hola');
 
   try {
       const results = await Promise.all(req.files.map(async (file, index) => {
@@ -873,20 +868,10 @@ app.post('/api/service', (req, res) => {
         const price_id = result.insertId;
 
         // 2. Si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
+        let consult_via_id = null;
         if (user_can_consult) {
-          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
-          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
-            if (err) {
-              return connection.rollback(() => {
-                console.error('Error al insertar en la tabla consult_via:', err);
-                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
-              });
-            }
-
-            const consult_via_id = result.insertId; // Aquí es donde se asigna el consult_via_id
-          });
-        } else {
-          const consult_via_id = null; // Si no hay consulta, se asigna null
+          const [consultResult] = connection.query('INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)', [consult_via_provide, consult_via_username, consult_via_url]);
+          consult_via_id = consultResult.insertId;
         }
         
         const insertService = () => {
@@ -962,7 +947,7 @@ app.post('/api/service', (req, res) => {
             // 7. Insertar imágenes en 'service_image'
             if (images && images.length > 0) {
               const imageQuery = 'INSERT INTO service_image (service_id, image_url, order) VALUES (?, ?)';
-              const imageValues = images.map(img => [service_id, img.url, img.order]); //CUIDADOOO
+              const imageValues = images.map(img => [service_id, img.url, img.order]);
 
               connection.query(imageQuery, [imageValues], err => {
                 if (err) {
@@ -988,22 +973,7 @@ app.post('/api/service', (req, res) => {
           });
         };
 
-        if (user_can_consult) {
-          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
-          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
-            if (err) {
-              return connection.rollback(() => {
-                console.error('Error al insertar en la tabla consult_via:', err);
-                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
-              });
-            }
-
-            consult_via_id = result.insertId;
-            insertService();
-          });
-        } else {
-          insertService();
-        }
+        
       });
     });
   });
