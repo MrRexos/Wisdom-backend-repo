@@ -823,8 +823,8 @@ app.post('/api/service', (req, res) => {
             const serviceQuery = `
               INSERT INTO service (
                 service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-                action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime, allow_discounts, discount_rate
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?, NOW())
+                action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, service_created_datetime
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
             `;
             const serviceValues = [
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
@@ -856,7 +856,7 @@ app.post('/api/service', (req, res) => {
           const serviceQuery = `
             INSERT INTO service (
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime, allow_discounts, discount_rate
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, service_created_datetime
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?, ?, ?, NOW())
           `;
           const serviceValues = [
