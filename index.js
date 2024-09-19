@@ -759,37 +759,13 @@ app.get('/api/category/:id/service', (req, res) => {
   });
 });
 
-const uploadImages = async (images) => {
-  if (images.length === 0) {
-      Alert.alert('Por favor selecciona al menos una imagen');
-      return;
-  }
-
-  const formData = new FormData();
-  images.forEach((image, index) => {
-      formData.append('files', {
-          uri: image.uri,
-          type: image.mimeType,
-          name: image.fileName,  // Usa el nombre original del archivo
-      });
-  });
-
-  try {
-      const res = await axios.post('https://wisdom-app-34b3fb420f18.herokuapp.com/api/upload-images', formData, {
-          headers: {
-              'Content-Type': 'multipart/form-data',
-          },
-      });
-      return res.data;
-  } catch (error) {
-      console.error(error);
-  }
-};
 
 app.post('/api/upload-images', upload.array('files'), async (req, res, next) => {
   if (!req.files || req.files.length === 0) {
       return res.status(400).send('No se subió ningún archivo.');
   }
+
+  console.log(req.files);
 
   try {
       const results = await Promise.all(req.files.map(async (file, index) => {
