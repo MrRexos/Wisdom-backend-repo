@@ -837,7 +837,7 @@ app.post('/api/service', (req, res) => {
     languages,      // Lista de lenguajes [{ language: 'en' }, { language: 'es' }]
     tags,           // Lista de tags [{ tag: 'plumbing' }, { tag: 'electricity' }]
     experiences,    // Lista de experiencias [{ experience_title, place_name, experience_started_date, experience_end_date }]
-    images,          // Lista de imágenes [{ url, order }, { url: 'image2.jpg' }]
+    images,         // Lista de imágenes [{ url, order }, { url: 'image2.jpg' }]
     hobbies
   } = req.body;
 
@@ -851,6 +851,7 @@ app.post('/api/service', (req, res) => {
     connection.beginTransaction(err => {
       if (err) {
         console.error('Error al iniciar la transacción:', err);
+        connection.release(); // Liberar conexión en caso de error
         res.status(500).json({ error: 'Error al iniciar la transacción.' });
         return;
       }
@@ -861,6 +862,7 @@ app.post('/api/service', (req, res) => {
         if (err) {
           return connection.rollback(() => {
             console.error('Error al insertar en la tabla price:', err);
+            connection.release(); // Liberar conexión en caso de error
             res.status(500).json({ error: 'Error al insertar en la tabla price.' });
           });
         }
@@ -869,23 +871,6 @@ app.post('/api/service', (req, res) => {
 
         // 2. Si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
         let consult_via_id = null;
-        if (user_can_consult) {
-          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
-          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
-            if (err) {
-              return connection.rollback(() => {
-                console.error('Error al insertar en la tabla consult_via:', err);
-                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
-              });
-            }
-
-            consult_via_id = result.insertId;
-            insertService(); // Llama a insertService después de haber obtenido el consult_via_id
-          });
-        } else {
-          insertService(); // Llama a insertService directamente si user_can_consult es false
-        }
-        
         const insertService = () => {
           // 3. Insertar en la tabla 'service'
           const serviceQuery = `
@@ -903,6 +888,7 @@ app.post('/api/service', (req, res) => {
             if (err) {
               return connection.rollback(() => {
                 console.error('Error al insertar en la tabla service:', err);
+                connection.release(); // Liberar conexión en caso de error
                 res.status(500).json({ error: 'Error al insertar en la tabla service.' });
               });
             }
@@ -912,12 +898,13 @@ app.post('/api/service', (req, res) => {
             // 4. Insertar lenguajes en 'service_language'
             if (languages && languages.length > 0) {
               const languageQuery = 'INSERT INTO service_language (service_id, language) VALUES ?';
-              const languageValues = languages.map(lang => [service_id, lang]);
+              const languageValues = languages.map(lang => [service_id, lang.language]);
 
               connection.query(languageQuery, [languageValues], err => {
                 if (err) {
                   return connection.rollback(() => {
                     console.error('Error al insertar lenguajes:', err);
+                    connection.release(); // Liberar conexión en caso de error
                     res.status(500).json({ error: 'Error al insertar lenguajes.' });
                   });
                 }
@@ -927,12 +914,13 @@ app.post('/api/service', (req, res) => {
             // 5. Insertar tags en 'service_tags'
             if (tags && tags.length > 0) {
               const tagsQuery = 'INSERT INTO service_tags (service_id, tag) VALUES ?';
-              const tagsValues = tags.map(tag => [service_id, tag]);
+              const tagsValues = tags.map(tag => [service_id, tag.tag]);
 
               connection.query(tagsQuery, [tagsValues], err => {
                 if (err) {
                   return connection.rollback(() => {
                     console.error('Error al insertar tags:', err);
+                    connection.release(); // Liberar conexión en caso de error
                     res.status(500).json({ error: 'Error al insertar tags.' });
                   });
                 }
@@ -943,13 +931,14 @@ app.post('/api/service', (req, res) => {
             if (experiences && experiences.length > 0) {
               const experienceQuery = 'INSERT INTO experience_place (service_id, experience_title, place_name, experience_started_date, experience_end_date) VALUES ?';
               const experienceValues = experiences.map(exp => [
-                service_id, exp.experience_title, exp.place_name, exp.experience_started_date, exp.experience_end_date
+                service_id, exp.experience_title, exp.place_name, exp.experience_started_date, exp.experience_end_date || null
               ]);
 
               connection.query(experienceQuery, [experienceValues], err => {
                 if (err) {
                   return connection.rollback(() => {
                     console.error('Error al insertar experiencias:', err);
+                    connection.release(); // Liberar conexión en caso de error
                     res.status(500).json({ error: 'Error al insertar experiencias.' });
                   });
                 }
@@ -965,6 +954,7 @@ app.post('/api/service', (req, res) => {
                 if (err) {
                   return connection.rollback(() => {
                     console.error('Error al insertar imágenes:', err);
+                    connection.release(); // Liberar conexión en caso de error
                     res.status(500).json({ error: 'Error al insertar imágenes.' });
                   });
                 }
@@ -976,16 +966,35 @@ app.post('/api/service', (req, res) => {
               if (err) {
                 return connection.rollback(() => {
                   console.error('Error al hacer commit de la transacción:', err);
+                  connection.release(); // Liberar conexión en caso de error
                   res.status(500).json({ error: 'Error al hacer commit de la transacción.' });
                 });
               }
 
+              connection.release(); // Liberar conexión después del commit exitoso
               res.status(201).json({ message: 'Servicio creado con éxito.' });
             });
           });
         };
 
-        
+        // 2.1. Insertar consult_via y continuar con insertService
+        if (user_can_consult) {
+          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
+          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
+            if (err) {
+              return connection.rollback(() => {
+                console.error('Error al insertar en la tabla consult_via:', err);
+                connection.release(); // Liberar conexión en caso de error
+                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
+              });
+            }
+
+            consult_via_id = result.insertId;
+            insertService(); // Llama a insertService después de haber obtenido el consult_via_id
+          });
+        } else {
+          insertService(); // Llama a insertService directamente si user_can_consult es false
+        }
       });
     });
   });
