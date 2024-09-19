@@ -658,7 +658,7 @@ app.get('/api/service-family/:id/categories', (req, res) => {
 
     // Consulta para obtener las categorías asociadas a un service_family
     const query = `
-      SELECT sct.id, sct.service_category_name, sct.description
+      SELECT sc.id AS service_category_id, sct.id AS service_category_type_id, sct.service_category_name, sct.description
       FROM service_category sc
       JOIN service_category_type sct ON sc.service_category_type_id = sct.id
       WHERE sc.service_family_id = ?
@@ -677,6 +677,7 @@ app.get('/api/service-family/:id/categories', (req, res) => {
     });
   });
 });
+
 
 //mostrar todos los servicios de una categoria
 app.get('/api/category/:id/service', (req, res) => {
@@ -757,6 +758,136 @@ app.get('/api/category/:id/service', (req, res) => {
     });
   });
 });
+
+app.post('/api/service', (req, res) => {
+  const {
+    service_title,
+    user_id,
+    description,
+    service_category_id,
+    price,
+    price_type,
+    latitude,
+    longitude,
+    action_rate,
+    user_can_ask,
+    user_can_consult,
+    price_consult,
+    consult_via_provide,
+    consult_via_username,
+    consult_via_url,
+    is_individual
+  } = req.body;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    connection.beginTransaction(err => {
+      if (err) {
+        console.error('Error al iniciar la transacción:', err);
+        res.status(500).json({ error: 'Error al iniciar la transacción.' });
+        return;
+      }
+
+      // 1. Insertar en la tabla 'price'
+      const priceQuery = 'INSERT INTO price (price, price_type) VALUES (?, ?)';
+      connection.query(priceQuery, [price, price_type], (err, result) => {
+        if (err) {
+          return connection.rollback(() => {
+            console.error('Error al insertar en la tabla price:', err);
+            res.status(500).json({ error: 'Error al insertar en la tabla price.' });
+          });
+        }
+
+        const price_id = result.insertId;
+
+        // 2. Condicional: si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
+        if (user_can_consult) {
+          const consultViaQuery = 'INSERT INTO consult_via (provide, username, url) VALUES (?, ?, ?)';
+          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
+            if (err) {
+              return connection.rollback(() => {
+                console.error('Error al insertar en la tabla consult_via:', err);
+                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
+              });
+            }
+
+            const consult_via_id = result.insertId;
+
+            // 3. Insertar en la tabla 'service'
+            const serviceQuery = `
+              INSERT INTO service (
+                service_title, user_id, description, service_category_id, price_id, latitude, longitude,
+                action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+            `;
+            const serviceValues = [
+              service_title, user_id, description, service_category_id, price_id, latitude, longitude,
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual
+            ];
+
+            connection.query(serviceQuery, serviceValues, (err, result) => {
+              if (err) {
+                return connection.rollback(() => {
+                  console.error('Error al insertar en la tabla service:', err);
+                  res.status(500).json({ error: 'Error al insertar en la tabla service.' });
+                });
+              }
+
+              connection.commit(err => {
+                if (err) {
+                  return connection.rollback(() => {
+                    console.error('Error al hacer commit de la transacción:', err);
+                    res.status(500).json({ error: 'Error al hacer commit de la transacción.' });
+                  });
+                }
+
+                res.status(201).json({ message: 'Servicio creado con éxito.' });
+              });
+            });
+          });
+        } else {
+          // Si user_can_consult es false, consult_via_id será null
+          const serviceQuery = `
+            INSERT INTO service (
+              service_title, user_id, description, service_category_id, price_id, latitude, longitude,
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?, NOW())
+          `;
+          const serviceValues = [
+            service_title, user_id, description, service_category_id, price_id, latitude, longitude,
+            action_rate, user_can_ask, user_can_consult, price_consult, is_individual
+          ];
+
+          connection.query(serviceQuery, serviceValues, (err, result) => {
+            if (err) {
+              return connection.rollback(() => {
+                console.error('Error al insertar en la tabla service:', err);
+                res.status(500).json({ error: 'Error al insertar en la tabla service.' });
+              });
+            }
+
+            connection.commit(err => {
+              if (err) {
+                return connection.rollback(() => {
+                  console.error('Error al hacer commit de la transacción:', err);
+                  res.status(500).json({ error: 'Error al hacer commit de la transacción.' });
+                });
+              }
+
+              res.status(201).json({ message: 'Servicio creado con éxito.' });
+            });
+          });
+        }
+      });
+    });
+  });
+});
+
 
 
 // Inicia el servidor
