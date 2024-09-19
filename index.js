@@ -678,7 +678,6 @@ app.get('/api/service-family/:id/categories', (req, res) => {
   });
 });
 
-
 //mostrar todos los servicios de una categoria
 app.get('/api/category/:id/service', (req, res) => {
   const { id } = req.params; // ID de la categoría
@@ -776,7 +775,9 @@ app.post('/api/service', (req, res) => {
     consult_via_provide,
     consult_via_username,
     consult_via_url,
-    is_individual
+    is_individual,
+    allow_discounts, 
+    discount_rate
   } = req.body;
 
   pool.getConnection((err, connection) => {
@@ -822,12 +823,12 @@ app.post('/api/service', (req, res) => {
             const serviceQuery = `
               INSERT INTO service (
                 service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-                action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime, allow_discounts, discount_rate
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?, NOW())
             `;
             const serviceValues = [
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate
             ];
 
             connection.query(serviceQuery, serviceValues, (err, result) => {
@@ -855,12 +856,12 @@ app.post('/api/service', (req, res) => {
           const serviceQuery = `
             INSERT INTO service (
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?, NOW())
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, service_created_datetime, allow_discounts, discount_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?, ?, ?, NOW())
           `;
           const serviceValues = [
             service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-            action_rate, user_can_ask, user_can_consult, price_consult, is_individual
+            action_rate, user_can_ask, user_can_consult, price_consult, is_individual, allow_discounts, discount_rate
           ];
 
           connection.query(serviceQuery, serviceValues, (err, result) => {
