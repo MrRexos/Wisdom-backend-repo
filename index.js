@@ -958,7 +958,7 @@ app.post('/api/service', (req, res) => {
 
             // 7. Insertar imágenes en 'service_image'
             if (images && images.length > 0) {
-              const imageQuery = 'INSERT INTO service_image (service_id, image_url, order) VALUES (?, ?)';
+              const imageQuery = 'INSERT INTO service_image (service_id, image_url, `order`) VALUES ?';
               const imageValues = images.map(img => [service_id, img.url, img.order]);
 
               connection.query(imageQuery, [imageValues], err => {
