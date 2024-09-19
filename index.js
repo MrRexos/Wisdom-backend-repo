@@ -15,6 +15,7 @@ const port = process.env.PORT || 3000;
 // Middleware para parsear JSON
 app.use(bodyParser.json());
 app.use(express.json());
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración del pool de conexiones a la base de datos
 const pool = mysql.createPool({
@@ -678,7 +679,7 @@ app.get('/api/service-family/:id/categories', (req, res) => {
   });
 });
 
-//mostrar todos los servicios de una categoria
+//Ruta para mostrar todos los servicios de una categoria
 app.get('/api/category/:id/service', (req, res) => {
   const { id } = req.params; // ID de la categoría
 
