@@ -210,7 +210,7 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
   console.log('Archivo recibido:', req.file);
 
   try {
-    
+
     if (!req.file) {
       res.status(400).send('No se subió ningún archivo.');
       return;
@@ -762,7 +762,6 @@ app.get('/api/category/:id/service', (req, res) => {
   });
 });
 
-
 app.post('/api/upload-images', upload.array('files'), async (req, res, next) => {
 
   if (!req.files || req.files.length === 0) {
@@ -843,7 +842,8 @@ app.post('/api/service', (req, res) => {
     languages,      // Lista de lenguajes [{ language: 'en' }, { language: 'es' }]
     tags,           // Lista de tags [{ tag: 'plumbing' }, { tag: 'electricity' }]
     experiences,    // Lista de experiencias [{ experience_title, place_name, experience_started_date, experience_end_date }]
-    images          // Lista de imágenes [{ url, order }, { url: 'image2.jpg' }]
+    images,          // Lista de imágenes [{ url, order }, { url: 'image2.jpg' }]
+    hobbies
   } = req.body;
 
   pool.getConnection((err, connection) => {
@@ -873,19 +873,33 @@ app.post('/api/service', (req, res) => {
         const price_id = result.insertId;
 
         // 2. Si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
-        let consult_via_id = null;
+        if (user_can_consult) {
+          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
+          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
+            if (err) {
+              return connection.rollback(() => {
+                console.error('Error al insertar en la tabla consult_via:', err);
+                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
+              });
+            }
 
+            const consult_via_id = result.insertId; // Aquí es donde se asigna el consult_via_id
+          });
+        } else {
+          const consult_via_id = null; // Si no hay consulta, se asigna null
+        }
+        
         const insertService = () => {
           // 3. Insertar en la tabla 'service'
           const serviceQuery = `
             INSERT INTO service (
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, service_created_datetime
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
           `;
           const serviceValues = [
             service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-            action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate
+            action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies
           ];
 
           connection.query(serviceQuery, serviceValues, (err, result) => {
