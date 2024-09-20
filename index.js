@@ -931,7 +931,11 @@ app.post('/api/service', (req, res) => {
             if (experiences && experiences.length > 0) {
               const experienceQuery = 'INSERT INTO experience_place (service_id, experience_title, place_name, experience_started_date, experience_end_date) VALUES ?';
               const experienceValues = experiences.map(exp => [
-                service_id, exp.experience_title, exp.place_name, exp.experience_started_date, exp.experience_end_date || null
+                service_id,
+                exp.experience_title,
+                exp.place_name,
+                new Date(exp.experience_started_date).toISOString().slice(0, 19).replace('T', ' '),  // Formato MySQL
+                new Date(exp.experience_end_date).toISOString().slice(0, 19).replace('T', ' ')       // Formato MySQL
               ]);
 
               console.log('Valores a insertar en experiencia:', experienceValues);
