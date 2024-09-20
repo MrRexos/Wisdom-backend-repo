@@ -929,22 +929,27 @@ app.post('/api/service', (req, res) => {
 
             // 6. Insertar experiencias en 'experience_place'
             if (experiences && experiences.length > 0) {
-              console.log('Experiences:', experiences);
               const experienceQuery = 'INSERT INTO experience_place (service_id, experience_title, place_name, experience_started_date, experience_end_date) VALUES ?';
               const experienceValues = experiences.map(exp => [
                 service_id, exp.experience_title, exp.place_name, exp.experience_started_date, exp.experience_end_date || null
               ]);
 
+              console.log('Valores a insertar en experiencia:', experienceValues);
+
               connection.query(experienceQuery, [experienceValues], err => {
                 if (err) {
                   return connection.rollback(() => {
                     console.error('Error al insertar experiencias:', err);
+                    console.error('Consulta:', experienceQuery);
+                    console.error('Valores:', experienceValues);
                     connection.release(); // Liberar conexión en caso de error
                     res.status(500).json({ error: 'Error al insertar experiencias.' });
                   });
+                } else {
+                  console.log('Experiencias insertadas correctamente');
                 }
               });
-            } else {console.log('NO')}
+            } 
 
             // 7. Insertar imágenes en 'service_image'
             if (images && images.length > 0) {
