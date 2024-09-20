@@ -848,6 +848,32 @@ app.post('/api/service', (req, res) => {
       return;
     }
 
+    console.log({
+      service_title,
+      user_id,
+      description,
+      service_category_id,
+      price,
+      price_type,
+      latitude,
+      longitude,
+      action_rate,
+      user_can_ask,
+      user_can_consult,
+      price_consult,
+      consult_via_provide,
+      consult_via_username,
+      consult_via_url,
+      is_individual,
+      allow_discounts,
+      discount_rate,
+      languages,     
+      tags,     
+      experiences, 
+      images,        
+      hobbies
+    })
+
     connection.beginTransaction(err => {
       if (err) {
         console.error('Error al iniciar la transacción:', err);
@@ -898,7 +924,8 @@ app.post('/api/service', (req, res) => {
             // 4. Insertar lenguajes en 'service_language'
             if (languages && languages.length > 0) {
               const languageQuery = 'INSERT INTO service_language (service_id, language) VALUES ?';
-              const languageValues = languages.map(lang => [service_id, lang.language]);
+              const languageValues = languages.map(lang => [service_id, lang]);
+              console.log(languages)
 
               connection.query(languageQuery, [languageValues], err => {
                 if (err) {
@@ -914,7 +941,8 @@ app.post('/api/service', (req, res) => {
             // 5. Insertar tags en 'service_tags'
             if (tags && tags.length > 0) {
               const tagsQuery = 'INSERT INTO service_tags (service_id, tag) VALUES ?';
-              const tagsValues = tags.map(tag => [service_id, tag.tag]);
+              const tagsValues = tags.map(tag => [service_id, tag]);
+              console.log(tags)
 
               connection.query(tagsQuery, [tagsValues], err => {
                 if (err) {
@@ -934,10 +962,10 @@ app.post('/api/service', (req, res) => {
                 service_id,
                 exp.experience_title,
                 exp.place_name,
-                new Date(exp.experience_started_date).toISOString().slice(0, 19).replace('T', ' '),  // Formato MySQL
-                new Date(exp.experience_end_date).toISOString().slice(0, 19).replace('T', ' ')       // Formato MySQL
+                new Date(exp.experience_started_date).toISOString().slice(0, 19).replace('T', ' '),
+                new Date(exp.experience_end_date).toISOString().slice(0, 19).replace('T', ' ')
               ]);
-
+              console.log(experiences)
               console.log('Valores a insertar en experiencia:', experienceValues);
 
               connection.query(experienceQuery, [experienceValues], err => {
@@ -959,6 +987,7 @@ app.post('/api/service', (req, res) => {
             if (images && images.length > 0) {
               const imageQuery = 'INSERT INTO service_image (service_id, image_url, order) VALUES ?';
               const imageValues = images.map(img => [service_id, img.url, img.order]);
+              console.log(images)
 
               connection.query(imageQuery, [imageValues], err => {
                 if (err) {
