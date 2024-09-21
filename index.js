@@ -1035,6 +1035,86 @@ app.post('/api/service', (req, res) => {
   });
 });
 
+//Ruta para crear lista
+app.post('/api/lists', (req, res) => {
+  const { user_id, list_name } = req.body;
+
+  if (!user_id || !list_name) {
+    return res.status(400).json({ error: 'user_id y list_name son requeridos.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = 'INSERT INTO service_list (user_id, list_name) VALUES (?, ?)';
+    const values = [user_id, list_name];
+
+    connection.query(query, values, (err, result) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al crear la lista:', err);
+        return res.status(500).json({ error: 'Error al crear la lista.' });
+      }
+
+      res.status(201).json({ message: 'Lista creada con éxito', listId: result.insertId });
+    });
+  });
+});
+
+//Ruta para añadir un item a una lista
+app.post('/api/lists/:list_id/items', (req, res) => {
+  const { list_id } = req.params;
+  const { service_id } = req.body;
+
+  if (!service_id) {
+    return res.status(400).json({ error: 'service_id es requerido.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Primero obtenemos el último orden de los items en la lista
+    const getLastOrderQuery = 'SELECT MAX(`order`) AS lastOrder FROM item_list WHERE list_id = ?';
+
+    connection.query(getLastOrderQuery, [list_id], (err, result) => {
+      if (err) {
+        connection.release(); // Libera la conexión en caso de error
+        console.error('Error al obtener el último orden:', err);
+        return res.status(500).json({ error: 'Error al obtener el último orden.' });
+      }
+
+      const lastOrder = result[0].lastOrder || 0;
+      const newOrder = lastOrder + 1;
+
+      const insertItemQuery = `
+        INSERT INTO item_list (list_id, service_id, \`order\`, added_datetime) 
+        VALUES (?, ?, ?, NOW())
+      `;
+      const values = [list_id, service_id, newOrder];
+
+      connection.query(insertItemQuery, values, (err, result) => {
+        connection.release(); // Libera la conexión después de usarla
+
+        if (err) {
+          console.error('Error al añadir el item a la lista:', err);
+          return res.status(500).json({ error: 'Error al añadir el item a la lista.' });
+        }
+
+        res.status(201).json({ message: 'Item añadido con éxito', itemId: result.insertId });
+      });
+    });
+  });
+});
+
+
+
 
 
 
