@@ -118,7 +118,7 @@ app.post('/api/signup', async (req, res) => {
             return;
           }
 
-          res.status(201).send('Usuario y lista de servicios creados.');
+          res.status(201).json({ message: 'Usuario y lista de servicios creados.', userId });
         });
       });
     });
