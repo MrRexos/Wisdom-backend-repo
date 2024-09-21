@@ -723,7 +723,7 @@ app.get('/api/category/:id/services', (req, res) => {
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating,
         -- Subconsulta para obtener los tags del servicio
-        (SELECT GROUP_CONCAT(tag) 
+        (SELECT JSON_ARRAYAGG(tag) 
          FROM service_tags 
          WHERE service_tags.service_id = service.id) AS tags,
         -- Subconsulta para obtener las imágenes del servicio
@@ -754,7 +754,7 @@ app.get('/api/category/:id/services', (req, res) => {
       }
 
       if (servicesData.length > 0) {
-        res.status(200).json(servicesData); // Devolver la lista de servicios con tags e imágenes
+        res.status(200).json(serviceData); // Devolver la lista de servicios con tags e imágenes
       } else {
         res.status(200).json({ notFound: true, message: 'No se encontraron servicios para esta categoría.' });
       }
