@@ -754,7 +754,7 @@ app.get('/api/category/:id/services', (req, res) => {
       }
 
       if (servicesData.length > 0) {
-        res.status(200).json(serviceData); // Devolver la lista de servicios con tags e imágenes
+        res.status(200).json(servicesData); // Devolver la lista de servicios con tags e imágenes
       } else {
         res.status(200).json({ notFound: true, message: 'No se encontraron servicios para esta categoría.' });
       }
