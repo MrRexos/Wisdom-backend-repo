@@ -94,15 +94,32 @@ app.post('/api/signup', async (req, res) => {
         return;
       }
 
+      // Inserta el nuevo usuario
       connection.query(query, values, (err, results) => {
-        connection.release(); // Libera la conexión después de usarla
-
         if (err) {
+          connection.release(); // Libera la conexión
           console.error('Error al crear el usuario:', err);
           res.status(500).send('Error al crear el usuario.');
           return;
         }
-        res.status(201).send('Usuario creado.');
+
+        const userId = results.insertId; // ID del usuario recién creado
+
+        // Inserta la lista "Recently seen" en la tabla service_list
+        const serviceListQuery = 'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)';
+        const serviceListValues = ['Recently seen', userId];
+
+        connection.query(serviceListQuery, serviceListValues, (err) => {
+          connection.release(); // Libera la conexión después de la segunda consulta
+
+          if (err) {
+            console.error('Error al crear la lista de servicios:', err);
+            res.status(500).send('Error al crear la lista de servicios.');
+            return;
+          }
+
+          res.status(201).send('Usuario y lista de servicios creados.');
+        });
       });
     });
   } catch (err) {
@@ -267,6 +284,7 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
   }
 });
 
+//Ruta para obtener las listas de un usuario en favorites
 app.get('/api/user/:userId/lists', (req, res) => {
   const { userId } = req.params;
 
@@ -363,6 +381,7 @@ app.get('/api/user/:userId/lists', (req, res) => {
   });
 });
 
+//Ruta para actulizar el nombre de una lista
 app.put('/api/list/:listId', (req, res) => {
   const { listId } = req.params;
   const { newName } = req.body;
@@ -396,6 +415,7 @@ app.put('/api/list/:listId', (req, res) => {
   });
 });
 
+// Ruta para borrar una lista desde list
 app.delete('/api/list/:listId', (req, res) => {
   const { listId } = req.params;
 
@@ -431,6 +451,7 @@ app.delete('/api/list/:listId', (req, res) => {
   });
 });
 
+//Ruta para compartir una lista
 app.post('/api/list/share', (req, res) => {
   const { listId, user, permissions } = req.body;
 
@@ -561,6 +582,7 @@ app.get('/api/lists/:id/items', (req, res) => {
   });
 });
 
+//Ruta para añadir una nota
 app.put('/api/items/:id/note', (req, res) => {
   const { id } = req.params;
   const { note } = req.body;
@@ -597,6 +619,7 @@ app.put('/api/items/:id/note', (req, res) => {
   });
 });
 
+// Ruta para borrar una lista desde favorites
 app.delete('/api/lists/:id', (req, res) => {
   const { id } = req.params;
 
@@ -625,6 +648,7 @@ app.delete('/api/lists/:id', (req, res) => {
   });
 });
 
+//Ruta para obtener todas las familias
 app.get('/api/service-family', (req, res) => {
   pool.getConnection((err, connection) => {
     if (err) {
@@ -650,6 +674,7 @@ app.get('/api/service-family', (req, res) => {
   });
 });
 
+//Ruta para obtener todas las categorias de una lista a partir de la id de la lista
 app.get('/api/service-family/:id/categories', (req, res) => {
   const { id } = req.params; // ID del service_family
 
@@ -762,6 +787,7 @@ app.get('/api/category/:id/services', (req, res) => {
   });
 });
 
+//Ruta para subir varias fotos (create service)
 app.post('/api/upload-images', upload.array('files'), async (req, res, next) => {
 
 
@@ -814,6 +840,7 @@ app.post('/api/upload-images', upload.array('files'), async (req, res, next) => 
   }
 });
 
+//Ruta para crear un servicio
 app.post('/api/service', (req, res) => {
   const {
     service_title,
