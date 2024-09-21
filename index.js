@@ -683,7 +683,7 @@ app.get('/api/service-family/:id/categories', (req, res) => {
 });
 
 //Ruta para mostrar todos los servicios de una categoria
-app.get('/api/category/:id/service', (req, res) => {
+app.get('/api/category/:id/services', (req, res) => {
   const { id } = req.params; // ID de la categoría
 
   pool.getConnection((err, connection) => {
@@ -693,7 +693,7 @@ app.get('/api/category/:id/service', (req, res) => {
       return;
     }
 
-    // Consulta para obtener la información del servicio, tags y las imágenes del servicio
+    // Consulta para obtener la información de todos los servicios, sus tags y las imágenes
     const query = `
       SELECT 
         service.id AS service_id,
@@ -744,19 +744,19 @@ app.get('/api/category/:id/service', (req, res) => {
       WHERE service.service_category_id = ?;
     `;
 
-    connection.query(query, [id], (err, serviceData) => {
+    connection.query(query, [id], (err, servicesData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
-        console.error('Error al obtener la información del servicio:', err);
-        res.status(500).json({ error: 'Error al obtener la información del servicio.' });
+        console.error('Error al obtener la información de los servicios:', err);
+        res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
         return;
       }
 
-      if (serviceData.length > 0) {
-        res.status(200).json(serviceData[0]); // Devolver la información del servicio con tags e imágenes
+      if (servicesData.length > 0) {
+        res.status(200).json(servicesData); // Devolver la lista de servicios con tags e imágenes
       } else {
-        res.status(200).json({notFound:true, message: 'Servicio no encontrado para esta categoría.' });
+        res.status(200).json({ notFound: true, message: 'No se encontraron servicios para esta categoría.' });
       }
     });
   });
