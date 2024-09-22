@@ -1234,11 +1234,6 @@ app.get('/api/service/:id', (req, res) => {
 });
 
 
-
-
-
-
-
 // Inicia el servidor
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
