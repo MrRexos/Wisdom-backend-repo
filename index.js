@@ -1128,7 +1128,7 @@ app.post('/api/lists/:list_id/items', (req, res) => {
 });
 
 
-// Ruta para obtener toda la información de un servicio por su ID !!!
+// Ruta para obtener toda la información de un servicio por su ID
 app.get('/api/service/:id', (req, res) => {
   const { id } = req.params; // ID del servicio
 
@@ -1182,14 +1182,9 @@ app.get('/api/service/:id', (req, res) => {
          FROM service_image si 
          WHERE si.service_id = s.id) AS images,
         -- Subconsulta para obtener las reseñas del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', r.id, 'user_id', r.user_id, 'rating', r.rating, 'comment', r.comment, 'review_datetime', r.review_datetime, 'user', JSON_OBJECT('id', ua_r.id, 'email', ua_r.email, 'username', ua_r.username, 'first_name', ua_r.first_name, 'surname', ua_r.surname, 'profile_picture', ua_r.profile_picture))
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', r.id, 'user_id', r.user_id, 'rating', r.rating, 'comment', r.comment, 'review_datetime', r.review_datetime))
          FROM review r 
-         JOIN user_account ua_r ON r.user_id = ua_r.id
          WHERE r.service_id = s.id) AS reviews,
-        -- Subconsulta para obtener las experiencias del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', ep.id, 'experience_title', ep.experience_title, 'place_name', ep.place_name, 'experience_started_date', ep.experience_started_date, 'experience_end_date', ep.experience_end_date))
-         FROM experience_place ep 
-         WHERE ep.service_id = s.id) AS experiences,
         -- Información de consult_via
         (SELECT JSON_OBJECT('id', cv.id, 'provider', cv.provider, 'username', cv.username, 'url', cv.url)
          FROM consult_via cv 
@@ -1223,6 +1218,8 @@ app.get('/api/service/:id', (req, res) => {
     });
   });
 });
+
+
 
 
 
