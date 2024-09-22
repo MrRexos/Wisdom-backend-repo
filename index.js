@@ -1180,9 +1180,21 @@ app.get('/api/service/:id', (req, res) => {
         (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
          FROM service_image si 
          WHERE si.service_id = s.id) AS images,
-        -- Subconsulta para obtener las reseñas del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', r.id, 'user_id', r.user_id, 'rating', r.rating, 'comment', r.comment, 'review_datetime', r.review_datetime))
+        -- Subconsulta para obtener las reseñas del servicio con información del usuario
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', r.id, 
+            'user_id', r.user_id, 
+            'rating', r.rating, 
+            'comment', r.comment, 
+            'review_datetime', r.review_datetime,
+            'user', JSON_OBJECT('id', ua_r.id, 
+                                'email', ua_r.email, 
+                                'username', ua_r.username, 
+                                'first_name', ua_r.first_name, 
+                                'surname', ua_r.surname, 
+                                'profile_picture', ua_r.profile_picture))
+         )
          FROM review r 
+         JOIN user_account ua_r ON r.user_id = ua_r.id
          WHERE r.service_id = s.id) AS reviews,
         -- Información de consult_via
         (SELECT JSON_OBJECT('id', cv.id, 'provider', cv.provider, 'username', cv.username, 'url', cv.url)
@@ -1220,6 +1232,7 @@ app.get('/api/service/:id', (req, res) => {
     });
   });
 });
+
 
 
 
