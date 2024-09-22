@@ -545,7 +545,6 @@ app.get('/api/lists/:id/items', (req, res) => {
         user_account.is_expert,
         user_account.is_verified,
         user_account.strikes_num,
-        user_account.hobbies,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating
       FROM item_list
