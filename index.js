@@ -1128,8 +1128,101 @@ app.post('/api/lists/:list_id/items', (req, res) => {
 });
 
 
+// Ruta para obtener toda la información de un servicio por su ID !!!
+app.get('/api/service/:id', (req, res) => {
+  const { id } = req.params; // ID del servicio
 
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
 
+    // Consulta para obtener la información del servicio y sus relaciones
+    const query = `
+      SELECT 
+        s.id AS service_id,
+        s.service_title,
+        s.description,
+        s.service_category_id,
+        s.price_id,
+        s.latitude,
+        s.longitude,
+        s.action_rate,
+        s.user_can_ask,
+        s.user_can_consult,
+        s.price_consult,
+        s.consult_via_id,
+        s.is_individual,
+        s.service_created_datetime,
+        s.allow_discounts,
+        s.discount_rate,
+        s.hobbies,
+        p.price,
+        p.price_type,
+        ua.id AS user_id,
+        ua.email,
+        ua.username,
+        ua.first_name,
+        ua.surname,
+        ua.profile_picture,
+        ua.is_professional,
+        ua.language,
+        -- Subconsulta para obtener los tags del servicio
+        (SELECT JSON_ARRAYAGG(tag) 
+         FROM service_tags 
+         WHERE service_id = s.id) AS tags,
+        -- Subconsulta para obtener los idiomas del servicio
+        (SELECT JSON_ARRAYAGG(language) 
+         FROM service_language 
+         WHERE service_id = s.id) AS languages,
+        -- Subconsulta para obtener las imágenes del servicio
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+         FROM service_image si 
+         WHERE si.service_id = s.id) AS images,
+        -- Subconsulta para obtener las reseñas del servicio
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', r.id, 'user_id', r.user_id, 'rating', r.rating, 'comment', r.comment, 'review_datetime', r.review_datetime, 'user', JSON_OBJECT('id', ua_r.id, 'email', ua_r.email, 'username', ua_r.username, 'first_name', ua_r.first_name, 'surname', ua_r.surname, 'profile_picture', ua_r.profile_picture))
+         FROM review r 
+         JOIN user_account ua_r ON r.user_id = ua_r.id
+         WHERE r.service_id = s.id) AS reviews,
+        -- Subconsulta para obtener las experiencias del servicio
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', ep.id, 'experience_title', ep.experience_title, 'place_name', ep.place_name, 'experience_started_date', ep.experience_started_date, 'experience_end_date', ep.experience_end_date))
+         FROM experience_place ep 
+         WHERE ep.service_id = s.id) AS experiences,
+        -- Información de consult_via
+        (SELECT JSON_OBJECT('id', cv.id, 'provider', cv.provider, 'username', cv.username, 'url', cv.url)
+         FROM consult_via cv 
+         WHERE cv.id = s.consult_via_id) AS consult_via,
+        -- Información de la categoría del servicio
+        (SELECT JSON_OBJECT('id', sc.id, 'name', sc.service_category_name, 'description', sc.description, 
+          'family', JSON_OBJECT('id', sf.id, 'name', sf.service_family, 'description', sf.description))
+         FROM service_category sc
+         JOIN service_family sf ON sc.service_family_id = sf.id
+         WHERE sc.id = s.service_category_id) AS category
+      FROM service s
+      JOIN price p ON s.price_id = p.id
+      JOIN user_account ua ON s.user_id = ua.id
+      WHERE s.id = ?;
+    `;
+
+    connection.query(query, [id], (err, serviceData) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener la información del servicio:', err);
+        res.status(500).json({ error: 'Error al obtener la información del servicio.' });
+        return;
+      }
+
+      if (serviceData.length > 0) {
+        res.status(200).json(serviceData[0]); // Devolver la información del servicio
+      } else {
+        res.status(404).json({ notFound: true, message: 'Servicio no encontrado.' });
+      }
+    });
+  });
+});
 
 
 
