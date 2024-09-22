@@ -1127,7 +1127,6 @@ app.post('/api/lists/:list_id/items', (req, res) => {
   });
 });
 
-
 // Ruta para obtener toda la información de un servicio por su ID
 app.get('/api/service/:id', (req, res) => {
   const { id } = req.params; // ID del servicio
@@ -1190,10 +1189,13 @@ app.get('/api/service/:id', (req, res) => {
          FROM consult_via cv 
          WHERE cv.id = s.consult_via_id) AS consult_via,
         -- Información de la categoría del servicio
-        (SELECT JSON_OBJECT('id', sc.id, 'name', sc.service_category_name, 'description', sc.description, 
+        (SELECT JSON_OBJECT('id', sc.id, 
+          'name', sct.service_category_name, 
+          'description', sct.description, 
           'family', JSON_OBJECT('id', sf.id, 'name', sf.service_family, 'description', sf.description))
          FROM service_category sc
          JOIN service_family sf ON sc.service_family_id = sf.id
+         JOIN service_category_type sct ON sc.service_category_type_id = sct.id
          WHERE sc.id = s.service_category_id) AS category
       FROM service s
       JOIN price p ON s.price_id = p.id
@@ -1218,6 +1220,7 @@ app.get('/api/service/:id', (req, res) => {
     });
   });
 });
+
 
 
 
