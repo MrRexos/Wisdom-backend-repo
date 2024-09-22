@@ -1079,38 +1079,54 @@ app.post('/api/lists/:list_id/items', (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    // Primero obtenemos el último orden de los items en la lista
-    const getLastOrderQuery = 'SELECT MAX(`order`) AS lastOrder FROM item_list WHERE list_id = ?';
-
-    connection.query(getLastOrderQuery, [list_id], (err, result) => {
+    // Comprobar si ya existe un item con el mismo service_id en la lista
+    const checkIfExistsQuery = 'SELECT id FROM item_list WHERE list_id = ? AND service_id = ?';
+    connection.query(checkIfExistsQuery, [list_id, service_id], (err, results) => {
       if (err) {
-        connection.release(); // Libera la conexión en caso de error
-        console.error('Error al obtener el último orden:', err);
-        return res.status(500).json({ error: 'Error al obtener el último orden.' });
+        connection.release();
+        console.error('Error al comprobar si el item ya existe:', err);
+        return res.status(500).json({ error: 'Error al comprobar si el item ya existe.' });
       }
 
-      const lastOrder = result[0].lastOrder || 0;
-      const newOrder = lastOrder + 1;
+      // Si ya existe, no añadir el nuevo item
+      if (results.length > 0) {
+        connection.release();
+        return res.status(201).json({ message: 'El item ya existe en la lista.', alreadyExists:true });
+      }
 
-      const insertItemQuery = `
-        INSERT INTO item_list (list_id, service_id, \`order\`, added_datetime) 
-        VALUES (?, ?, ?, NOW())
-      `;
-      const values = [list_id, service_id, newOrder];
-
-      connection.query(insertItemQuery, values, (err, result) => {
-        connection.release(); // Libera la conexión después de usarla
-
+      // Si no existe, proceder con la inserción
+      const getLastOrderQuery = 'SELECT MAX(`order`) AS lastOrder FROM item_list WHERE list_id = ?';
+      connection.query(getLastOrderQuery, [list_id], (err, result) => {
         if (err) {
-          console.error('Error al añadir el item a la lista:', err);
-          return res.status(500).json({ error: 'Error al añadir el item a la lista.' });
+          connection.release();
+          console.error('Error al obtener el último orden:', err);
+          return res.status(500).json({ error: 'Error al obtener el último orden.' });
         }
 
-        res.status(201).json({ message: 'Item añadido con éxito', itemId: result.insertId });
+        const lastOrder = result[0].lastOrder || 0;
+        const newOrder = lastOrder + 1;
+
+        const insertItemQuery = `
+          INSERT INTO item_list (list_id, service_id, \`order\`, added_datetime) 
+          VALUES (?, ?, ?, NOW())
+        `;
+        const values = [list_id, service_id, newOrder];
+
+        connection.query(insertItemQuery, values, (err, result) => {
+          connection.release();
+
+          if (err) {
+            console.error('Error al añadir el item a la lista:', err);
+            return res.status(500).json({ error: 'Error al añadir el item a la lista.' });
+          }
+
+          res.status(201).json({ message: 'Item añadido con éxito', itemId: result.insertId });
+        });
       });
     });
   });
 });
+
 
 
 
