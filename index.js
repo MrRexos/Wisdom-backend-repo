@@ -1196,6 +1196,14 @@ app.get('/api/service/:id', (req, res) => {
          FROM review r 
          JOIN user_account ua_r ON r.user_id = ua_r.id
          WHERE r.service_id = s.id) AS reviews,
+        -- Subconsulta para obtener las experiencias del servicio
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', ep.id, 
+            'experience_title', ep.experience_title, 
+            'place_name', ep.place_name, 
+            'experience_started_date', ep.experience_started_date, 
+            'experience_end_date', ep.experience_end_date))
+         FROM experience_place ep
+         WHERE ep.service_id = s.id) AS experiences,
         -- Información de consult_via
         (SELECT JSON_OBJECT('id', cv.id, 'provider', cv.provider, 'username', cv.username, 'url', cv.url)
          FROM consult_via cv 
@@ -1232,6 +1240,7 @@ app.get('/api/service/:id', (req, res) => {
     });
   });
 });
+
 
 
 // Inicia el servidor
