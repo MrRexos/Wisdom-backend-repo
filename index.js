@@ -1127,7 +1127,6 @@ app.post('/api/lists/:list_id/items', (req, res) => {
   });
 });
 
-// Ruta para obtener toda la información de un servicio por su ID
 app.get('/api/service/:id', (req, res) => {
   const { id } = req.params; // ID del servicio
 
@@ -1168,8 +1167,6 @@ app.get('/api/service/:id', (req, res) => {
         ua.profile_picture,
         ua.is_professional,
         ua.language,
-        COALESCE(review_data.review_count, 0) AS review_count,
-        COALESCE(review_data.average_rating, 0) AS average_rating,
         -- Subconsulta para obtener los tags del servicio
         (SELECT JSON_ARRAYAGG(tag) 
          FROM service_tags 
@@ -1198,6 +1195,30 @@ app.get('/api/service/:id', (req, res) => {
          FROM review r 
          JOIN user_account ua_r ON r.user_id = ua_r.id
          WHERE r.service_id = s.id) AS reviews,
+        -- Calcular la media de valoraciones
+        (SELECT AVG(r.rating) 
+         FROM review r 
+         WHERE r.service_id = s.id) AS average_rating,
+        -- Contar el número total de reseñas
+        (SELECT COUNT(*) 
+         FROM review r 
+         WHERE r.service_id = s.id) AS review_count,
+        -- Contar el número de reseñas por rating
+        (SELECT COUNT(*) 
+         FROM review r 
+         WHERE r.service_id = s.id AND r.rating = 5) AS rating_5_count,
+        (SELECT COUNT(*) 
+         FROM review r 
+         WHERE r.service_id = s.id AND r.rating = 4) AS rating_4_count,
+        (SELECT COUNT(*) 
+         FROM review r 
+         WHERE r.service_id = s.id AND r.rating = 3) AS rating_3_count,
+        (SELECT COUNT(*) 
+         FROM review r 
+         WHERE r.service_id = s.id AND r.rating = 2) AS rating_2_count,
+        (SELECT COUNT(*) 
+         FROM review r 
+         WHERE r.service_id = s.id AND r.rating = 1) AS rating_1_count,
         -- Subconsulta para obtener las experiencias del servicio
         (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', ep.id, 
             'experience_title', ep.experience_title, 
@@ -1242,6 +1263,7 @@ app.get('/api/service/:id', (req, res) => {
     });
   });
 });
+
 
 
 
