@@ -1168,6 +1168,8 @@ app.get('/api/service/:id', (req, res) => {
         ua.profile_picture,
         ua.is_professional,
         ua.language,
+        COALESCE(review_data.review_count, 0) AS review_count,
+        COALESCE(review_data.average_rating, 0) AS average_rating,
         -- Subconsulta para obtener los tags del servicio
         (SELECT JSON_ARRAYAGG(tag) 
          FROM service_tags 
