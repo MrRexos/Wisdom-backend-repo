@@ -1264,6 +1264,44 @@ app.get('/api/service/:id', (req, res) => {
   });
 });
 
+app.get('/api/suggested_professional', (req, res) => {
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para obtener el ID del servicio y toda la información del usuario, con un límite de 20 resultados
+    const query = `
+      SELECT 
+        s.id AS service_id,
+        ua.id AS user_id,
+        ua.email,
+        ua.username,
+        ua.first_name,
+        ua.surname,
+        ua.profile_picture,
+        ua.is_professional,
+        ua.language
+      FROM service s
+      JOIN user_account ua ON s.user_id = ua.id
+      LIMIT 20;
+    `;
+
+    connection.query(query, (err, servicesData) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener la información de los servicios:', err);
+        res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
+        return;
+      }
+
+      res.status(200).json(servicesData); // Devolver la información de hasta 20 servicios
+    });
+  });
+});
 
 
 
