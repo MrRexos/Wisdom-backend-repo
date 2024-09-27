@@ -1276,6 +1276,7 @@ app.get('/api/suggested_professional', (req, res) => {
     const query = `
       SELECT 
         s.id AS service_id,
+        s.service_title,
         ua.id AS user_id,
         ua.email,
         ua.username,
