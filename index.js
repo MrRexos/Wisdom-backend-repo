@@ -1360,7 +1360,8 @@ app.get('/api/user/:userId/bookings', (req, res) => {
       JOIN service ON booking.service_id = service.id
       JOIN price ON service.price_id = price.id
       JOIN user_account ON service.user_id = user_account.id
-      WHERE booking.user_id = ?;
+      WHERE booking.user_id = ?
+      ORDER BY b.booking_start_datetime DESC;
     `;
 
     connection.query(query, [userId], (err, bookingsData) => {
