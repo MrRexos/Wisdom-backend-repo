@@ -1382,6 +1382,83 @@ app.get('/api/user/:userId/bookings', (req, res) => {
   });
 });
 
+//Ruta para obtener todas las reservas de un profesional
+app.get('/api/service-user/:userId/bookings', (req, res) => {
+  const { userId } = req.params; // ID del usuario dentro de la tabla service
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para obtener la información de todas las reservas donde el servicio pertenece a un usuario específico
+    const query = `
+      SELECT 
+        booking.id AS booking_id,
+        booking.booking_start_datetime,
+        booking.booking_end_datetime,
+        booking.service_duration,
+        booking.final_price,
+        booking.is_paid,
+        booking.booking_status,
+        booking.order_datetime,
+        service.id AS service_id,
+        service.service_title,
+        service.description,
+        service.service_category_id,
+        service.price_id,
+        service.latitude,
+        service.longitude,
+        service.action_rate,
+        service.user_can_ask,
+        service.user_can_consult,
+        service.price_consult,
+        service.consult_via_id,
+        service.is_individual,
+        service.service_created_datetime,
+        price.price,
+        price.price_type,
+        user_account.id AS service_user_id,
+        user_account.email,
+        user_account.username,
+        user_account.first_name,
+        user_account.surname,
+        user_account.profile_picture,
+        user_account.is_professional,
+        user_account.language,
+        -- Subconsulta para obtener las imágenes del servicio
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+         FROM service_image si 
+         WHERE si.service_id = service.id) AS images
+      FROM booking
+      JOIN service ON booking.service_id = service.id
+      JOIN price ON service.price_id = price.id
+      JOIN user_account ON service.user_id = user_account.id
+      WHERE service.user_id = ? -- Filtrar por el user_id dentro de la tabla service
+      ORDER BY booking.booking_start_datetime DESC; -- Ordenar de más reciente a más antiguo
+    `;
+
+    connection.query(query, [userId], (err, bookingsData) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener la información de las reservas:', err);
+        res.status(500).json({ error: 'Error al obtener la información de las reservas.' });
+        return;
+      }
+
+      if (bookingsData.length > 0) {
+        res.status(200).json(bookingsData); // Devolver la lista de reservas con la información del servicio y usuario
+      } else {
+        res.status(200).json({ notFound: true, message: 'No se encontraron reservas para este usuario.' });
+      }
+    });
+  });
+});
+
+
 
 
 
