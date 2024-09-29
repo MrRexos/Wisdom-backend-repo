@@ -1397,6 +1397,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
     const query = `
       SELECT 
         booking.id AS booking_id,
+        booking.user_id AS booking_user_id,
         booking.booking_start_datetime,
         booking.booking_end_datetime,
         booking.service_duration,
