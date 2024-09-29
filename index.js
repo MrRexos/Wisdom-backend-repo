@@ -1421,14 +1421,24 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         service.service_created_datetime,
         price.price,
         price.price_type,
-        user_account.id AS service_user_id,
-        user_account.email,
-        user_account.username,
-        user_account.first_name,
-        user_account.surname,
-        user_account.profile_picture,
-        user_account.is_professional,
-        user_account.language,
+        -- Información del usuario que presta el servicio
+        service_user.id AS service_user_id,
+        service_user.email AS service_user_email,
+        service_user.username AS service_user_username,
+        service_user.first_name AS service_user_first_name,
+        service_user.surname AS service_user_surname,
+        service_user.profile_picture AS service_user_profile_picture,
+        service_user.is_professional AS service_user_is_professional,
+        service_user.language AS service_user_language,
+        -- Información del usuario que realizó la reserva
+        booking_user.id AS booking_user_id,
+        booking_user.email AS booking_user_email,
+        booking_user.username AS booking_user_username,
+        booking_user.first_name AS booking_user_first_name,
+        booking_user.surname AS booking_user_surname,
+        booking_user.profile_picture AS booking_user_profile_picture,
+        booking_user.is_professional AS booking_user_is_professional,
+        booking_user.language AS booking_user_language,
         -- Subconsulta para obtener las imágenes del servicio
         (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
          FROM service_image si 
@@ -1436,7 +1446,8 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
       FROM booking
       JOIN service ON booking.service_id = service.id
       JOIN price ON service.price_id = price.id
-      JOIN user_account ON service.user_id = user_account.id
+      JOIN user_account AS service_user ON service.user_id = service_user.id -- Usuario que presta el servicio
+      JOIN user_account AS booking_user ON booking.user_id = booking_user.id -- Usuario que realizó la reserva
       WHERE service.user_id = ? -- Filtrar por el user_id dentro de la tabla service
       ORDER BY booking.booking_start_datetime DESC; -- Ordenar de más reciente a más antiguo
     `;
@@ -1458,6 +1469,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
     });
   });
 });
+
 
 
 
