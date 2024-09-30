@@ -1550,6 +1550,42 @@ app.get('/api/user/:id/services', (req, res) => {
   });
 });
 
+//Ruta para obtener el dinero en wallet
+app.get('/api/user/:id/wallet', (req, res) => {
+  const { id } = req.params; // ID del usuario
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para obtener el valor de money_in_wallet
+    const query = `
+      SELECT money_in_wallet
+      FROM user_account
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [id], (err, walletData) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener el dinero en la cartera:', err);
+        res.status(500).json({ error: 'Error al obtener el dinero en la cartera.' });
+        return;
+      }
+
+      if (walletData.length > 0) {
+        res.status(200).json({ money_in_wallet: walletData[0].money_in_wallet });
+      } else {
+        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      }
+    });
+  });
+});
+
 
 
 
