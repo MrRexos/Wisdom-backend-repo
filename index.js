@@ -1740,6 +1740,47 @@ app.put('/api/user/:id/allow_notis', (req, res) => {
   });
 });
 
+app.post('/api/directions', (req, res) => {
+  const { user_id, address_type, street_number, address_1, address_2, postal_code, city, state, country } = req.body;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Primero insertar la dirección en la tabla address
+    const addressQuery = 'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+    const addressValues = [address_type, street_number, address_1, address_2, postal_code, city, state, country];
+
+    connection.query(addressQuery, addressValues, (err, result) => {
+      if (err) {
+        connection.release();
+        console.error('Error al insertar la dirección:', err);
+        return res.status(500).json({ error: 'Error al insertar la dirección.' });
+      }
+
+      const addressId = result.insertId; // Obtenemos el ID de la dirección recién insertada
+
+      // Ahora insertar en la tabla directions utilizando el user_id y el address_id
+      const directionsQuery = 'INSERT INTO directions (user_id, address_id) VALUES (?, ?)';
+      const directionsValues = [user_id, addressId];
+
+      connection.query(directionsQuery, directionsValues, (err, result) => {
+        connection.release(); // Liberar la conexión después de usarla
+
+        if (err) {
+          console.error('Error al insertar la dirección en directions:', err);
+          return res.status(500).json({ error: 'Error al insertar en directions.' });
+        }
+
+        res.status(201).json({ message: 'Dirección añadida con éxito', directionsId: result.insertId });
+      });
+    });
+  });
+});
+
+
 
 
 
