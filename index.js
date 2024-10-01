@@ -1790,6 +1790,45 @@ app.post('/api/directions', (req, res) => {
   });
 });
 
+//Ruta para obtener todas las direcciones de un user
+app.get('/api/directions/:user_id', (req, res) => {
+  const { user_id } = req.params;
+
+  if (!user_id) {
+    return res.status(400).json({ error: 'El user_id es requerido.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Consulta para obtener todas las direcciones del usuario junto con los detalles de address
+    const query = `
+      SELECT d.id AS direction_id, a.id AS address_id, a.address_type, a.street_number, a.address_1, a.address_2, a.postal_code, a.city, a.state, a.country
+      FROM directions d
+      JOIN address a ON d.address_id = a.id
+      WHERE d.user_id = ?
+    `;
+
+    connection.query(query, [user_id], (err, results) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener las direcciones:', err);
+        return res.status(500).json({ error: 'Error al obtener las direcciones.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'No se encontraron direcciones para este usuario.' });
+      }
+
+      res.status(200).json({ directions: results });
+    });
+  });
+});
+
 
 
 
