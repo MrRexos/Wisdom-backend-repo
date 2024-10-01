@@ -1695,7 +1695,7 @@ app.delete('/api/user/:id', (req, res) => {
   });
 });
 
-// Ruta para actualizar allow_notis de un usuario
+//Ruta para actualizar allow_notis de un usuario
 app.put('/api/user/:id/allow_notis', (req, res) => {
   const { id } = req.params;  // ID del usuario
   const { allow_notis } = req.body;  // Nuevo valor de `allow_notis`
@@ -1740,8 +1740,18 @@ app.put('/api/user/:id/allow_notis', (req, res) => {
   });
 });
 
+//Ruta para guardar address + direction
 app.post('/api/directions', (req, res) => {
   const { user_id, address_type, street_number, address_1, address_2, postal_code, city, state, country } = req.body;
+
+  // Verificar que los campos requeridos estén presentes, excepto address_2 y street_number que pueden ser nulos
+  if (!user_id || !address_type || !address_1 || !postal_code || !city || !state || !country) {
+    return res.status(400).json({ error: 'Algunos campos requeridos faltan.' });
+  }
+
+  // Si street_number o address_2 son undefined o vacíos, se establecen como NULL
+  const streetNumberValue = street_number || null;
+  const address2Value = address_2 || null;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -1751,7 +1761,7 @@ app.post('/api/directions', (req, res) => {
 
     // Primero insertar la dirección en la tabla address
     const addressQuery = 'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-    const addressValues = [address_type, street_number, address_1, address_2, postal_code, city, state, country];
+    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country];
 
     connection.query(addressQuery, addressValues, (err, result) => {
       if (err) {
@@ -1779,6 +1789,7 @@ app.post('/api/directions', (req, res) => {
     });
   });
 });
+
 
 
 
