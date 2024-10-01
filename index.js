@@ -1695,6 +1695,50 @@ app.delete('/api/user/:id', (req, res) => {
   });
 });
 
+// Ruta para actualizar allow_notis de un usuario
+app.put('/api/user/:id/allow_notis', (req, res) => {
+  const { id } = req.params;  // ID del usuario
+  const { allow_notis } = req.body;  // Nuevo valor de `allow_notis`
+
+  // Verificar que el valor de `allow_notis` sea válido (booleano)
+  if (typeof allow_notis !== 'boolean') {
+      res.status(400).json({ error: 'El valor de allow_notis debe ser un booleano.' });
+      return;
+  }
+
+  // Obtener una conexión del pool de MySQL
+  pool.getConnection((err, connection) => {
+      if (err) {
+          console.error('Error al obtener la conexión:', err);
+          res.status(500).json({ error: 'Error al obtener la conexión.' });
+          return;
+      }
+
+      // Consulta SQL para actualizar el campo `allow_notis`
+      const query = `
+          UPDATE user_account
+          SET allow_notis = ?
+          WHERE id = ?;
+      `;
+
+      // Ejecutar la consulta
+      connection.query(query, [allow_notis, id], (err, result) => {
+          connection.release();  // Liberar la conexión después de usarla
+
+          if (err) {
+              console.error('Error al actualizar allow_notis:', err);
+              res.status(500).json({ error: 'Error al actualizar allow_notis.' });
+              return;
+          }
+
+          if (result.affectedRows > 0) {
+              res.status(200).json({ message: 'allow_notis actualizado exitosamente.' });
+          } else {
+              res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+          }
+      });
+  });
+});
 
 
 
