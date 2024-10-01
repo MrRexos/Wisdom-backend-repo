@@ -1586,6 +1586,115 @@ app.get('/api/user/:id/wallet', (req, res) => {
   });
 });
 
+//Ruta para actualizar el profile
+app.put('/api/user/:id/profile', (req, res) => {
+  const { id } = req.params; // ID del usuario
+  const { profile_picture, username, first_name, surname } = req.body; // Datos a actualizar
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para actualizar los valores en user_account
+    const query = `
+      UPDATE user_account
+      SET profile_picture = ?, username = ?, first_name = ?, surname = ?
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [profile_picture, username, first_name, surname, id], (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al actualizar el perfil del usuario:', err);
+        res.status(500).json({ error: 'Error al actualizar el perfil del usuario.' });
+        return;
+      }
+
+      if (result.affectedRows > 0) {
+        res.status(200).json({ message: 'Perfil actualizado exitosamente.' });
+      } else {
+        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      }
+    });
+  });
+});
+
+//Ruta para actualizar account (ahora mismo solo actualiza email)
+app.put('/api/user/:id/email', (req, res) => {
+  const { id } = req.params; // ID del usuario
+  const { email } = req.body; // Nuevo email a actualizar
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para actualizar el email en user_account
+    const query = `
+      UPDATE user_account
+      SET email = ?
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [email, id], (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al actualizar el email del usuario:', err);
+        res.status(500).json({ error: 'Error al actualizar el email del usuario.' });
+        return;
+      }
+
+      if (result.affectedRows > 0) {
+        res.status(200).json({ message: 'Email actualizado exitosamente.' });
+      } else {
+        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      }
+    });
+  });
+});
+
+//Ruta para borrar una cuenta
+app.delete('/api/user/:id', (req, res) => {
+  const { id } = req.params; // ID del usuario
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    // Consulta para eliminar el usuario de user_account
+    const query = `
+      DELETE FROM user_account
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [id], (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al eliminar la cuenta del usuario:', err);
+        res.status(500).json({ error: 'Error al eliminar la cuenta del usuario.' });
+        return;
+      }
+
+      if (result.affectedRows > 0) {
+        res.status(200).json({ message: 'Cuenta eliminada exitosamente.' });
+      } else {
+        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      }
+    });
+  });
+});
+
 
 
 
