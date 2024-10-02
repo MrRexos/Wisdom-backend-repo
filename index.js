@@ -1829,6 +1829,82 @@ app.get('/api/directions/:user_id', (req, res) => {
   });
 });
 
+//Actualziar address 
+app.put('/api/address/:id', (req, res) => {
+  const { id } = req.params; // ID de la address a actualizar
+  const { address_type, street_number, address_1, address_2, postal_code, city, state, country } = req.body;
+
+  // Verificar que los campos requeridos estén presentes
+  if (!address_type || !address_1 || !postal_code || !city || !state || !country) {
+    return res.status(400).json({ error: 'Algunos campos requeridos faltan.' });
+  }
+
+  // Si street_number o address_2 son undefined o vacíos, se establecen como NULL
+  const streetNumberValue = street_number || null;
+  const address2Value = address_2 || null;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Actualizar la dirección en la tabla address
+    const addressQuery = `
+      UPDATE address 
+      SET address_type = ?, street_number = ?, address_1 = ?, address_2 = ?, postal_code = ?, city = ?, state = ?, country = ?
+      WHERE id = ?`;
+    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country, id];
+
+    connection.query(addressQuery, addressValues, (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al actualizar la dirección:', err);
+        return res.status(500).json({ error: 'Error al actualizar la dirección.' });
+      }
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: 'Dirección no encontrada.' });
+      }
+
+      res.status(200).json({ message: 'Dirección actualizada con éxito' });
+    });
+  });
+});
+
+//Borrar direction por su id
+app.delete('/api/directions/:id', (req, res) => {
+  const { id } = req.params; // ID de la dirección a eliminar
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Eliminar la dirección en la tabla directions
+    const deleteQuery = 'DELETE FROM directions WHERE id = ?';
+    const deleteValues = [id];
+
+    connection.query(deleteQuery, deleteValues, (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al eliminar la dirección:', err);
+        return res.status(500).json({ error: 'Error al eliminar la dirección.' });
+      }
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: 'Dirección no encontrada.' });
+      }
+
+      res.status(200).json({ message: 'Dirección eliminada con éxito' });
+    });
+  });
+});
+
+
 
 
 
