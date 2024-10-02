@@ -1821,7 +1821,7 @@ app.get('/api/directions/:user_id', (req, res) => {
       }
 
       if (results.length === 0) {
-        return res.status(404).json({ message: 'No se encontraron direcciones para este usuario.' });
+        return res.status(200).json({ message: 'No se encontraron direcciones para este usuario.', notFound: true });
       }
 
       res.status(200).json({ directions: results });
