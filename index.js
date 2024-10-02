@@ -1873,8 +1873,8 @@ app.put('/api/address/:id', (req, res) => {
   });
 });
 
-//Borrar direction por su id
-app.delete('/api/directions/:id', (req, res) => {
+//Borrar address por su id
+app.delete('/api/address/:id', (req, res) => {
   const { id } = req.params; // ID de la dirección a eliminar
 
   pool.getConnection((err, connection) => {
@@ -1883,8 +1883,8 @@ app.delete('/api/directions/:id', (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    // Eliminar la dirección en la tabla directions
-    const deleteQuery = 'DELETE FROM directions WHERE id = ?';
+    // Eliminar la dirección en la tabla address
+    const deleteQuery = 'DELETE FROM address WHERE id = ?';
     const deleteValues = [id];
 
     connection.query(deleteQuery, deleteValues, (err, result) => {
