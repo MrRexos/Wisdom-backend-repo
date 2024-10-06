@@ -7,6 +7,9 @@ const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
 
+const Stripe = require('stripe');
+const stripe = new Stripe('tu_clave_secreta');
+
 require('dotenv').config();
 
 const app = express();
@@ -1904,8 +1907,103 @@ app.delete('/api/address/:id', (req, res) => {
   });
 });
 
+//Crear reserva
+app.post('/api/bookings', (req, res) => {
+  const {
+    user_id,
+    address_type,
+    street_number,
+    address_1,
+    address_2,
+    postal_code,
+    city,
+    state,
+    country,
+    service_id,
+    booking_start_datetime,
+    booking_end_datetime,
+    recurrent_pattern_id,
+    promotion_id,
+    service_duration,
+    final_price,
+    description // Nueva propiedad para la descripción
+  } = req.body;
 
+  // Verificación de campos requeridos para el usuario
+  if (!user_id) {
+    return res.status(400).json({ error: 'El campo user_id es requerido.' });
+  }
 
+  // Si street_number o address_2 son undefined o vacíos, se establecen como NULL
+  const streetNumberValue = street_number || null;
+  const address2Value = address_2 || null;
+
+  // Variable para almacenar el address_id
+  let addressId = null;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Paso 1: Verificar si se necesita insertar la dirección
+    if (address_type && address_1 && postal_code && city && state && country) {
+      // Insertar la dirección en `address`
+      const addressQuery = 'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+      const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country];
+
+      connection.query(addressQuery, addressValues, (err, result) => {
+        if (err) {
+          connection.release();
+          console.error('Error al insertar la dirección:', err);
+          return res.status(500).json({ error: 'Error al insertar la dirección.' });
+        }
+
+        addressId = result.insertId; // ID de la dirección recién insertada
+
+        // Paso 2: Insertar en la tabla `booking`
+        createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, description, res);
+      });
+    } else {
+      // Si no se necesita una dirección, se usa NULL para address_id
+      createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, description, res);
+    }
+  });
+});
+
+// Función para crear la reserva
+function createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, description, res) {
+  const bookingQuery = `
+    INSERT INTO booking (user_id, service_id, address_id, payment_method_id, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, is_paid, booking_status, description, order_datetime) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, NOW())
+  `;
+  const bookingValues = [
+    user_id,
+    service_id,
+    addressId, // Esto puede ser null
+    null, // payment_method_id se establece en NULL
+    booking_start_datetime || null,
+    booking_end_datetime || null,
+    recurrent_pattern_id || null,
+    promotion_id || null,
+    service_duration || null,
+    final_price || null,
+    false, // is_paid
+    description || null // Se establece la descripción, puede ser null
+  ];
+
+  connection.query(bookingQuery, bookingValues, (err, result) => {
+    connection.release(); // Liberar la conexión después de usarla
+
+    if (err) {
+      console.error('Error al insertar la reserva:', err);
+      return res.status(500).json({ error: 'Error al insertar la reserva.' });
+    }
+
+    res.status(201).json({ message: 'Reserva creada con éxito', bookingId: result.insertId });
+  });
+}
 
 
 
