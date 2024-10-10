@@ -2166,13 +2166,14 @@ app.get('/api/services', (req, res) => {
         OR service.description LIKE CONCAT('%', ?, '%') -- Prioridad baja
       ORDER BY 
         CASE 
-          WHEN service.service_title LIKE CONCAT('%', ?) THEN 1 -- Más importante
-          WHEN category_type.service_category_name LIKE CONCAT('%', ?) THEN 1 -- Más importante
-          WHEN family.service_family LIKE CONCAT('%', ?) THEN 1 -- Más importante
-          WHEN service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE CONCAT('%', ?,'%')) THEN 1 -- Más importante
-          WHEN service.description LIKE CONCAT('%', ?) THEN 2 -- Menos importante
+          WHEN service.service_title LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
+          WHEN category_type.service_category_name LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
+          WHEN family.service_family LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
+          WHEN EXISTS (SELECT 1 FROM service_tags WHERE service_tags.service_id = service.id AND tag LIKE CONCAT('%', ?, '%')) THEN 1 -- Más importante
+          WHEN service.description LIKE CONCAT('%', ?, '%') THEN 2 -- Menos importante
           ELSE 3
-        END;`;
+        END;
+      `;
 
     connection.query(queryServices, [searchPattern, searchPattern, searchPattern], (err, servicesData) => {
       connection.release(); // Liberar la conexión después de usarla
