@@ -2007,10 +2007,12 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
 
 //Ruta para obtener las sugerencias de busqueda de servicios
 app.get('/api/suggestions', (req, res) => {
-  const { query } = req.query; // Puedes recibir el texto de búsqueda aquí (ej. { query: 'plomero' })
-  console.log('Query:', query);
+  // Obtén el parámetro de consulta `query` del objeto req.query
+  const { query } = req.query;
+
+  // Validar que `query` no esté vacío
   if (!query || typeof query !== 'string' || query.trim() === '') {
-    return res.status(400).json({ error: 'La consulta de búsqueda es requerida.'});
+    return res.status(400).json({ error: 'La consulta de búsqueda es requerida.' });
   }
 
   pool.getConnection((err, connection) => {
@@ -2021,12 +2023,16 @@ app.get('/api/suggestions', (req, res) => {
 
     // Consulta para obtener las sugerencias de búsqueda
     const searchQuery = `
-      SELECT DISTINCT s.service_title, c.service_category_name, f.service_family, t.tag
-      FROM service s
-      LEFT JOIN service_category c ON s.service_category_id = c.id
-      LEFT JOIN service_family f ON c.service_family_id = f.id
-      LEFT JOIN service_tags t ON s.id = t.service_id
-      WHERE s.service_title LIKE ? OR c.service_category_name LIKE ? OR f.service_family LIKE ? OR t.tag LIKE ?
+      SELECT DISTINCT s.service_title, ct.service_category_name, f.service_family, t.tag 
+      FROM service s 
+      LEFT JOIN service_category c ON s.service_category_id = c.id 
+      LEFT JOIN service_family f ON c.service_family_id = f.id 
+      LEFT JOIN service_category_type ct ON c.service_category_type_id = ct.id 
+      LEFT JOIN service_tags t ON s.id = t.service_id 
+      WHERE s.service_title LIKE ? 
+         OR ct.service_category_name LIKE ? 
+         OR f.service_family LIKE ? 
+         OR t.tag LIKE ? 
       LIMIT 8
     `;
 
@@ -2045,10 +2051,12 @@ app.get('/api/suggestions', (req, res) => {
         return res.status(200).json({ message: 'No se encontraron sugerencias.', notFound: true });
       }
 
+      // Respuesta con las sugerencias encontradas
       res.status(200).json({ suggestions: results });
     });
   });
 });
+
 
 
 
