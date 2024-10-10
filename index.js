@@ -2088,7 +2088,7 @@ app.get('/api/suggestions', (req, res) => {
   });
 });
 
-//Ruta para obtener todos los servicios de una busqueda
+//Ruta para obtener todos los servicios de una busqueda 
 app.get('/api/services', (req, res) => {
   const { query } = req.query; // Obtener la consulta de búsqueda de los parámetros de la solicitud
 
