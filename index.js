@@ -2007,21 +2007,24 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
 
 //Ruta para obtener las sugerencias de busqueda de servicios
 app.get('/api/suggestions', (req, res) => {
-  // Obtén el parámetro de consulta `query` del objeto req.query
   const { query } = req.query;
 
-  // Validar que `query` no esté vacío
+  // Validar que se reciba el término de búsqueda
   if (!query || typeof query !== 'string' || query.trim() === '') {
     return res.status(400).json({ error: 'La consulta de búsqueda es requerida.' });
   }
 
+  // Conectar a la base de datos
   pool.getConnection((err, connection) => {
     if (err) {
       console.error('Error al obtener la conexión:', err);
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    // Consulta para obtener las sugerencias de búsqueda
+    // Definir el patrón de búsqueda
+    const searchPattern = `%${query}%`;
+
+    // Consulta para obtener sugerencias de búsqueda
     const searchQuery = `
       SELECT DISTINCT s.service_title, ct.service_category_name, f.service_family, t.tag 
       FROM service s 
@@ -2029,31 +2032,43 @@ app.get('/api/suggestions', (req, res) => {
       LEFT JOIN service_family f ON c.service_family_id = f.id 
       LEFT JOIN service_category_type ct ON c.service_category_type_id = ct.id 
       LEFT JOIN service_tags t ON s.id = t.service_id 
-      WHERE s.service_title LIKE ? 
-         OR ct.service_category_name LIKE ? 
-         OR f.service_family LIKE ? 
-         OR t.tag LIKE ? 
+      WHERE 
+        s.service_title LIKE ? 
+        OR ct.service_category_name LIKE ? 
+        OR f.service_family LIKE ? 
+        OR t.tag LIKE ? 
+      ORDER BY 
+        CASE 
+          WHEN s.service_title LIKE ? THEN 1
+          WHEN ct.service_category_name LIKE ? THEN 2
+          WHEN f.service_family LIKE ? THEN 3
+          WHEN t.tag LIKE ? THEN 4
+          ELSE 5 
+        END 
       LIMIT 8
     `;
 
-    // Definir los patrones de búsqueda
-    const searchPattern = `%${connection.escape(query)}%`;
+    // Ejecutar la consulta
+    connection.query(searchQuery, 
+      [searchPattern, searchPattern, searchPattern, searchPattern, 
+       searchPattern, searchPattern, searchPattern, searchPattern], 
+      (err, results) => {
+        connection.release(); // Liberar la conexión después de usarla
 
-    connection.query(searchQuery, [searchPattern, searchPattern, searchPattern, searchPattern], (err, results) => {
-      connection.release(); // Liberar la conexión después de usarla
+        if (err) {
+          console.error('Error al obtener las sugerencias:', err);
+          return res.status(500).json({ error: 'Error al obtener las sugerencias.' });
+        }
 
-      if (err) {
-        console.error('Error al obtener las sugerencias:', err);
-        return res.status(500).json({ error: 'Error al obtener las sugerencias.' });
+        // Verificar si se encontraron resultados
+        if (results.length === 0) {
+          return res.status(200).json({ message: 'No se encontraron sugerencias.', notFound: true });
+        }
+
+        // Devolver las sugerencias encontradas
+        res.status(200).json({ suggestions: results });
       }
-
-      if (results.length === 0) {
-        return res.status(200).json({ message: 'No se encontraron sugerencias.', notFound: true });
-      }
-
-      // Respuesta con las sugerencias encontradas
-      res.status(200).json({ suggestions: results });
-    });
+    );
   });
 });
 
