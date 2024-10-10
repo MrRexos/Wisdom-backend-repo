@@ -2009,7 +2009,7 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
 app.get('/api/suggestions', (req, res) => {
   const { query } = req; // Puedes recibir el texto de búsqueda aquí (ej. { query: 'plomero' })
 
-  if (!query || query.trim() === '') {
+  if (!query || typeof query !== 'string' || query.trim() === '') {
     return res.status(400).json({ error: 'La consulta de búsqueda es requerida.' });
   }
 
