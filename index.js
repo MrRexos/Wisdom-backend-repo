@@ -2024,9 +2024,9 @@ app.get('/api/suggestions', (req, res) => {
     // Definir el patrón de búsqueda
     const searchPattern = `%${query}%`;
 
-    // Consulta para obtener sugerencias de búsqueda
+    // Consulta para obtener sugerencias de búsqueda, eliminando duplicados
     const searchQuery = `
-      SELECT DISTINCT s.service_title, ct.service_category_name, f.service_family, t.tag 
+      SELECT s.service_title, ct.service_category_name, f.service_family, t.tag 
       FROM service s 
       LEFT JOIN service_category c ON s.service_category_id = c.id 
       LEFT JOIN service_family f ON c.service_family_id = f.id 
@@ -2036,22 +2036,13 @@ app.get('/api/suggestions', (req, res) => {
         s.service_title LIKE ? 
         OR ct.service_category_name LIKE ? 
         OR f.service_family LIKE ? 
-        OR t.tag LIKE ? 
-      ORDER BY 
-        CASE 
-          WHEN s.service_title LIKE ? THEN 1
-          WHEN ct.service_category_name LIKE ? THEN 2
-          WHEN f.service_family LIKE ? THEN 3
-          WHEN t.tag LIKE ? THEN 4
-          ELSE 5 
-        END 
+        OR t.tag LIKE ?
       LIMIT 8
     `;
 
     // Ejecutar la consulta
     connection.query(searchQuery, 
-      [searchPattern, searchPattern, searchPattern, searchPattern, 
-       searchPattern, searchPattern, searchPattern, searchPattern], 
+      [searchPattern, searchPattern, searchPattern, searchPattern], 
       (err, results) => {
         connection.release(); // Liberar la conexión después de usarla
 
@@ -2060,13 +2051,37 @@ app.get('/api/suggestions', (req, res) => {
           return res.status(500).json({ error: 'Error al obtener las sugerencias.' });
         }
 
+        // Crear un array para almacenar las sugerencias únicas
+        const suggestions = [];
+        const uniqueKeys = new Set(); // Usamos un Set para asegurarnos de que no haya duplicados
+
+        results.forEach(result => {
+          // Agregar un solo valor por cada tipo de sugerencia si aún no ha sido agregado
+          if (result.service_title && !uniqueKeys.has(result.service_title)) {
+            suggestions.push({ service_title: result.service_title });
+            uniqueKeys.add(result.service_title);
+          }
+          if (result.service_category_name && !uniqueKeys.has(result.service_category_name)) {
+            suggestions.push({ service_category_name: result.service_category_name });
+            uniqueKeys.add(result.service_category_name);
+          }
+          if (result.service_family && !uniqueKeys.has(result.service_family)) {
+            suggestions.push({ service_family: result.service_family });
+            uniqueKeys.add(result.service_family);
+          }
+          if (result.tag && !uniqueKeys.has(result.tag)) {
+            suggestions.push({ tag: result.tag });
+            uniqueKeys.add(result.tag);
+          }
+        });
+
         // Verificar si se encontraron resultados
-        if (results.length === 0) {
+        if (suggestions.length === 0) {
           return res.status(200).json({ message: 'No se encontraron sugerencias.', notFound: true });
         }
 
         // Devolver las sugerencias encontradas
-        res.status(200).json({ suggestions: results });
+        res.status(200).json({ suggestions });
       }
     );
   });
