@@ -2007,10 +2007,10 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
 
 //Ruta para obtener las sugerencias de busqueda de servicios
 app.get('/api/suggestions', (req, res) => {
-  const { query } = req.query.query; // Puedes recibir el texto de búsqueda aquí (ej. { query: 'plomero' })
-
+  const { query } = req.query; // Puedes recibir el texto de búsqueda aquí (ej. { query: 'plomero' })
+  console.log('Query:', query);
   if (!query || typeof query !== 'string' || query.trim() === '') {
-    return res.status(400).json({ error: 'La consulta de búsqueda es requerida.', query });
+    return res.status(400).json({ error: 'La consulta de búsqueda es requerida.'});
   }
 
   pool.getConnection((err, connection) => {
