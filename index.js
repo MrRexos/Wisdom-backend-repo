@@ -2103,48 +2103,46 @@ app.get('/api/services', (req, res) => {
     const searchPattern = `%${query}%`;
 
     // Consulta para obtener la información de todos los servicios, sus tags y las imágenes
-    const queryServices = `
+    const queryServices = ` 
       SELECT 
-        service.id AS service_id,
-        service.service_title,
-        service.description,
-        service.service_category_id,
-        service.price_id,
-        service.latitude,
-        service.longitude,
-        service.action_rate,
-        service.user_can_ask,
-        service.user_can_consult,
-        service.price_consult,
-        service.consult_via_id,
-        service.is_individual,
-        service.service_created_datetime,
-        price.price,
-        price.price_type,
-        user_account.id AS user_id,
-        user_account.email,
-        user_account.username,
-        user_account.first_name,
-        user_account.surname,
-        user_account.profile_picture,
-        user_account.is_professional,
-        user_account.language,
-        COALESCE(review_data.review_count, 0) AS review_count,
-        COALESCE(review_data.average_rating, 0) AS average_rating,
-        
-        -- Campos adicionales
-        category_type.service_category_name,
-        family.service_family,
-        
-        -- Subconsulta para obtener los tags del servicio
-        (SELECT JSON_ARRAYAGG(tag) 
-        FROM service_tags 
-        WHERE service_tags.service_id = service.id) AS tags,
-        
-        -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
-        FROM service_image si 
-        WHERE si.service_id = service.id) AS images
+      service.id AS service_id,
+      service.service_title,
+      service.description,
+      service.service_category_id,
+      service.price_id,
+      service.latitude,
+      service.longitude,
+      service.action_rate,
+      service.user_can_ask,
+      service.user_can_consult,
+      service.price_consult,
+      service.consult_via_id,
+      service.is_individual,
+      service.service_created_datetime,
+      price.price,
+      price.price_type,
+      user_account.id AS user_id,
+      user_account.email,
+      user_account.username,
+      user_account.first_name,
+      user_account.surname,
+      user_account.profile_picture,
+      user_account.is_professional,
+      user_account.language,
+      COALESCE(review_data.review_count, 0) AS review_count,
+      COALESCE(review_data.average_rating, 0) AS average_rating,
+      category_type.service_category_name,
+      family.service_family,
+      
+      -- Subconsulta para obtener los tags del servicio
+      (SELECT JSON_ARRAYAGG(tag) 
+      FROM service_tags 
+      WHERE service_tags.service_id = service.id) AS tags,
+      
+      -- Subconsulta para obtener las imágenes del servicio
+      (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+      FROM service_image si 
+      WHERE si.service_id = service.id) AS images
     FROM service
     JOIN price ON service.price_id = price.id
     JOIN user_account ON service.user_id = user_account.id
@@ -2152,27 +2150,18 @@ app.get('/api/services', (req, res) => {
     JOIN service_family family ON category.service_family_id = family.id
     JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
     LEFT JOIN (
-        SELECT 
-            service_id,
-            COUNT(*) AS review_count,
-            AVG(rating) AS average_rating
-        FROM review
-        GROUP BY service_id
+      SELECT 
+        service_id,
+        COUNT(*) AS review_count,
+        AVG(rating) AS average_rating
+      FROM review
+      GROUP BY service_id
     ) AS review_data ON service.id = review_data.service_id
-    WHERE service.service_title LIKE CONCAT('%', ?, '%') -- Prioridad alta
-      OR category_type.service_category_name LIKE CONCAT('%', ?, '%') -- Prioridad alta
-      OR family.service_family LIKE CONCAT('%', ?, '%') -- Prioridad alta
-      OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE CONCAT('%', ?, '%')) -- Prioridad alta
-      OR service.description LIKE CONCAT('%', ?, '%') -- Prioridad baja
-    ORDER BY 
-        CASE 
-            WHEN service.service_title LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
-            WHEN category_type.service_category_name LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
-            WHEN family.service_family LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
-            WHEN EXISTS (SELECT 1 FROM service_tags WHERE service_tags.service_id = service.id AND tag LIKE CONCAT('%', ?, '%')) THEN 1 -- Más importante
-            WHEN service.description LIKE CONCAT('%', ?, '%') THEN 2 -- Menos importante
-            ELSE 3
-        END;
+    WHERE service.service_title LIKE CONCAT('%', ?, '%') -- Búsqueda en título
+      OR category_type.service_category_name LIKE CONCAT('%', ?, '%') -- Búsqueda en nombre de categoría
+      OR family.service_family LIKE CONCAT('%', ?, '%') -- Búsqueda en familia de servicios
+      OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE CONCAT('%', ?, '%')) -- Búsqueda en tags
+      OR service.description LIKE CONCAT('%', ?, '%'); -- Búsqueda en descripción
       `;
 
     connection.query(queryServices, [searchPattern, searchPattern, searchPattern], (err, servicesData) => {
