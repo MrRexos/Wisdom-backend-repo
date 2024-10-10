@@ -2057,19 +2057,20 @@ app.get('/api/suggestions', (req, res) => {
 
         results.forEach(result => {
           // Agregar un solo valor por cada tipo de sugerencia si aún no ha sido agregado
-          if (result.service_title && !uniqueKeys.has(result.service_title)) {
+          // y asegurarse de que contenga la palabra de búsqueda
+          if (result.service_title && !uniqueKeys.has(result.service_title) && result.service_title.toLowerCase().includes(query.toLowerCase())) {
             suggestions.push({ service_title: result.service_title });
             uniqueKeys.add(result.service_title);
           }
-          if (result.service_category_name && !uniqueKeys.has(result.service_category_name)) {
+          if (result.service_category_name && !uniqueKeys.has(result.service_category_name) && result.service_category_name.toLowerCase().includes(query.toLowerCase())) {
             suggestions.push({ service_category_name: result.service_category_name });
             uniqueKeys.add(result.service_category_name);
           }
-          if (result.service_family && !uniqueKeys.has(result.service_family)) {
+          if (result.service_family && !uniqueKeys.has(result.service_family) && result.service_family.toLowerCase().includes(query.toLowerCase())) {
             suggestions.push({ service_family: result.service_family });
             uniqueKeys.add(result.service_family);
           }
-          if (result.tag && !uniqueKeys.has(result.tag)) {
+          if (result.tag && !uniqueKeys.has(result.tag) && result.tag.toLowerCase().includes(query.toLowerCase())) {
             suggestions.push({ tag: result.tag });
             uniqueKeys.add(result.tag);
           }
