@@ -2005,7 +2005,50 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
   });
 }
 
+//Ruta para obtener las sugerencias de busqueda de servicios
+app.get('/api/suggestions', (req, res) => {
+  const { query } = req; // Puedes recibir el texto de búsqueda aquí (ej. { query: 'plomero' })
 
+  if (!query || query.trim() === '') {
+    return res.status(400).json({ error: 'La consulta de búsqueda es requerida.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    // Consulta para obtener las sugerencias de búsqueda
+    const searchQuery = `
+      SELECT DISTINCT s.service_title, c.service_category_name, f.service_family, t.tag
+      FROM service s
+      LEFT JOIN service_category c ON s.service_category_id = c.id
+      LEFT JOIN service_family f ON c.service_family_id = f.id
+      LEFT JOIN service_tags t ON s.id = t.service_id
+      WHERE s.service_title LIKE ? OR c.service_category_name LIKE ? OR f.service_family LIKE ? OR t.tag LIKE ?
+      LIMIT 8
+    `;
+
+    // Definir los patrones de búsqueda
+    const searchPattern = `%${connection.escape(query)}%`;
+
+    connection.query(searchQuery, [searchPattern, searchPattern, searchPattern, searchPattern], (err, results) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener las sugerencias:', err);
+        return res.status(500).json({ error: 'Error al obtener las sugerencias.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(200).json({ message: 'No se encontraron sugerencias.', notFound: true });
+      }
+
+      res.status(200).json({ suggestions: results });
+    });
+  });
+});
 
 
 
