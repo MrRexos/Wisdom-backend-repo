@@ -2082,7 +2082,7 @@ app.get('/api/suggestions', (req, res) => {
         }
 
         // Devolver las sugerencias encontradas
-        res.status(200).json({ suggestions });
+        res.status(200).json({ suggestions }); 
       }
     );
   });
