@@ -2159,7 +2159,14 @@ app.get('/api/services', (req, res) => {
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
-      WHERE (service.service_title LIKE ? OR service.description LIKE ?);`;
+      WHERE service.service_title LIKE ? -- Prioridad alta
+        OR service.description LIKE ? -- Prioridad baja
+      ORDER BY 
+        CASE 
+          WHEN service.service_title LIKE ? THEN 1 -- Más importante
+          WHEN service.description LIKE ? THEN 2 -- Menos importante
+          ELSE 3
+        END;`;
 
     connection.query(queryServices, [searchPattern, searchPattern, searchPattern], (err, servicesData) => {
       connection.release(); // Liberar la conexión después de usarla
