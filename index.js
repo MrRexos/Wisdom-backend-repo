@@ -2145,33 +2145,33 @@ app.get('/api/services', (req, res) => {
         (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
         FROM service_image si 
         WHERE si.service_id = service.id) AS images
-      FROM service
-      JOIN price ON service.price_id = price.id
-      JOIN user_account ON service.user_id = user_account.id
-      JOIN service_category category ON service.service_category_id = category.id
-      JOIN service_family family ON category.service_family_id = family.id
-      JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
-      LEFT JOIN (
+    FROM service
+    JOIN price ON service.price_id = price.id
+    JOIN user_account ON service.user_id = user_account.id
+    JOIN service_category category ON service.service_category_id = category.id
+    JOIN service_family family ON category.service_family_id = family.id
+    JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+    LEFT JOIN (
         SELECT 
-          service_id,
-          COUNT(*) AS review_count,
-          AVG(rating) AS average_rating
+            service_id,
+            COUNT(*) AS review_count,
+            AVG(rating) AS average_rating
         FROM review
         GROUP BY service_id
-      ) AS review_data ON service.id = review_data.service_id
-      WHERE service.service_title LIKE CONCAT('%', ?, '%') -- Prioridad alta
-        OR category_type.service_category_name LIKE CONCAT('%', ?, '%') -- Prioridad alta
-        OR family.service_family LIKE CONCAT('%', ?, '%') -- Prioridad alta
-        OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE CONCAT('%', ?, '%')) -- Prioridad alta
-        OR service.description LIKE CONCAT('%', ?, '%') -- Prioridad baja
-      ORDER BY 
+    ) AS review_data ON service.id = review_data.service_id
+    WHERE service.service_title LIKE CONCAT('%', ?, '%') -- Prioridad alta
+      OR category_type.service_category_name LIKE CONCAT('%', ?, '%') -- Prioridad alta
+      OR family.service_family LIKE CONCAT('%', ?, '%') -- Prioridad alta
+      OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE CONCAT('%', ?, '%')) -- Prioridad alta
+      OR service.description LIKE CONCAT('%', ?, '%') -- Prioridad baja
+    ORDER BY 
         CASE 
-          WHEN service.service_title LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
-          WHEN category_type.service_category_name LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
-          WHEN family.service_family LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
-          WHEN EXISTS (SELECT 1 FROM service_tags WHERE service_tags.service_id = service.id AND tag LIKE CONCAT('%', ?, '%')) THEN 1 -- Más importante
-          WHEN service.description LIKE CONCAT('%', ?, '%') THEN 2 -- Menos importante
-          ELSE 3
+            WHEN service.service_title LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
+            WHEN category_type.service_category_name LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
+            WHEN family.service_family LIKE CONCAT('%', ?, '%') THEN 1 -- Más importante
+            WHEN EXISTS (SELECT 1 FROM service_tags WHERE service_tags.service_id = service.id AND tag LIKE CONCAT('%', ?, '%')) THEN 1 -- Más importante
+            WHEN service.description LIKE CONCAT('%', ?, '%') THEN 2 -- Menos importante
+            ELSE 3
         END;
       `;
 
