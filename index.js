@@ -2160,10 +2160,16 @@ app.get('/api/services', (req, res) => {
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
       WHERE service.service_title LIKE ? -- Prioridad alta
+        OR category_type.service_category_name LIKE ? -- Prioridad alta
+        OR family.service_family LIKE ? -- Prioridad alta
+        OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?) -- Prioridad alta
         OR service.description LIKE ? -- Prioridad baja
       ORDER BY 
         CASE 
           WHEN service.service_title LIKE ? THEN 1 -- Más importante
+          WHEN category_type.service_category_name LIKE ? THEN 1 -- Más importante
+          WHEN family.service_family LIKE ? THEN 1 -- Más importante
+          WHEN service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?) THEN 1 -- Más importante
           WHEN service.description LIKE ? THEN 2 -- Menos importante
           ELSE 3
         END;`;
