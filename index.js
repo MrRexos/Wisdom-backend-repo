@@ -2159,11 +2159,11 @@ app.get('/api/services', (req, res) => {
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
-      WHERE service.service_title LIKE ? -- Prioridad alta
-        OR category_type.service_category_name LIKE ? -- Prioridad alta
-        OR family.service_family LIKE ? -- Prioridad alta
-        OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?) -- Prioridad alta
-        OR service.description LIKE ? -- Prioridad baja
+      WHERE service.service_title LIKE ?
+        OR category_type.service_category_name LIKE ?
+        OR family.service_family LIKE ?
+        OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?)
+        OR service.description LIKE ?
       ORDER BY 
         CASE 
           WHEN service.service_title LIKE ? THEN 1 -- Más importante
@@ -2174,7 +2174,7 @@ app.get('/api/services', (req, res) => {
           ELSE 3
         END;`;
 
-    connection.query(queryServices, [searchPattern, searchPattern, searchPattern], (err, servicesData) => {
+    connection.query(queryServices, [searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern], (err, servicesData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
