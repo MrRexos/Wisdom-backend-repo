@@ -2133,11 +2133,14 @@ app.get('/api/services', (req, res) => {
   COALESCE(review_data.average_rating, 0) AS average_rating,
   category_type.service_category_name,
   family.service_family,
-  
-  -- Subconsulta para obtener los tags del servicio
-  (SELECT JSON_ARRAYAGG(tag) 
-   FROM service_tags 
-   WHERE service_tags.service_id = service.id) AS tags,
+
+  -- Subconsulta para obtener los tags del servicio, asegurándonos de manejar null
+  COALESCE(
+    (SELECT JSON_ARRAYAGG(tag) 
+     FROM service_tags 
+     WHERE service_tags.service_id = service.id), 
+    JSON_ARRAY()
+  ) AS tags,
   
   -- Subconsulta para obtener las imágenes del servicio
   (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
@@ -2164,7 +2167,7 @@ WHERE service.service_title LIKE CONCAT('%', ?, '%') -- Búsqueda en título
        SELECT 1 
        FROM service_tags 
        WHERE service_tags.service_id = service.id 
-       AND service_tags.tag LIKE CONCAT('%', ?, '%') -- Búsqueda en tags
+       AND tag LIKE CONCAT('%', ?, '%') -- Búsqueda en tags
    )
    OR service.description LIKE CONCAT('%', ?, '%'); -- Búsqueda en descripción
 
