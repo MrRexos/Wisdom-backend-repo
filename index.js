@@ -22,14 +22,14 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración del pool de conexiones a la base de datos
 const pool = mysql.createPool({
-  host: process.env.HOST,
+  socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
   user: process.env.USER,
   password: process.env.PASSWORD,
   database: process.env.DATABASE,
   waitForConnections: true,
   connectionLimit: 20,  // Número máximo de conexiones en el pool
-  acquireTimeout: 10000,  // Tiempo máximo para adquirir una conexión
-  idleTimeout: 60000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada
+  acquireTimeout: 20000,  // Tiempo máximo para adquirir una conexión
+  connectTimeout: 20000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada
 });
 
 const credentials = JSON.parse(process.env.GCLOUD_KEYFILE_JSON);
