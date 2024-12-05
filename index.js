@@ -22,7 +22,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración del pool de conexiones a la base de datos a
 const pool = mysql.createPool({
-  socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
+  socketPath: `/cloudsql/main-aura-443312-j9:europe-southwest1:wisdom-db`,
   host: process.env.HOST,
   user: process.env.USER,
   password: process.env.PASSWORD,
