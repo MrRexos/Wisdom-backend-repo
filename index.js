@@ -20,7 +20,7 @@ app.use(bodyParser.json());
 app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Configuración del pool de conexiones a la base de datos.
+// Configuración del pool de conexiones a la base de datos
 const pool = mysql.createPool({
   socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
   user: process.env.USER,
