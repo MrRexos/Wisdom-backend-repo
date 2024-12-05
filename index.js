@@ -15,7 +15,7 @@ require('dotenv').config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware para parsear JSON
+// Middleware para parsear JSON.
 app.use(bodyParser.json());
 app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
