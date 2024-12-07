@@ -20,13 +20,13 @@ app.use(bodyParser.json());
 app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Configuración del pool de conexiones a la base de datos a
-const pool = mysql.createPool({
-  socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
-  host: process.env.HOST,
+// Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)
+const pool = mysql.createPool({ 
+  //host: process.env.HOST,
   user: process.env.USER,
   password: process.env.PASSWORD,
   database: process.env.DATABASE,
+  socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
   waitForConnections: true,
   connectionLimit: 20,  // Número máximo de conexiones en el pool
   acquireTimeout: 20000,  // Tiempo máximo para adquirir una conexión
