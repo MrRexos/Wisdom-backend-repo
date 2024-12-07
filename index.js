@@ -30,7 +30,7 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 20,  // Número máximo de conexiones en el pool
   acquireTimeout: 20000,  // Tiempo máximo para adquirir una conexión
-  connectTimeout: 20000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada...
+  connectTimeout: 20000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada
 });
 
 const credentials = JSON.parse(process.env.GCLOUD_KEYFILE_JSON);
