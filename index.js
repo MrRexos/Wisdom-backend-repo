@@ -1324,48 +1324,48 @@ app.get('/api/user/:userId/bookings', (req, res) => {
     // Consulta para obtener la información de todas las reservas y servicios asociados
     const query = `
       SELECT 
-        booking.id AS booking_id,
-        booking.booking_start_datetime,
-        booking.booking_end_datetime,
-        booking.service_duration,
-        booking.final_price,
-        booking.is_paid,
-        booking.booking_status,
-        booking.order_datetime,
-        service.id AS service_id,
-        service.service_title,
-        service.description,
-        service.service_category_id,
-        service.price_id,
-        service.latitude,
-        service.longitude,
-        service.action_rate,
-        service.user_can_ask,
-        service.user_can_consult,
-        service.price_consult,
-        service.consult_via_id,
-        service.is_individual,
-        service.service_created_datetime,
-        price.price,
-        price.price_type,
-        user_account.id AS service_user_id,
-        user_account.email,
-        user_account.username,
-        user_account.first_name,
-        user_account.surname,
-        user_account.profile_picture,
-        user_account.is_professional,
-        user_account.language,
-        -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
-         FROM service_image si 
-         WHERE si.service_id = service.id) AS images
+          booking.id AS booking_id,
+          booking.booking_start_datetime,
+          booking.booking_end_datetime,
+          booking.service_duration,
+          booking.final_price,
+          booking.is_paid,
+          booking.booking_status,
+          booking.order_datetime,
+          service.id AS service_id,
+          service.service_title,
+          service.description,
+          service.service_category_id,
+          service.price_id,
+          service.latitude,
+          service.longitude,
+          service.action_rate,
+          service.user_can_ask,
+          service.user_can_consult,
+          service.price_consult,
+          service.consult_via_id,
+          service.is_individual,
+          service.service_created_datetime,
+          price.price,
+          price.price_type,
+          user_account.id AS service_user_id,
+          user_account.email,
+          user_account.username,
+          user_account.first_name,
+          user_account.surname,
+          user_account.profile_picture,
+          user_account.is_professional,
+          user_account.language,
+          (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+          FROM service_image si 
+          WHERE si.service_id = service.id) AS images
       FROM booking
-      JOIN service ON booking.service_id = service.id
-      JOIN price ON service.price_id = price.id
-      JOIN user_account ON service.user_id = user_account.id
+      LEFT JOIN service ON booking.service_id = service.id
+      LEFT JOIN price ON service.price_id = price.id
+      LEFT JOIN user_account ON service.user_id = user_account.id
       WHERE booking.user_id = ?
       ORDER BY booking.booking_start_datetime DESC;
+
     `;
 
     connection.query(query, [userId], (err, bookingsData) => {
@@ -1973,7 +1973,7 @@ app.post('/api/bookings', (req, res) => {
   });
 });
 
-// Función para crear la reserva
+// Función para crear la reserva 
 function createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, description, res) {
   const bookingQuery = `
     INSERT INTO booking (user_id, service_id, address_id, payment_method_id, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, is_paid, booking_status, description, order_datetime) 
@@ -2200,3 +2200,6 @@ app.get('/api/services', (req, res) => {
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
 });
+
+
+
