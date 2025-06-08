@@ -1,3 +1,5 @@
+require('dotenv').config();
+
 const bodyParser = require('body-parser');
 const express = require('express');
 const mysql = require('mysql2');
@@ -10,18 +12,8 @@ const sharp = require('sharp');
 const Stripe = require('stripe');
 const stripe = new Stripe('tu_clave_secreta');
 
-console.log({
-  DB_HOST:  process.env.DB_HOST,
-  DB_USER:  process.env.DB_USER,
-  DB_PASSWORD:  process.env.DB_PASSWORD,
-  DB_DATABASE:  process.env.DB_DATABASE,
-  DB_PORT:  process.env.DB_PORT,
-});
-
-require('dotenv').config();
-
 const app = express();
-const port = process.env.DB_PORT || 3000;
+const port = process.env.PORT || 3000;
 
 // Middleware para parsear JSON.
 app.use(bodyParser.json());
@@ -29,11 +21,12 @@ app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
-const pool = mysql.createPool({ 
+const pool = mysql.createPool({
   host: process.env.DB_HOST, //process.env.HOST process.env.USER process.env.PASSWORD process.env.DATABASE
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_DATABASE,
+  port: process.env.DB_PORT,
   //socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
   waitForConnections: true,
   connectionLimit: 20,  // Número máximo de conexiones en el pool
