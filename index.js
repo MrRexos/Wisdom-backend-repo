@@ -13,7 +13,7 @@ const stripe = new Stripe('tu_clave_secreta');
 require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 3306 || 3000;
+const port = process.env.DB_PORT || 3000;
 
 // Middleware para parsear JSON.
 app.use(bodyParser.json());
@@ -22,10 +22,10 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({ 
-  host: 'shortline.proxy.rlwy.net', //process.env.HOST
-  user: process.env.USER,
-  password: process.env.PASSWORD,
-  database: process.env.DATABASE,
+  host: process.env.DB_HOST, //process.env.HOST process.env.USER process.env.PASSWORD process.env.DATABASE
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_DATABASE,
   //socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
   waitForConnections: true,
   connectionLimit: 20,  // Número máximo de conexiones en el pool
