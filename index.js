@@ -22,7 +22,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({ 
-  host: '34.175.131.147', //process.env.HOST
+  host: process.env.HOST, //process.env.HOST
   user: process.env.USER,
   password: process.env.PASSWORD,
   database: process.env.DATABASE,
