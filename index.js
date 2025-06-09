@@ -17,7 +17,7 @@ const stripe = new Stripe('tu_clave_secreta');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware para parsear JSON.
+// Middleware para parsear JSON. 
 app.use(bodyParser.json());
 app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
