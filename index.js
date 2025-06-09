@@ -4,10 +4,12 @@ const bodyParser = require('body-parser');
 const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const { Storage } = require('@google-cloud/storage');
 const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
+const nodemailer = require('nodemailer');
 
 const Stripe = require('stripe');
 const stripe = new Stripe('tu_clave_secreta');
@@ -19,6 +21,35 @@ const port = process.env.PORT || 3000;
 app.use(bodyParser.json());
 app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Configuración de transporte para enviar correos
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST,
+  port: process.env.EMAIL_PORT,
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+// Middleware para verificar tokens JWT
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Token requerido' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Token inválido' });
+    }
+    req.user = user;
+    next();
+  });
+}
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({
@@ -81,6 +112,7 @@ app.get('/api/users', (req, res) => {
   });
 });
 
+
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
   const { email, username, password, first_name, surname, language, allow_notis, profile_picture } = req.body;
@@ -89,7 +121,7 @@ app.post('/api/signup', async (req, res) => {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis, profile_picture) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?)';
+    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis, profile_picture, is_verified) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0)';
     const values = [email, username, hashedPassword, first_name, surname, language, allow_notis, profile_picture];
 
     pool.getConnection((err, connection) => {
@@ -114,7 +146,7 @@ app.post('/api/signup', async (req, res) => {
         const serviceListQuery = 'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)';
         const serviceListValues = ['Recently seen', userId];
 
-        connection.query(serviceListQuery, serviceListValues, (err) => {
+        connection.query(serviceListQuery, serviceListValues, async (err) => {
           connection.release(); // Libera la conexión después de la segunda consulta
 
           if (err) {
@@ -122,8 +154,23 @@ app.post('/api/signup', async (req, res) => {
             res.status(500).send('Error al crear la lista de servicios.');
             return;
           }
+          const token = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
-          res.status(201).json({ message: 'Usuario y lista de servicios creados.', userId });
+          // Enviar correo de verificación
+          try {
+            const verifyToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1d' });
+            const url = `${process.env.BASE_URL}/api/verify-email?token=${verifyToken}`;
+            await transporter.sendMail({
+              from: process.env.EMAIL_USER,
+              to: email,
+              subject: 'Confirma tu cuenta',
+              text: `Haz clic en el siguiente enlace para verificar tu cuenta: ${url}`,
+            });
+          } catch (mailErr) {
+            console.error('Error al enviar el correo de verificación:', mailErr);
+          }
+
+          res.status(201).json({ message: 'Usuario y lista de servicios creados.', userId, token });
         });
       });
     });
@@ -185,6 +232,34 @@ app.get('/api/check-username', (req, res) => {
   });
 });
 
+// Ruta para verificar el correo electrónico
+app.get('/api/verify-email', (req, res) => {
+  const { token } = req.query;
+  if (!token) {
+    return res.status(400).send('Token requerido');
+  }
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(400).send('Token inválido');
+    }
+    const userId = decoded.id;
+    pool.getConnection((connErr, connection) => {
+      if (connErr) {
+        console.error('Error al obtener la conexión:', connErr);
+        return res.status(500).send('Error de conexión');
+      }
+      connection.query('UPDATE user_account SET is_verified = 1 WHERE id = ?', [userId], (updErr) => {
+        connection.release();
+        if (updErr) {
+          console.error('Error al verificar el usuario:', updErr);
+          return res.status(500).send('Error al verificar el usuario');
+        }
+        res.send('Cuenta verificada con éxito');
+      });
+    });
+  });
+});
+
 // Ruta para hacer login
 app.post('/api/login', (req, res) => {
   const { usernameOrEmail, password } = req.body;
@@ -211,7 +286,8 @@ app.post('/api/login', (req, res) => {
           const match = await bcrypt.compare(password, user.password);
           if (match) {
             delete user.password;
-            res.json({ success: true, message: 'Inicio de sesión exitoso.', user });
+            const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+            res.json({ success: true, message: 'Inicio de sesión exitoso.', user, token });
           } else {
             res.json({ success: false, message: 'Password incorrect.' });
           }
@@ -225,6 +301,9 @@ app.post('/api/login', (req, res) => {
     });
   });
 });
+
+// Proteger las rutas siguientes con JWT
+app.use(authenticateToken);
 
 // Nueva ruta para subir imágenes a Google Cloud Storage
 app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) => {
@@ -1661,6 +1740,52 @@ app.put('/api/user/:id/email', (req, res) => {
       } else {
         res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
       }
+    });
+  });
+});
+
+// Cambiar contraseña
+app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { currentPassword, newPassword } = req.body;
+
+  if (parseInt(id, 10) !== req.user.id) {
+    return res.status(403).json({ error: 'Acceso denegado' });
+  }
+
+  pool.getConnection(async (err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    connection.query('SELECT password FROM user_account WHERE id = ?', [id], async (err, results) => {
+      if (err) {
+        connection.release();
+        console.error('Error al obtener la contraseña:', err);
+        return res.status(500).json({ error: 'Error al obtener la contraseña.' });
+      }
+
+      if (results.length === 0) {
+        connection.release();
+        return res.status(404).json({ error: 'Usuario no encontrado.' });
+      }
+
+      const match = await bcrypt.compare(currentPassword, results[0].password);
+      if (!match) {
+        connection.release();
+        return res.status(400).json({ error: 'Contraseña actual incorrecta.' });
+      }
+
+      const hashed = await bcrypt.hash(newPassword, 10);
+      connection.query('UPDATE user_account SET password = ? WHERE id = ?', [hashed, id], (err) => {
+        connection.release();
+        if (err) {
+          console.error('Error al actualizar la contraseña:', err);
+          return res.status(500).json({ error: 'Error al actualizar la contraseña.' });
+        }
+        res.json({ message: 'Contraseña actualizada con éxito.' });
+      });
     });
   });
 });
