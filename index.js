@@ -24,14 +24,13 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración de transporte para enviar correos
 const transporter = nodemailer.createTransport({
-  port: Number(process.env.EMAIL_PORT),
-  secure: Number(process.env.EMAIL_PORT) === 465,
+  host: process.env.EMAIL_HOST,
+  port: process.env.EMAIL_PORT,
   secure: false,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
-  tls: { rejectUnauthorized: false },
 });
 
 // Comprobar la configuración del transporte al iniciar la aplicación
@@ -41,6 +40,7 @@ transporter.verify().catch(err => {
 
 // Middleware para verificar tokens JWT
 function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) {
