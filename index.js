@@ -117,7 +117,6 @@ app.get('/api/users', (req, res) => {
   });
 });
 
-
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
   const { email, username, password, first_name, surname, language, allow_notis, profile_picture } = req.body;
