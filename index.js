@@ -22,7 +22,7 @@ app.use(bodyParser.json());
 app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Configuración de transporte para enviar correos
+// Configuración de transporte para enviar correos.
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
   port: process.env.EMAIL_PORT,
