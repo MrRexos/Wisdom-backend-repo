@@ -165,7 +165,7 @@ app.post('/api/signup', async (req, res) => {
             const verifyToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1d' });
             const url = `${process.env.BASE_URL}/api/verify-email?token=${verifyToken}`;
             await transporter.sendMail({
-              from: process.env.EMAIL_USER,
+              from: '"Wisdom" <wisdom.helpcontact@gmail.com>', // process.env.EMAIL_USER,
               to: email,
               subject: 'Confirma tu cuenta',
               text: `Haz clic en el siguiente enlace para verificar tu cuenta: ${url}`,
