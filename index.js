@@ -167,8 +167,266 @@ app.post('/api/signup', async (req, res) => {
             await transporter.sendMail({
               from: '"Wisdom" <wisdom.helpcontact@gmail.com>', // process.env.EMAIL_USER,
               to: email,
-              subject: 'Confirma tu cuenta',
-              text: `Haz clic en el siguiente enlace para verificar tu cuenta: ${url}`,
+              subject: 'Confirm your Wisdom',
+              html:`
+              <!DOCTYPE html>
+              <html lang="en">
+
+              <head>
+                  <meta charset="UTF-8" />
+                  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+                  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+                  <title>Cosmos – 100 Elements Milestone</title>
+
+                  <!-- Font → Inter (very similar to the one used in the design) -->
+                  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+                  <style>
+                      :root {
+                          /* Highlight colour for the inline link */
+                          --cosmos-yellow: #f0de7a;
+                          /* Greys used across the layout */
+                          --grey-100: #f3f4f6;
+                          --grey-500: #6b7280;
+                          --grey-900: #111827;
+                          /* Neutral for the button */
+                          --btn-bg: #f3f3f3;
+                          --btn-bg-hover: #e6e6e6;
+                      }
+
+                      * {
+                          box-sizing: border-box;
+                          margin: 0;
+                          padding: 0;
+                      }
+
+                      body {
+                          font-family: "Inter", sans-serif;
+                          background: #ffffff;
+                          color: var(--grey-900);
+                          -webkit-font-smoothing: antialiased;
+                          text-rendering: optimizeLegibility;
+                      }
+
+                      /* ===== LAYOUT CONTAINER ===== */
+                      .wrapper {
+                          width: 100%;
+                          max-width: 600px;
+                          /* matches the visual width in the screenshot */
+                          margin: 0 auto;
+                          padding: 48px 24px;
+                          text-align: center;
+                      }
+
+                      /* ===== LOGO ===== */
+                      .logo {
+                          font-size: 24px;
+                          font-weight: 600;
+                          letter-spacing: 0.6px;
+                          margin-bottom: 32px;
+                      }
+
+                      .logo sup {
+                          font-size: 12px;
+                          vertical-align: top;
+                          margin-left: 1px;
+                      }
+
+                      /* ===== HERO ===== */
+                      .hero {
+                          position: relative;
+                          overflow: hidden;
+                          border-radius: 4px;
+                          margin-bottom: 40px;
+                      }
+
+                      .hero img {
+                          width: 100%;
+                          display: block;
+                          filter: grayscale(100%);
+                          object-fit: cover;
+                      }
+
+                      .count {
+                          position: absolute;
+                          top: 50%;
+                          left: 50%;
+                          transform: translate(-50%, -50%);
+                          color: #ffffff;
+                          text-align: center;
+                      }
+
+                      .count span {
+                          display: block;
+                      }
+
+                      .count .number {
+                          font-size: 64px;
+                          font-weight: 500;
+                          letter-spacing: 1px;
+                      }
+
+                      .count .label {
+                          font-size: 14px;
+                          letter-spacing: 1.2px;
+                          text-transform: uppercase;
+                          margin-top: 6px;
+                      }
+
+                      /* ===== HEADINGS & TEXT ===== */
+                      h1 {
+                          font-size: 30px;
+                          font-weight: 500;
+                          margin-bottom: 16px;
+                      }
+
+                      p.message {
+                          font-size: 16px;
+                          line-height: 1.55;
+                          max-width: 420px;
+                          margin: 0 auto 50px auto;
+                      }
+
+
+
+                      /* ===== PRIMARY BUTTON ===== */
+                      .cta {
+                          display: inline-block;
+                          padding: 22px 100px;
+                          background: var(--btn-bg);
+                          text-decoration:none;
+                          color: black;
+                          border: none;
+                          border-radius: 14px;
+                          font-size: 14px;
+                          font-weight: 600;
+                          cursor: pointer;
+                          transition: background 0.2s ease;
+                      }
+
+                      .cta:hover {
+                          background: var(--btn-bg-hover);
+                      }
+
+                      /* ===== FOOTER ===== */
+                      footer {
+                          margin-top: 40px;
+                          font-size: 12px;
+                          color: var(--grey-500);
+                      }
+
+                      .social {
+                          margin-bottom: 24px;
+                      }
+
+                      .social a {
+                          width: 32px;
+                          height: 32px;
+                          display: inline-flex;
+                          align-items: center;
+                          justify-content: center;
+                          background: var(--grey-100);
+                          border-radius: 50%;
+                          margin: 0 5px;
+                          text-decoration: none;
+                      }
+
+                      .social svg {
+                          width: 18px;
+                          height: 18px;
+                          fill: var(--grey-900);
+                      }
+
+                      .legal {
+                          margin: 16px 0;
+                      }
+
+                      .legal a {
+                          color: inherit;
+                          text-decoration: none;
+                      }
+
+                      .address {
+                          margin-top: 16px;
+                      }
+                      .line {
+                          border-bottom: 3px;
+                          background: var(--grey-100);
+                          margin-top: 70px;
+                          width: 100%;
+                      }
+
+
+                  </style>
+              </head>
+
+              <body>
+                  <main class="wrapper">
+                      <!-- Logo (text‑based) -->
+                      <div class="logo">WISDOM<sup>®</sup></div>
+
+                      <!-- Hero with overlayed milestone number -->
+                      <section class="hero">
+                          <!-- Replace the src with the actual hero asset → the screenshot shows a greyish close‑up hand photo -->
+                          <!-- <img src="https://via.placeholder.com/600x300/000000/ffffff?text=" /> -->
+
+
+                      </section>
+
+                      <!-- Copywriting -->
+                      <h1>Welcome to Wisdom</h1>
+                      <p class="message">
+                          You've successfully sign up on Wisdom. Please confirm your email.
+                      </p>
+                      <br />
+
+                      <!-- Call‑to‑action -->
+                      <a href="${url}" class="cta">Verify email</a> 
+                      
+                      <hr class="line" width="100%" size="2">
+
+                      <!-- FOOTER -->
+                      <footer>
+                          <!-- Social icons (SVG placeholders) -->
+                          <div class="social">
+                              <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web">
+                                  <svg viewBox="0 0 24 24">
+                                      <circle cx="12" cy="12" r="9" />
+                                  </svg>
+                              </a>
+
+                              <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram">
+                                  <svg viewBox="0 0 24 24">
+                                      <rect x="4" y="4" width="16" height="16" rx="4" />
+                                  </svg>
+                              </a>
+                              <a href="#" aria-label="Twitter">
+                                  <svg viewBox="0 0 24 24">
+                                      <path d="M 3320 4383 c -155 -24 -289 -74 -403 -150 c -200 -133 -332 -324 -392 -567 c -19 -77 -25 -256 -12 -348 l 8 -58 l -56 0 c -107 0 -365 46 -534 95 c -324 94 -650 263 -911 472 c -96 76 -282 255 -340 327 c -25 30 -50 55 -57 56 c -11 0 -57 -103 -86 -195 c -78 -245 -28 -560 122 -778 c 49 -70 156 -183 210 -220 c 39 -26 18 -31 -69 -18 c -85 13 -190 45 -257 80 c -23 11 -45 21 -49 21 c -11 0 7 -159 27 -239 c 24 -93 85 -224 144 -306 c 64 -91 201 -214 295 -267 c 45 -26 120 -59 167 -74 c 99 -32 95 -37 -45 -55 c -62 -8 -112 -8 -172 -1 c -47 6 -87 9 -89 7 c -2 -2 9 -35 24 -72 c 58 -146 198 -314 343 -412 c 111 -75 272 -133 410 -147 c 34 -4 62 -10 62 -14 c 0 -16 -191 -134 -315 -196 c -281 -138 -604 -204 -911 -187 c -57 3 -104 4 -104 1 c 0 -10 189 -114 290 -161 c 251 -117 516 -192 805 -228 c 133 -16 495 -17 620 -1 c 826 107 1474 518 1901 1208 c 256 415 404 922 404 1391 l 0 131 l 84 66 c 46 36 125 110 174 163 c 94 102 197 231 190 239 c -3 2 -32 -7 -66 -21 c -117 -48 -433 -125 -432 -106 c 0 3 22 21 49 39 c 64 43 154 133 207 208 c 45 62 130 231 122 239 c -3 3 -61 -21 -129 -54 c -118 -56 -281 -114 -396 -141 l -53 -12 l -52 47 c -63 56 -144 113 -213 148 c -136 68 -381 111 -515 90 Z"/>
+                                  </svg>
+                              </a>
+                          </div>
+                          
+                          
+
+                          <!-- Legal links -->
+                          <div class="legal">
+                              <a href="#">Privacy Policy</a> · <a href="#">Terms of Service</a>
+                          </div>
+
+                          <!-- Address -->
+                          <div <br /><br />Mataró, BCN, 08304</div>
+
+                          <!-- Unsubscribe notice -->
+                          <div class="unsubscribe">
+                              <br /><br />
+                              This email was sent to example@email.com<br />
+                          </div>
+                      </footer>
+                  </main>
+              </body>
+
+              </html>`
             });
           } catch (mailErr) {
             console.error('Error al enviar el correo de verificación:', mailErr);
