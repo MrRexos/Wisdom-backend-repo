@@ -253,7 +253,9 @@ app.post('/api/signup', async (req, res) => {
                               align-items: center;
                             ">
                             
-                            <img src="cid:wisdomLogo" alt="Wisdom" width="18" height="9" style="display:block;margin:auto;" />
+                            <img src="cid:wisdomLogo"
+                              alt="Wisdom"
+                              style="display:block; margin:auto; max-width:18px; max-height:18px; object-fit:contain;" />
 
                           </a>
                         </td>
