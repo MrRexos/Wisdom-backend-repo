@@ -236,7 +236,7 @@ app.post('/api/signup', async (req, res) => {
                               align-items: center;
                             ">
                             
-                            <svg
+                            <svg  xmlns="http://www.w3.org/2000/svg"
                               viewBox="-5000 -15000 40000 10000"
                               width="18"
                               height="18"
@@ -263,7 +263,7 @@ app.post('/api/signup', async (req, res) => {
                               justify-content: center;
                               align-items: center;
                             ">
-                            <svg
+                            <svg  xmlns="http://www.w3.org/2000/svg"
                               viewBox="0 0 5120 5120"
                               width="18"
                               height="18"
@@ -291,7 +291,7 @@ app.post('/api/signup', async (req, res) => {
                               justify-content: center;
                               align-items: center;
                             ">
-                            <svg viewBox="0 0 21 24" width="18" height="18" fill="#111827" style="display:block;margin:auto;">
+                            <svg  xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 24" width="18" height="18" fill="#111827" style="display:block;margin:auto;">
                               <path d="M8 19c5.5 0 10-4.5 10-10 0-.2 0-.4 0-.6a7.2 7.2 0 0 0 1.8-1.9c-.7.3-1.5.5-2.3.5a4 4 0 0 0 1.7-2.2 8 8 0 0 1-2.6 1 4 4 0 0 0-6.8 3.6A11.3 11.3 0 0 1 3 5.2a4 4 0 0 0 1.3 5.3A4 4 0 0 1 2.4 10v.1a4 4 0 0 0 3.2 3.9 4 4 0 0 1-1.8.1 4 4 0 0 0 3.7 2.7A8.1 8.1 0 0 1 2 18.6a11.3 11.3 0 0 0 6 1.8"/>
                             </svg>
                           </a>
