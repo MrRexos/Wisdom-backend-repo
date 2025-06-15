@@ -245,7 +245,7 @@ app.post('/api/signup', async (req, res) => {
                             style="
                               display: flex;
                               width: 32px;
-                              height: 16px;
+                              height: 32px;
                               background: #f3f4f6;
                               border-radius: 50%;
                               text-decoration: none;
@@ -253,7 +253,7 @@ app.post('/api/signup', async (req, res) => {
                               align-items: center;
                             ">
                             
-                            <img src="cid:wisdomLogo" alt="Wisdom" width="18" height="18" style="display:block;margin:auto;" />
+                            <img src="cid:wisdomLogo" alt="Wisdom" width="18" height="9" style="display:block;margin:auto;" />
 
                           </a>
                         </td>
