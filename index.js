@@ -300,7 +300,7 @@ app.post('/api/signup', async (req, res) => {
                     </table>
 
                     <!-- PIE DE PÁGINA -->
-                    <div style="font-size:12px;color:#6b7280;line-height:1.4;">
+                    <div style="font-size:12px;color:#6b7280;line-height:1.4;text-decoration:none;">
                       <a href="#" style="color:#6b7280;text-decoration:none;">Privacy Policy</a>
                       &nbsp;·&nbsp;
                       <a href="#" style="color:#6b7280;text-decoration:none;">Terms of Service</a>
