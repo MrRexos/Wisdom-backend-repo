@@ -168,6 +168,23 @@ app.post('/api/signup', async (req, res) => {
               from: '"Wisdom" <wisdom.helpcontact@gmail.com>', // process.env.EMAIL_USER,
               to: email,
               subject: 'Confirm your Wisdom',
+              attachments: [
+                {
+                  filename: 'wisdom.png',
+                  path: path.join(__dirname, 'assets', 'wisdom.png'),
+                  cid: 'wisdomLogo'
+                },
+                {
+                  filename: 'instagram.png',
+                  path: path.join(__dirname, 'assets', 'instagram.png'),
+                  cid: 'instagramLogo'
+                },
+                {
+                  filename: 'twitter.png',
+                  path: path.join(__dirname, 'assets', 'twitter.png'),
+                  cid: 'twitterLogo'
+                }
+              ],
               html:`
               <table
                 width="100%"
@@ -236,18 +253,7 @@ app.post('/api/signup', async (req, res) => {
                               align-items: center;
                             ">
                             
-                            <svg  xmlns="http://www.w3.org/2000/svg"
-                              viewBox="-5000 -15000 40000 10000"
-                              width="18"
-                              height="18"
-                              fill="#111827"
-                              aria-hidden="true"
-                            >
-                                                
-                              <g transform="translate(0,0) scale(1,-1)">
-                                <path d="M 345 17646 c -160 -39 -280 -158 -321 -316 c -22 -88 -15 -200 18 -272 c 31 -67 9607 -16794 9656 -16867 c 49 -73 136 -136 224 -162 c 57 -18 87 -21 160 -17 c 77 5 100 11 163 42 c 50 25 88 53 122 90 c 33 37 823 1364 2532 4255 c 1366 2310 2487 4201 2490 4201 c 3 0 1124 -1891 2491 -4203 c 1417 -2396 2502 -4221 2525 -4246 c 116 -127 296 -175 456 -121 c 118 40 182 95 257 222 c 228 387 9617 16799 9628 16830 c 85 242 -77 520 -331 567 c -79 15 -9438 16 -9516 1 c -78 -15 -169 -63 -224 -118 c -36 -36 -654 -1074 -2660 -4466 c -1438 -2430 -2617 -4422 -2622 -4427 c -4 -4 -1187 1986 -2628 4423 c -2768 4681 -2644 4475 -2755 4541 c -105 61 276 57 -4895 56 c -3688 -1 -4731 -3 -4770 -13 Z" />
-                              </g>
-                            </svg>
+                            <img src="cid:wisdomLogo" alt="Wisdom" width="18" height="18" style="display:block;margin:auto;" />
 
                           </a>
                         </td>
@@ -263,20 +269,7 @@ app.post('/api/signup', async (req, res) => {
                               justify-content: center;
                               align-items: center;
                             ">
-                            <svg  xmlns="http://www.w3.org/2000/svg"
-                              viewBox="0 0 5120 5120"
-                              width="18"
-                              height="18"
-                              fill="#111827"
-                              style="display:block;margin:auto;"
-                              aria-hidden="true"
-                            >
-                              <path d="M 1525 4798 c -356 -40 -708 -245 -939 -549 c -139 -184 -240 -438 -266 -671 c -14 -132 -14 -1904 0 -2036 c 41 -372 241 -720 551 -956 c 184 -139 438 -240 671 -266 c 132 -14 1904 -14 2036 0 c 633 69 1153 589 1222 1222 c 14 132 14 1904 0 2036 c -69 633 -589 1153 -1222 1222 c -120 12 -1937 11 -2053 -2 Z m 2138 -365 c 212 -60 360 -147 502 -295 c 138 -142 214 -279 268 -481 c 22 -82 22 -86 22 -1097 c 0 -1011 0 -1015 -22 -1097 c -54 -202 -130 -339 -268 -481 c -144 -150 -297 -239 -507 -295 l -83 -22 l -1015 0 l -1015 0 l -83 22 c -210 56 -363 145 -507 295 c -138 142 -214 279 -268 481 c -22 82 -22 86 -22 1097 c 0 1011 0 1015 22 1097 c 54 202 130 339 268 481 c 130 135 253 213 428 271 c 148 50 146 50 1207 48 c 994 -2 995 -2 1073 -24 Z"></path>
-                            
-                              <path d="M 3750 1510 c -127 -38 -204 -177 -167 -301 c 52 -179 274 -238 405 -107 c 65 65 87 158 59 250 c -14 50 -69 114 -118 139 c -47 24 -133 33 -179 19 Z"></path>
-                            
-                              <path d="M 2436 3800 c -314 -36 -598 -185 -809 -425 c -524 -598 -371 -1519 319 -1919 c 355 -206 810 -223 1169 -44 c 262 131 446 311 580 570 c 193 372 181 825 -31 1192 c -182 316 -489 535 -854 610 c -97 19 -274 27 -374 16 Z m 370 -375 c 298 -75 548 -317 640 -620 c 26 -83 28 -103 28 -255 c 0 -152 -2 -172 -28 -255 c -94 -306 -315 -527 -621 -621 c -83 -26 -103 -28 -255 -28 c -152 0 -172 2 -255 28 c -493 150 -763 668 -605 1161 c 60 185 221 384 400 494 c 200 122 453 157 696 96 Z"></path>
-                            </svg>
+                            <img src="cid:instagramLogo" alt="Instagram" width="18" height="18" style="display:block;margin:auto;" />
                           </a>
                         </td>
                         <td style="padding:0 0px;">
@@ -291,9 +284,7 @@ app.post('/api/signup', async (req, res) => {
                               justify-content: center;
                               align-items: center;
                             ">
-                            <svg  xmlns="http://www.w3.org/2000/svg" viewBox="0 0 21 24" width="18" height="18" fill="#111827" style="display:block;margin:auto;">
-                              <path d="M8 19c5.5 0 10-4.5 10-10 0-.2 0-.4 0-.6a7.2 7.2 0 0 0 1.8-1.9c-.7.3-1.5.5-2.3.5a4 4 0 0 0 1.7-2.2 8 8 0 0 1-2.6 1 4 4 0 0 0-6.8 3.6A11.3 11.3 0 0 1 3 5.2a4 4 0 0 0 1.3 5.3A4 4 0 0 1 2.4 10v.1a4 4 0 0 0 3.2 3.9 4 4 0 0 1-1.8.1 4 4 0 0 0 3.7 2.7A8.1 8.1 0 0 1 2 18.6a11.3 11.3 0 0 0 6 1.8"/>
-                            </svg>
+                            <img src="cid:twitterLogo" alt="Twitter" width="18" height="18" style="display:block;margin:auto;" />
                           </a>
                         </td>
                       </tr>
