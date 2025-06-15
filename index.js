@@ -245,7 +245,7 @@ app.post('/api/signup', async (req, res) => {
                             style="
                               display: flex;
                               width: 32px;
-                              height: 32px;
+                              height: 16px;
                               background: #f3f4f6;
                               border-radius: 50%;
                               text-decoration: none;
@@ -273,7 +273,7 @@ app.post('/api/signup', async (req, res) => {
                           </a>
                         </td>
                         <td style="padding:0 0px;">
-                          <a href="https://twitter.com/" aria-label="Twitter"
+                          <a href="https://x.com/wisdom_entity" aria-label="Twitter"
                             style="
                               display: flex;
                               width: 32px;
