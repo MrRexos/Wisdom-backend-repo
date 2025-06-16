@@ -489,9 +489,6 @@ app.post('/api/forgot-password', (req, res) => {
                 <div style="font-size:24px;font-weight:600;letter-spacing:.6px;margin-bottom:32px;">
                   WISDOM<sup style="font-size:12px;vertical-align:top;">®</sup>
                 </div>
-                <h1 style="font-size:30px;font-weight:500;margin-bottom:16px;">
-                  Reset your password for Wisdom
-                </h1>
                 <p style="font-size:16px;line-height:1.55;max-width:420px;margin:0 auto 50px;">
                   It looks like you lost your password. To pick a new one, hit the button below
                 </p>
@@ -546,8 +543,8 @@ app.get('/reset-password', (req, res) => {
   if (!token) {
     return res.status(400).send('Token requerido');
   }
-  const deepLink = `Wisdom_expo://reset-password?token=${token}`;
-  res.redirect(deepLink);
+  const deepLink = `wisdomexpo://reset-password?token=${token}`;
+  res.redirect(302, deepLink);
 });
 
 // Restablecer contraseña con token
