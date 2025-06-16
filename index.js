@@ -543,7 +543,7 @@ app.get('/reset-password', (req, res) => {
   if (!token) {
     return res.status(400).send('Token requerido');
   }
-  const deepLink = `wisdomexpo://reset-password?token=${token}`;
+  const deepLink = `Wisdom_expo://reset-password?token=${token}`;
   res.redirect(302, deepLink);
 });
 
