@@ -547,9 +547,7 @@ app.get('/reset-password', (req, res) => {
     return res.status(400).send('Token requerido');
   }
   const deepLink = `Wisdom_expo://reset-password?token=${token}`;
-  res.send(
-    `<html><head><meta http-equiv="refresh" content="0; URL=${deepLink}" /></head><body>Redirecting...</body></html>`
-  );
+  res.redirect(deepLink);
 });
 
 // Restablecer contraseña con token
