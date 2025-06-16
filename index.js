@@ -470,7 +470,7 @@ app.post('/api/forgot-password', (req, res) => {
 
       const { id, email } = results[0];
       const resetToken = jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-      const url = `${process.env.BASE_URL}/reset-password?token=${resetToken}`;
+      const url = `Wisdom_expo://reset-password?token=${resetToken}`;
 
       try {
         await transporter.sendMail({
@@ -535,16 +535,6 @@ app.post('/api/forgot-password', (req, res) => {
       res.json({ message: 'Reset email sent' });
     });
   });
-});
-
-// Página intermedia para abrir la app desde el enlace de restablecer contraseña
-app.get('/reset-password', (req, res) => {
-  const { token } = req.query;
-  if (!token) {
-    return res.status(400).send('Token requerido');
-  }
-  const deepLink = `Wisdom_expo://reset-password?token=${token}`;
-  res.redirect(deepLink);
 });
 
 // Restablecer contraseña con token
