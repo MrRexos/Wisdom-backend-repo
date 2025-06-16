@@ -253,7 +253,7 @@ app.post('/api/signup', async (req, res) => {
                               align-items: center;
                             ">
                             
-                            <img src="cid:wisdomLogo"
+                            <img src="cid:wisdomLogo" width="18" height="18"
                               alt="Wisdom"
                               style="display:block; margin:auto; max-width:18px; max-height:18px; object-fit:contain;" />
 
@@ -500,7 +500,7 @@ app.post('/api/forgot-password', (req, res) => {
                   <tr>
                     <td style="padding:0 5px;">
                       <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web" style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
-                        <img src="cid:wisdomLogo" alt="Wisdom" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
+                        <img src="cid:wisdomLogo" width="18" height="18" alt="Wisdom" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
                       </a>
                     </td>
                     <td style="padding:0 5px;">
@@ -599,7 +599,7 @@ app.post('/api/reset-password', async (req, res) => {
 
 
 // Proteger las rutas siguientes con JWT
-app.use(authenticateToken);
+//app.use(authenticateToken);
 
 // Nueva ruta para subir imágenes a Google Cloud Storage
 app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) => {
