@@ -540,8 +540,10 @@ app.post('/api/forgot-password', (req, res) => {
 // Página intermedia para abrir la app desde el enlace de restablecer contraseña
 app.get('/reset-password', (req, res) => {
   const { token } = req.query;
-  
-  const deepLink = `Wisdom_expo://reset-password?token=${token}`;
+  if (!token) {
+    return res.status(400).send('Token requerido');
+  }
+  const deepLink = `Wisdom-expo://reset-password?token=${token}`;
   res.redirect(302, deepLink);
 });
 
