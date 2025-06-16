@@ -599,7 +599,7 @@ app.post('/api/reset-password', async (req, res) => {
 
 
 // Proteger las rutas siguientes con JWT
-//app.use(authenticateToken);
+app.use(authenticateToken);
 
 // Nueva ruta para subir imágenes a Google Cloud Storage
 app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) => {
