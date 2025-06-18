@@ -20,6 +20,7 @@ const port = process.env.PORT || 3000;
 // Middleware para parsear JSON. 
 app.use(bodyParser.json());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Configuración de transporte para enviar correos.
@@ -395,7 +396,7 @@ app.get('/api/verify-email', (req, res) => {
           console.error('Error al verificar el usuario:', updErr);
           return res.status(500).send('Error al verificar el usuario');
         }
-        res.send('Cuenta verificada con éxito');
+        res.sendFile(path.join(__dirname, 'public', 'verify-success.html'));
       });
     });
   });
