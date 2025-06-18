@@ -10,6 +10,7 @@ const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
 const nodemailer = require('nodemailer');
+const fs = require('fs');
 
 const Stripe = require('stripe');
 const stripe = new Stripe('tu_clave_secreta');
@@ -22,6 +23,11 @@ app.use(bodyParser.json());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 const upload = multer({ storage: multer.memoryStorage() });
+
+// Imágenes en base64 para los correos
+const wisdomLogoBase64 = fs.readFileSync(path.join(__dirname, 'assets', 'wisdom.png'), { encoding: 'base64' });
+const instagramLogoBase64 = fs.readFileSync(path.join(__dirname, 'assets', 'instagram.png'), { encoding: 'base64' });
+const twitterLogoBase64 = fs.readFileSync(path.join(__dirname, 'assets', 'twitter.png'), { encoding: 'base64' });
 
 // Configuración de transporte para enviar correos.
 const transporter = nodemailer.createTransport({
@@ -169,23 +175,6 @@ app.post('/api/signup', async (req, res) => {
               from: '"Wisdom" <wisdom.helpcontact@gmail.com>', // process.env.EMAIL_USER,
               to: email,
               subject: 'Confirm your Wisdom',
-              attachments: [
-                {
-                  filename: 'wisdom.png',
-                  path: path.join(__dirname, 'assets', 'wisdom.png'),
-                  cid: 'wisdomLogo'
-                },
-                {
-                  filename: 'instagram.png',
-                  path: path.join(__dirname, 'assets', 'instagram.png'),
-                  cid: 'instagramLogo'
-                },
-                {
-                  filename: 'twitter.png',
-                  path: path.join(__dirname, 'assets', 'twitter.png'),
-                  cid: 'twitterLogo'
-                }
-              ],
               html:`
               <table
                 width="100%"
@@ -254,7 +243,7 @@ app.post('/api/signup', async (req, res) => {
                               align-items: center;
                             ">
                             
-                            <img src="cid:wisdomLogo" width="18" height="18"
+                            <img src="data:image/png;base64,${wisdomLogoBase64}" width="18" height="18"
                               alt="Wisdom"
                               style="display:block; margin:auto; max-width:18px; max-height:18px; object-fit:contain;" />
 
@@ -272,7 +261,7 @@ app.post('/api/signup', async (req, res) => {
                               justify-content: center;
                               align-items: center;
                             ">
-                            <img src="cid:instagramLogo" alt="Instagram" width="18" height="18" style="display:block;margin:auto;" />
+                            <img src="data:image/png;base64,${instagramLogoBase64}" alt="Instagram" width="18" height="18" style="display:block;margin:auto;" />
                           </a>
                         </td>
                         <td style="padding:0 0px;">
@@ -287,7 +276,7 @@ app.post('/api/signup', async (req, res) => {
                               justify-content: center;
                               align-items: center;
                             ">
-                            <img src="cid:twitterLogo" alt="Twitter" width="18" height="18" style="display:block;margin:auto;" />
+                            <img src="data:image/png;base64,${twitterLogoBase64}" alt="Twitter" width="18" height="18" style="display:block;margin:auto;" />
                           </a>
                         </td>
                       </tr>
@@ -490,11 +479,6 @@ app.post('/api/forgot-password', (req, res) => {
               from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
               to: email,
               subject: 'Reset your password for Wisdom',
-              attachments: [
-                { filename: 'wisdom.png', path: path.join(__dirname, 'assets', 'wisdom.png'), cid: 'wisdomLogo' },
-                { filename: 'instagram.png', path: path.join(__dirname, 'assets', 'instagram.png'), cid: 'instagramLogo' },
-                { filename: 'twitter.png', path: path.join(__dirname, 'assets', 'twitter.png'), cid: 'twitterLogo' }
-              ],
               html: `
                 <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;font-family:Inter,sans-serif;color:#111827;">
                   <tr>
@@ -511,17 +495,17 @@ app.post('/api/forgot-password', (req, res) => {
                         <tr>
                           <td style="padding:0 5px;">
                             <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web" style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
-                              <img src="cid:wisdomLogo" width="18" height="18" alt="Wisdom" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
+                              <img src="data:image/png;base64,${wisdomLogoBase64}" width="18" height="18" alt="Wisdom" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
                             </a>
                           </td>
                           <td style="padding:0 5px;">
                             <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram" style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
-                              <img src="cid:instagramLogo" alt="Instagram" width="18" height="18" style="display:block;margin:auto;" />
+                              <img src="data:image/png;base64,${instagramLogoBase64}" alt="Instagram" width="18" height="18" style="display:block;margin:auto;" />
                             </a>
                           </td>
                           <td style="padding:0 0px;">
                             <a href="https://x.com/wisdom_entity" aria-label="Twitter" style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
-                              <img src="cid:twitterLogo" alt="Twitter" width="18" height="18" style="display:block;margin:auto;" />
+                              <img src="data:image/png;base64,${twitterLogoBase64}" alt="Twitter" width="18" height="18" style="display:block;margin:auto;" />
                             </a>
                           </td>
                         </tr>
