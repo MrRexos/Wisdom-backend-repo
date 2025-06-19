@@ -1812,7 +1812,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
     }
 
     // Consulta para obtener la información de todas las reservas donde el servicio pertenece a un usuario específico
-    const query = `
+    let query = `
       SELECT 
         booking.id AS booking_id,
         booking.user_id AS booking_user_id,
