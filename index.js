@@ -708,7 +708,7 @@ app.get('/api/user/:userId/lists', (req, res) => {
     }
 
     // Obtener las listas del usuario en service_list y las listas compartidas en shared_list
-    const query = `
+    let query = `
       SELECT id, list_name, 'owner' AS role FROM service_list WHERE user_id = ?
       UNION
       SELECT service_list.id, service_list.list_name, 'shared' AS role 
@@ -917,8 +917,8 @@ app.get('/api/lists/:id/items', (req, res) => {
     }
 
     // Usar una sola consulta con JOIN para obtener los ítems y datos adicionales de la tabla service, price, user_account y review
-    const query = `
-      SELECT 
+    let query = `
+      SELECT
         item_list.id AS item_id, 
         item_list.list_id, 
         item_list.service_id, 
@@ -1721,6 +1721,7 @@ app.get('/api/suggested_professional', (req, res) => {
 //Ruta para obtener todas las reservas de un user
 app.get('/api/user/:userId/bookings', (req, res) => {
   const { userId } = req.params; // ID del usuario
+  const { status } = req.query;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -1730,8 +1731,8 @@ app.get('/api/user/:userId/bookings', (req, res) => {
     }
 
     // Consulta para obtener la información de todas las reservas y servicios asociados
-    const query = `
-      SELECT 
+    let query = `
+      SELECT
           booking.id AS booking_id,
           booking.booking_start_datetime,
           booking.booking_end_datetime,
@@ -1771,12 +1772,16 @@ app.get('/api/user/:userId/bookings', (req, res) => {
       LEFT JOIN service ON booking.service_id = service.id
       LEFT JOIN price ON service.price_id = price.id
       LEFT JOIN user_account ON service.user_id = user_account.id
-      WHERE booking.user_id = ?
-      ORDER BY booking.booking_start_datetime DESC;
+      WHERE booking.user_id = ?`;
 
-    `;
-
-    connection.query(query, [userId], (err, bookingsData) => {
+      const params = [userId];
+      if (status) {
+        query += ' AND booking.booking_status = ?';
+        params.push(status);
+      }
+      query += ' ORDER BY booking.booking_start_datetime DESC;';
+  
+      connection.query(query, params, (err, bookingsData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -1797,6 +1802,7 @@ app.get('/api/user/:userId/bookings', (req, res) => {
 //Ruta para obtener todas las reservas de un profesional
 app.get('/api/service-user/:userId/bookings', (req, res) => {
   const { userId } = req.params; // ID del usuario dentro de la tabla service
+  const { status } = req.query;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -1860,11 +1866,16 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
       JOIN price ON service.price_id = price.id
       JOIN user_account AS service_user ON service.user_id = service_user.id -- Usuario que presta el servicio
       JOIN user_account AS booking_user ON booking.user_id = booking_user.id -- Usuario que realizó la reserva
-      WHERE service.user_id = ? -- Filtrar por el user_id dentro de la tabla service
-      ORDER BY booking.booking_start_datetime DESC; -- Ordenar de más reciente a más antiguo
-    `;
+      WHERE service.user_id = ?`;
 
-    connection.query(query, [userId], (err, bookingsData) => {
+    const params = [userId];
+    if (status) {
+      query += ' AND booking.booking_status = ?';
+      params.push(status);
+    }
+    query += ' ORDER BY booking.booking_start_datetime DESC;';
+
+    connection.query(query, params, (err, bookingsData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
