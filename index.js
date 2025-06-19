@@ -2471,6 +2471,90 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
   });
 }
 
+// Obtener detalles de una reserva
+app.get('/api/bookings/:id', (req, res) => {
+  const { id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `
+      SELECT * FROM booking WHERE id = ?
+    `;
+
+    connection.query(query, [id], (err, result) => {
+      connection.release();
+      if (err) {
+        console.error('Error al obtener la reserva:', err);
+        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+      }
+
+      if (result.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
+
+      res.status(200).json(result[0]);
+    });
+  });
+});
+
+// Actualizar una reserva
+app.put('/api/bookings/:id', (req, res) => {
+  const { id } = req.params;
+  const { booking_start_datetime, booking_end_datetime, service_duration, final_price, description } = req.body;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `
+      UPDATE booking SET booking_start_datetime = ?, booking_end_datetime = ?, service_duration = ?, final_price = ?, description = ?
+      WHERE id = ?
+    `;
+
+    const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, description, id];
+
+    connection.query(query, values, (err, result) => {
+      connection.release();
+      if (err) {
+        console.error('Error al actualizar la reserva:', err);
+        return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+      }
+
+      res.status(200).json({ message: 'Reserva actualizada con éxito' });
+    });
+  });
+});
+
+// Actualizar el estado de una reserva
+app.patch('/api/bookings/:id/status', (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `UPDATE booking SET booking_status = ? WHERE id = ?`;
+
+    connection.query(query, [status, id], (err, result) => {
+      connection.release();
+      if (err) {
+        console.error('Error al actualizar el estado de la reserva:', err);
+        return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+      }
+      res.status(200).json({ message: 'Estado actualizado' });
+    });
+  });
+});
+
 //Ruta para obtener las sugerencias de busqueda de servicios
 app.get('/api/suggestions', (req, res) => {
   const { query } = req.query;
