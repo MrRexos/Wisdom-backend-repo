@@ -2009,6 +2009,42 @@ app.get('/api/user/:id/wallet', (req, res) => {
   });
 });
 
+//Ruta para obtener la información de un usuario
+app.get('/api/user/:id', (req, res) => {
+  const { id } = req.params; // ID del usuario
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    const query = `
+      SELECT id, email, username, first_name, surname, profile_picture,
+             is_professional, language, joined_datetime
+      FROM user_account
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [id], (err, userData) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener la información del usuario:', err);
+        res.status(500).json({ error: 'Error al obtener la información del usuario.' });
+        return;
+      }
+
+      if (userData.length > 0) {
+        res.status(200).json(userData[0]);
+      } else {
+        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      }
+    });
+  });
+});
+
 //Ruta para actualizar el profile
 app.put('/api/user/:id/profile', (req, res) => {
   const { id } = req.params; // ID del usuario
