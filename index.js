@@ -2591,6 +2591,35 @@ app.patch('/api/bookings/:id/status', (req, res) => {
   });
 });
 
+// Borrar una reserva por su id
+app.delete('/api/delete_booking/:id', (req, res) => {
+  const { id } = req.params; // ID de la reserva a eliminar
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const deleteQuery = 'DELETE FROM booking WHERE id = ?';
+
+    connection.query(deleteQuery, [id], (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al eliminar la reserva:', err);
+        return res.status(500).json({ error: 'Error al eliminar la reserva.' });
+      }
+
+      if (result.affectedRows > 0) {
+        res.status(200).json({ message: 'Reserva eliminada con éxito' });
+      } else {
+        res.status(404).json({ message: 'Reserva no encontrada' });
+      }
+    });
+  });
+});
+
 //Ruta para obtener las sugerencias de busqueda de servicios
 app.get('/api/suggestions', (req, res) => {
   const { query } = req.query;
