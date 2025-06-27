@@ -2518,7 +2518,25 @@ app.get('/api/bookings/:id', (req, res) => {
     }
 
     const query = `
-      SELECT * FROM booking WHERE id = ?
+      SELECT
+        b.*,
+        pr.price,
+        pr.price_type,
+        pm.*,
+        a.address_type,
+        a.street_number,
+        a.address_1,
+        a.address_2,
+        a.postal_code,
+        a.city,
+        a.state,
+        a.country
+      FROM booking b
+      LEFT JOIN service s ON b.service_id = s.id
+      LEFT JOIN price pr ON s.price_id = pr.id
+      LEFT JOIN payment_method pm ON b.payment_method_id = pm.id
+      LEFT JOIN address a ON b.address_id = a.id
+      WHERE b.id = ?
     `;
 
     connection.query(query, [id], (err, result) => {
