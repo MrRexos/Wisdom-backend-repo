@@ -2606,7 +2606,7 @@ app.put('/api/bookings/:id', (req, res) => {
 // Actualizar el estado de una reserva
 app.patch('/api/bookings/:id/status', (req, res) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status, is_paid } = req.body;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2614,9 +2614,27 @@ app.patch('/api/bookings/:id/status', (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const query = `UPDATE booking SET booking_status = ? WHERE id = ?`;
+    const fields = [];
+    const values = [];
 
-    connection.query(query, [status, id], (err, result) => {
+    if (typeof status !== 'undefined') {
+      fields.push('booking_status = ?');
+      values.push(status);
+    }
+    if (typeof is_paid !== 'undefined') {
+      fields.push('is_paid = ?');
+      values.push(is_paid);
+    }
+
+    if (fields.length === 0) {
+      connection.release();
+      return res.status(400).json({ error: 'No fields to update.' });
+    }
+
+    const query = `UPDATE booking SET ${fields.join(', ')} WHERE id = ?`;
+    values.push(id);
+
+    connection.query(query, values, (err, result) => {
       connection.release();
       if (err) {
         console.error('Error al actualizar el estado de la reserva:', err);
