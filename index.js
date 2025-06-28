@@ -2945,6 +2945,38 @@ app.get('/api/services/:id', (req, res) => {
 
 
 
+app.post('/api/services/:id/reviews', (req, res) => {
+  const { id } = req.params;
+  const { rating, comment } = req.body;
+  const userId = req.user.id;
+
+  if (!rating) {
+    return res.status(400).json({ error: 'rating es requerido.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `
+      INSERT INTO review (user_id, service_id, rating, comment, review_datetime)
+      VALUES (?, ?, ?, ?, NOW());
+    `;
+    connection.query(query, [userId, id, rating, comment], (err, result) => {
+      connection.release();
+
+      if (err) {
+        console.error('Error al añadir la review:', err);
+        return res.status(500).json({ error: 'Error al añadir la review.' });
+      }
+
+      res.status(201).json({ message: 'Review añadida con éxito', reviewId: result.insertId });
+    });
+  });
+});
+
 // Inicia el servidor
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
