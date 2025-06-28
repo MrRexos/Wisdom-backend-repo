@@ -2645,7 +2645,35 @@ app.patch('/api/bookings/:id/status', (req, res) => {
   });
 });
 
+// Actualizar el pago de una reserva
+app.patch('/api/bookings/:id/is_paid', (req, res) => {
+  const { id } = req.params;
+  const { is_paid } = req.body;
+
+  if (typeof is_paid === 'undefined') {
+    return res.status(400).json({ error: 'is_paid es requerido.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = 'UPDATE booking SET is_paid = ? WHERE id = ?';
+
+    connection.query(query, [is_paid, id], (err, result) => {
+      connection.release();
+      if (err) {
+        console.error('Error al actualizar el pago de la reserva:', err);
+        return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+      }
+      res.status(200).json({ message: 'Pago actualizado' });
+    });
+  });
+});
 // Borrar una reserva por su id
+
 app.delete('/api/delete_booking/:id', (req, res) => {
   const { id } = req.params; // ID de la reserva a eliminar
 
