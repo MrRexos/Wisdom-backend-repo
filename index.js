@@ -2672,8 +2672,8 @@ app.patch('/api/bookings/:id/is_paid', (req, res) => {
     });
   });
 });
-// Borrar una reserva por su id
 
+// Borrar una reserva por su id
 app.delete('/api/delete_booking/:id', (req, res) => {
   const { id } = req.params; // ID de la reserva a eliminar
 
