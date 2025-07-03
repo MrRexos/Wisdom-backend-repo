@@ -2245,6 +2245,41 @@ app.put('/api/user/:id/allow_notis', (req, res) => {
   });
 });
 
+// Ruta para añadir un strike a un usuario
+app.post('/api/user/:id/strike', (req, res) => {
+  const { id } = req.params; // ID del usuario
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    const query = `
+      UPDATE user_account
+      SET strikes_num = COALESCE(strikes_num, 0) + 1
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [id], (err, result) => {
+      connection.release(); // Liberar la conexión después de usarla
+
+      if (err) {
+        console.error('Error al añadir el strike:', err);
+        res.status(500).json({ error: 'Error al añadir el strike.' });
+        return;
+      }
+
+      if (result.affectedRows > 0) {
+        res.status(200).json({ message: 'Strike añadido exitosamente.' });
+      } else {
+        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      }
+    });
+  });
+});
+
 //Ruta para guardar address + direction
 app.post('/api/directions', (req, res) => {
   const { user_id, address_type, street_number, address_1, address_2, postal_code, city, state, country } = req.body;
