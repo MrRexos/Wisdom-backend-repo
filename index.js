@@ -10,9 +10,10 @@ const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
 const nodemailer = require('nodemailer');
+const PDFDocument = require('pdfkit');
 
 const Stripe = require('stripe');
-const stripe = new Stripe('tu_clave_secreta');
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -2704,6 +2705,151 @@ app.patch('/api/bookings/:id/is_paid', (req, res) => {
         return res.status(500).json({ error: 'Error al actualizar la reserva.' });
       }
       res.status(200).json({ message: 'Pago actualizado' });
+    });
+  });
+});
+
+// Pago de comisión al crear la reserva (10% o mínimo 1€)
+app.post('/api/bookings/:id/deposit', authenticateToken, (req, res) => {
+  const { id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = 'SELECT final_price FROM booking WHERE id = ?';
+    connection.query(query, [id], async (err, results) => {
+      connection.release();
+      if (err) {
+        console.error('Error al obtener la reserva:', err);
+        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
+
+      const finalPrice = parseFloat(results[0].final_price || 0);
+      const commission = Math.max(finalPrice * 0.1, 1);
+
+      try {
+        const intent = await stripe.paymentIntents.create({
+          amount: Math.round(commission * 100),
+          currency: 'eur',
+          metadata: { booking_id: id, type: 'deposit' }
+        });
+        res.status(200).json({ clientSecret: intent.client_secret });
+      } catch (stripeErr) {
+        console.error('Error al crear el pago:', stripeErr);
+        res.status(500).json({ error: 'Error al procesar el pago.' });
+      }
+    });
+  });
+});
+
+// Pago final de una reserva completada
+app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
+  const { id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = 'SELECT final_price FROM booking WHERE id = ?';
+    connection.query(query, [id], async (err, results) => {
+      connection.release();
+      if (err) {
+        console.error('Error al obtener la reserva:', err);
+        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
+
+      const finalPrice = parseFloat(results[0].final_price || 0);
+      const commission = Math.max(finalPrice * 0.1, 1);
+      const amountToPay = finalPrice - commission;
+
+      try {
+        const intent = await stripe.paymentIntents.create({
+          amount: Math.round(amountToPay * 100),
+          currency: 'eur',
+          metadata: { booking_id: id, type: 'final' }
+        });
+        res.status(200).json({ clientSecret: intent.client_secret });
+      } catch (stripeErr) {
+        console.error('Error al crear el pago final:', stripeErr);
+        res.status(500).json({ error: 'Error al procesar el pago final.' });
+      }
+    });
+  });
+});
+
+// Generar y descargar factura en PDF de una reserva pagada
+app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
+  const { id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `SELECT b.id AS booking_id, b.final_price, b.booking_start_datetime, b.booking_end_datetime, s.service_title, s.description, 
+                          cu.email AS customer_email, cu.first_name AS customer_first_name, cu.surname AS customer_surname,
+                          sp.email AS provider_email, sp.first_name AS provider_first_name, sp.surname AS provider_surname
+                   FROM booking b
+                   JOIN user_account cu ON b.user_id = cu.id
+                   JOIN service s ON b.service_id = s.id
+                   JOIN user_account sp ON s.user_id = sp.id
+                   WHERE b.id = ?`;
+
+    connection.query(query, [id], (err, results) => {
+      connection.release();
+      if (err) {
+        console.error('Error al obtener la reserva:', err);
+        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
+
+      const data = results[0];
+      const doc = new PDFDocument();
+      const buffers = [];
+
+      doc.on('data', buffers.push.bind(buffers));
+      doc.on('end', () => {
+        const pdfData = Buffer.concat(buffers);
+        res.set({
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': `attachment; filename=invoice_${id}.pdf`,
+          'Content-Length': pdfData.length
+        });
+        res.send(pdfData);
+      });
+
+      doc.fontSize(18).text('Factura', { align: 'center' });
+      doc.moveDown();
+      doc.fontSize(12).text(`Reserva: ${data.booking_id}`);
+      doc.text(`Servicio: ${data.service_title}`);
+      if (data.description) doc.text(`Descripción: ${data.description}`);
+      doc.text(`Inicio: ${data.booking_start_datetime}`);
+      doc.text(`Fin: ${data.booking_end_datetime}`);
+      doc.text(`Precio final: €${data.final_price}`);
+      doc.moveDown();
+      doc.text('Cliente:');
+      doc.text(`${data.customer_first_name} ${data.customer_surname} - ${data.customer_email}`);
+      doc.moveDown();
+      doc.text('Profesional:');
+      doc.text(`${data.provider_first_name} ${data.provider_surname} - ${data.provider_email}`);
+      doc.end();
     });
   });
 });
