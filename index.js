@@ -2120,7 +2120,7 @@ app.put('/api/user/:id/email', (req, res) => {
   });
 });
 
-// Cambiar contraseña
+// Cambiar contraseña 
 app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { currentPassword, newPassword } = req.body;
