@@ -2532,14 +2532,26 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
   ];
 
   connection.query(bookingQuery, bookingValues, (err, result) => {
-    connection.release(); // Liberar la conexión después de usarla
-
     if (err) {
+      connection.release();
       console.error('Error al insertar la reserva:', err);
       return res.status(500).json({ error: 'Error al insertar la reserva.' });
     }
 
-    res.status(201).json({ message: 'Reserva creada con éxito', bookingId: result.insertId });
+    const newBookingId = result.insertId;
+    const selectQuery = 'SELECT * FROM booking WHERE id = ?';
+    connection.query(selectQuery, [newBookingId], (selectErr, bookingData) => {
+      connection.release();
+      if (selectErr) {
+        console.error('Error al obtener la reserva creada:', selectErr);
+        return res.status(500).json({ error: 'Error al obtener la reserva creada.' });
+      }
+      if (bookingData.length === 0) {
+        return res.status(500).json({ error: 'No se encontró la reserva creada.' });
+      }
+
+      res.status(201).json({ message: 'Reserva creada con éxito', booking: bookingData[0] });
+    });
   });
 }
 
