@@ -63,6 +63,14 @@ function authenticateToken(req, res, next) {
   });
 }
 
+//Formats dates and times in English (GB)
+function formatDateTime(date) {
+  return new Date(date).toLocaleString('en-GB', {
+    dateStyle: 'medium',
+    timeStyle: 'short'
+  });
+}
+
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({
   host: process.env.DB_HOST, //process.env.HOST process.env.USER process.env.PASSWORD process.env.DATABASE
@@ -2803,7 +2811,7 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
 });
 
 // Crear método de cobro y cuenta Stripe Connect
-app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
+app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   const { id } = req.params;
   const {
     date_of_birth,
@@ -2847,56 +2855,96 @@ app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
       const user = userRes[0];
       const [year, month, day] = date_of_birth.split('-').map(Number);
 
-      try {
-        const account = await stripe.accounts.create({
-          type: 'custom',
-          country: country.toUpperCase(),
-          email: user.email,
-          business_type: 'individual',
-          individual: {
-            first_name: user.first_name,
-            last_name: user.surname,
-            id_number: nif,
-            dob: { day, month, year },
-            address: {
-              line1: address_line1,
-              line2: address_line2 || undefined,
-              postal_code,
-              city,
-              state,
-              country: country.toUpperCase()
-            }
-          },
-          capabilities: {
-            card_payments: { requested: true },
-            transfers: { requested: true }
-          }
-        });
+      // Insertar la dirección asociada al método de cobro
+      const addressQuery =
+        'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+      const addressValues = ['payout', null, address_line1, address_line2 || null, postal_code, city, state, country];
 
-        await stripe.accounts.createExternalAccount(account.id, {
-          external_account: {
-            object: 'bank_account',
-            country: country.toUpperCase(),
-            currency: 'eur',
-            account_holder_name: `${user.first_name} ${user.surname}`,
-            account_number: iban
-          }
-        });
-
-        const updateQuery = 'UPDATE user_account SET date_of_birth = ?, nif = ?, stripe_account_id = ? WHERE id = ?';
-        connection.query(updateQuery, [date_of_birth, nif, account.id, id], (updErr) => {
+      connection.query(addressQuery, addressValues, async (addrErr, addrRes) => {
+        if (addrErr) {
           connection.release();
-          if (updErr) {
-            console.error('Error al actualizar el usuario:', updErr);
-            return res.status(500).json({ error: 'Error al guardar la cuenta.' });
-          }
-          res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
-        });
-      } catch (stripeErr) {
-        connection.release();
-        console.error('Error al crear la cuenta de Stripe:', stripeErr);
-        res.status(500).json({ error: 'Error al crear la cuenta de cobro.' });
-      }
+          console.error('Error al insertar la dirección:', addrErr);
+          return res.status(500).json({ error: 'Error al insertar la dirección.' });
+        }
+
+        const addressId = addrRes.insertId;
+
+        try {
+          const account = await stripe.accounts.create({
+            type: 'custom',
+            country: country.toUpperCase(),
+            email: user.email,
+            business_type: 'individual',
+            individual: {
+              first_name: user.first_name,
+              last_name: user.surname,
+              id_number: nif,
+              dob: { day, month, year },
+              address: {
+                line1: address_line1,
+                line2: address_line2 || undefined,
+                postal_code,
+                city,
+                state,
+                country: country.toUpperCase()
+              }
+            },
+            capabilities: {
+              card_payments: { requested: true },
+              transfers: { requested: true }
+            }
+          });
+
+          const extAccount = await stripe.accounts.createExternalAccount(account.id, {
+            external_account: {
+              object: 'bank_account',
+              country: country.toUpperCase(),
+              currency: 'eur',
+              account_holder_name: `${user.first_name} ${user.surname}`,
+              account_number: iban
+            }
+          });
+
+          const updateQuery =
+            'UPDATE user_account SET date_of_birth = ?, nif = ?, stripe_account_id = ? WHERE id = ?';
+          connection.query(updateQuery, [date_of_birth, nif, account.id, id], (updErr) => {
+            if (updErr) {
+              connection.release();
+              console.error('Error al actualizar el usuario:', updErr);
+              return res.status(500).json({ error: 'Error al guardar la cuenta.' });
+            }
+
+            const methodQuery =
+              'INSERT INTO collection_method (user_account_id, type, provider, external_account_id, last4, brand, currency, address_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+            const methodValues = [
+              id,
+              'iban',
+              'stripe',
+              extAccount.id,
+              extAccount.last4 || '',
+              null,
+              extAccount.currency || 'EUR',
+              addressId
+            ];
+
+            connection.query(methodQuery, methodValues, (methErr) => {
+              connection.release();
+              if (methErr) {
+                console.error('Error al guardar el método de cobro:', methErr);
+                return res.status(500).json({ error: 'Error al guardar el método de cobro.' });
+              }
+
+              res
+                .status(201)
+                .json({ message: 'Método de cobro creado', stripe_account_id: account.id });
+            });
+          });
+        } catch (stripeErr) {
+          connection.release();
+          console.error('Error al crear la cuenta de Stripe:', stripeErr);
+          res.status(500).json({ error: 'Error al crear la cuenta de cobro.' });
+        }
+      });
     });
   });
 });
@@ -2960,34 +3008,52 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
 
   pool.getConnection((err, connection) => {
     if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+      console.error('Error getting connection:', err);
+      return res.status(500).json({ error: 'Connection error.' });
     }
 
-    const query = `SELECT b.id AS booking_id, b.final_price, b.booking_start_datetime, b.booking_end_datetime, s.service_title, s.description, 
-                          cu.email AS customer_email, cu.first_name AS customer_first_name, cu.surname AS customer_surname,
-                          sp.email AS provider_email, sp.first_name AS provider_first_name, sp.surname AS provider_surname
-                   FROM booking b
-                   JOIN user_account cu ON b.user_id = cu.id
-                   JOIN service s ON b.service_id = s.id
-                   JOIN user_account sp ON s.user_id = sp.id
-                   WHERE b.id = ?`;
+    const query = `
+      SELECT 
+        b.id AS booking_id,
+        b.final_price,
+        b.booking_start_datetime,
+        b.booking_end_datetime,
+        s.service_title,
+        s.description,
+        cu.email AS customer_email,
+        cu.first_name AS customer_first_name,
+        cu.surname AS customer_surname,
+        sp.email AS provider_email,
+        sp.first_name AS provider_first_name,
+        sp.surname AS provider_surname
+      FROM booking b
+      JOIN user_account cu ON b.user_id = cu.id
+      JOIN service s ON b.service_id = s.id
+      JOIN user_account sp ON s.user_id = sp.id
+      WHERE b.id = ?;
+    `;
 
     connection.query(query, [id], (err, results) => {
       connection.release();
       if (err) {
-        console.error('Error al obtener la reserva:', err);
-        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+        console.error('Error fetching booking:', err);
+        return res.status(500).json({ error: 'Error fetching booking.' });
       }
 
       if (results.length === 0) {
-        return res.status(404).json({ message: 'Reserva no encontrada.' });
+        return res.status(404).json({ message: 'Booking not found.' });
       }
 
       const data = results[0];
-      const doc = new PDFDocument();
-      const buffers = [];
+      const doc = new PDFDocument({ margin: 48 });
 
+      // Resource paths
+      const assetsPath = path.join(__dirname, 'assets');
+      doc.registerFont('Inter', path.join(assetsPath, 'fonts', 'Inter-Regular.ttf'));
+      doc.registerFont('Inter-Bold', path.join(assetsPath, 'fonts', 'Inter-Bold.ttf'));
+
+      // Capture PDF data in memory
+      const buffers = [];
       doc.on('data', buffers.push.bind(buffers));
       doc.on('end', () => {
         const pdfData = Buffer.concat(buffers);
@@ -2999,20 +3065,50 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         res.send(pdfData);
       });
 
-      doc.fontSize(18).text('Factura', { align: 'center' });
+      /* ---------- Header ---------- */
+      // Logo top–right
+      try {
+        doc.image(path.join(assetsPath, 'wisdom.png'), doc.page.width - 130, 32, { width: 100 });
+      } catch (e) {
+        console.warn('Logo not found:', e);
+      }
+
+      // Centered title
+      doc.font('Inter-Bold').fontSize(20).text('INVOICE', 0, 40, { align: 'center' });
+      doc.moveDown(2);
+
+      /* ---------- Booking details ---------- */
+      doc.font('Inter-Bold').fontSize(12).text('Booking details');
+      doc.moveDown(0.3);
+
+      doc.font('Inter').fontSize(11);
+      doc.text(`Booking #${data.booking_id}`);
+      doc.text(`Service: ${data.service_title}`);
+      if (data.description) doc.text(`Description: ${data.description}`);
+      doc.text(`Start: ${formatDateTime(data.booking_start_datetime)}`);
+      doc.text(`End: ${formatDateTime(data.booking_end_datetime)}`);
+      doc.text(`Final price: €${Number(data.final_price).toFixed(2)}`);
+
       doc.moveDown();
-      doc.fontSize(12).text(`Reserva: ${data.booking_id}`);
-      doc.text(`Servicio: ${data.service_title}`);
-      if (data.description) doc.text(`Descripción: ${data.description}`);
-      doc.text(`Inicio: ${data.booking_start_datetime}`);
-      doc.text(`Fin: ${data.booking_end_datetime}`);
-      doc.text(`Precio final: €${data.final_price}`);
+      doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#E5E7EB').stroke();
       doc.moveDown();
-      doc.text('Cliente:');
-      doc.text(`${data.customer_first_name} ${data.customer_surname} - ${data.customer_email}`);
+
+      /* ---------- Customer ---------- */
+      doc.font('Inter-Bold').text('Customer');
+      doc.font('Inter').text(`${data.customer_first_name} ${data.customer_surname}`);
+      doc.text(data.customer_email);
+
       doc.moveDown();
-      doc.text('Profesional:');
-      doc.text(`${data.provider_first_name} ${data.provider_surname} - ${data.provider_email}`);
+
+      /* ---------- Provider ---------- */
+      doc.font('Inter-Bold').text('Provider');
+      doc.font('Inter').text(`${data.provider_first_name} ${data.provider_surname}`);
+      doc.text(data.provider_email);
+
+      // Final horizontal rule
+      doc.moveDown(2);
+      doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#E5E7EB').stroke();
+
       doc.end();
     });
   });
