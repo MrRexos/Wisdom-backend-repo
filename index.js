@@ -2814,7 +2814,6 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
 app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
   const { id } = req.params;
   const {
-    user_id,
     full_name,
     date_of_birth,
     nif,
@@ -2828,10 +2827,6 @@ app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
     state,
     country
   } = req.body;
-
-  if (parseInt(id, 10) !== req.user.id || (user_id && parseInt(user_id, 10) !== req.user.id)) {
-    return res.status(403).json({ error: 'Acceso denegado' });
-  }
 
   if (!full_name || !date_of_birth || !nif || !iban || !address_type || !address_1 || !postal_code || !city || !state || !country) {
     return res.status(400).json({ error: 'Campos requeridos faltantes' });
@@ -2908,7 +2903,7 @@ app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
           }
 
           const insertMethodQuery =
-            'INSERT INTO collection_method (user_account_id, type, external_account_id, last4, brand, address_id, full_name) VALUES (?, ?, ?, ?, ?, ?, ?)';
+            'INSERT INTO collection_method (user_id, type, external_account_id, last4, brand, address_id, full_name) VALUES (?, ?, ?, ?, ?, ?, ?)';
           const last4 = iban.slice(-4);
           connection.query(
             insertMethodQuery,
