@@ -2992,6 +2992,77 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
   });
 });
 
+// Pago final y transferencia automática al profesional (!)
+app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { payment_method_id } = req.body;
+
+  if (!payment_method_id) {
+    return res.status(400).json({ error: 'payment_method_id es requerido.' });
+  }
+
+  // Idempotency‑Key por request (p.e. un UUID en header X-Idempotency-Key)
+  const idemKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
+
+  pool.getConnection(async (err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    try {
+      await connection.beginTransaction();
+
+      // 1. Lee la reserva FOR UPDATE para bloquear la fila
+      const [[booking]] = await connection.query(
+        `SELECT b.final_price, b.is_paid, u.stripe_account_id
+         FROM booking b
+         JOIN service s  ON b.service_id = s.id
+         JOIN user_account u ON s.user_id = u.id
+         WHERE b.id = ? FOR UPDATE`, [id]);
+
+      if (!booking) throw new NotFound('Reserva no encontrada.');
+      if (booking.is_paid) throw new Conflict('Ya está pagada.');
+      if (!booking.stripe_account_id) throw new BadRequest('El profesional no tiene cuenta Stripe.');
+      if (booking.final_price <= 0) throw new BadRequest('Importe no válido.');
+
+      // 2. Crea y confirma el PaymentIntent
+      const intent = await stripe.paymentIntents.create({
+        amount: Math.round(booking.final_price * 100),
+        currency: 'eur',
+        payment_method: payment_method_id,
+        confirm: true,
+        idempotencyKey: idemKey,
+        metadata: { booking_id: id, type: 'final' }
+      });
+
+      if (intent.status !== 'succeeded') throw new Error('Pago no completado.');
+
+      // 3. Transferencia al profesional
+      await stripe.transfers.create({
+        amount: intent.amount,
+        currency: 'eur',
+        destination: booking.stripe_account_id,
+        idempotencyKey: idemKey,
+        metadata: { booking_id: id }
+      });
+
+      // 4. Marca como pagada y confirma la transacción
+      await connection.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [id]);
+      await connection.commit();
+
+      res.status(200).json({ message: 'Pago y transferencia OK', paymentIntentId: intent.id });
+    } catch (e) {
+      await connection.rollback();
+      handleStripeRollbackIfNeeded(e);
+      log.error(e);
+      res.status(e.statusCode || 500).json({ error: e.message });
+    } finally {
+      connection.release();
+    }
+  });
+});
+
 // Generar y descargar factura en PDF de una reserva pagada
 app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
   const { id } = req.params;
