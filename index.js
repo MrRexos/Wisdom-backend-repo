@@ -2811,25 +2811,29 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
 });
 
 // Crear método de cobro y cuenta Stripe Connect
-app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
+app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
   const { id } = req.params;
   const {
+    user_id,
+    full_name,
     date_of_birth,
     nif,
     iban,
-    address_line1,
-    address_line2,
+    address_type,
+    street_number,
+    address_1,
+    address_2,
     postal_code,
     city,
     state,
     country
   } = req.body;
 
-  if (parseInt(id, 10) !== req.user.id) {
+  if (parseInt(id, 10) !== req.user.id || (user_id && parseInt(user_id, 10) !== req.user.id)) {
     return res.status(403).json({ error: 'Acceso denegado' });
   }
 
-  if (!date_of_birth || !nif || !iban || !address_line1 || !postal_code || !city || !state || !country) {
+  if (!full_name || !date_of_birth || !nif || !iban || !address_type || !address_1 || !postal_code || !city || !state || !country) {
     return res.status(400).json({ error: 'Campos requeridos faltantes' });
   }
 
@@ -2855,96 +2859,85 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
       const user = userRes[0];
       const [year, month, day] = date_of_birth.split('-').map(Number);
 
-      // Insertar la dirección asociada al método de cobro
-      const addressQuery =
-        'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-      const addressValues = ['payout', null, address_line1, address_line2 || null, postal_code, city, state, country];
+      try {
+        const account = await stripe.accounts.create({
+          type: 'custom',
+          country: country.toUpperCase(),
+          email: user.email,
+          business_type: 'individual',
+          individual: {
+            first_name: user.first_name,
+            last_name: user.surname,
+            id_number: nif,
+            dob: { day, month, year },
+            address: {
+              line1: address_1,
+              line2: address_2 || undefined,
+              postal_code,
+              city,
+              state,
+              country: country.toUpperCase()
+            }
+          },
+          capabilities: {
+            card_payments: { requested: true },
+            transfers: { requested: true }
+          }
+        });
 
-      connection.query(addressQuery, addressValues, async (addrErr, addrRes) => {
-        if (addrErr) {
-          connection.release();
-          console.error('Error al insertar la dirección:', addrErr);
-          return res.status(500).json({ error: 'Error al insertar la dirección.' });
-        }
-
-        const addressId = addrRes.insertId;
-
-        try {
-          const account = await stripe.accounts.create({
-            type: 'custom',
+        const bank = await stripe.accounts.createExternalAccount(account.id, {
+          external_account: {
+            object: 'bank_account',
             country: country.toUpperCase(),
-            email: user.email,
-            business_type: 'individual',
-            individual: {
-              first_name: user.first_name,
-              last_name: user.surname,
-              id_number: nif,
-              dob: { day, month, year },
-              address: {
-                line1: address_line1,
-                line2: address_line2 || undefined,
-                postal_code,
-                city,
-                state,
-                country: country.toUpperCase()
-              }
-            },
-            capabilities: {
-              card_payments: { requested: true },
-              transfers: { requested: true }
-            }
-          });
+            currency: 'eur',
+            account_holder_name: full_name,
+            account_number: iban
+          }
+        });
 
-          const extAccount = await stripe.accounts.createExternalAccount(account.id, {
-            external_account: {
-              object: 'bank_account',
-              country: country.toUpperCase(),
-              currency: 'eur',
-              account_holder_name: `${user.first_name} ${user.surname}`,
-              account_number: iban
-            }
-          });
+        const addressQuery =
+          'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+        const streetNumberValue = street_number || null;
+        const address2Value = address_2 || null;
+        const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country];
+        connection.query(addressQuery, addressValues, (addrErr, addrRes) => {
+          if (addrErr) {
+            connection.release();
+            console.error('Error al guardar la dirección:', addrErr);
+            return res.status(500).json({ error: 'Error al guardar la dirección.' });
+          }
 
-          const updateQuery =
-            'UPDATE user_account SET date_of_birth = ?, nif = ?, stripe_account_id = ? WHERE id = ?';
-          connection.query(updateQuery, [date_of_birth, nif, account.id, id], (updErr) => {
-            if (updErr) {
-              connection.release();
-              console.error('Error al actualizar el usuario:', updErr);
-              return res.status(500).json({ error: 'Error al guardar la cuenta.' });
-            }
-
-            const methodQuery =
-              'INSERT INTO collection_method (user_account_id, type, provider, external_account_id, last4, brand, currency, address_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-            const methodValues = [
-              id,
-              'iban',
-              'stripe',
-              extAccount.id,
-              extAccount.last4 || '',
-              null,
-              extAccount.currency || 'EUR',
-              addressId
-            ];
-
-            connection.query(methodQuery, methodValues, (methErr) => {
-              connection.release();
-              if (methErr) {
-                console.error('Error al guardar el método de cobro:', methErr);
+          const insertMethodQuery =
+            'INSERT INTO collection_method (user_account_id, type, external_account_id, last4, brand, address_id, full_name) VALUES (?, ?, ?, ?, ?, ?, ?)';
+          const last4 = iban.slice(-4);
+          connection.query(
+            insertMethodQuery,
+            [id, 'iban', bank.id, last4, null, addrRes.insertId, full_name],
+            (cmErr) => {
+              if (cmErr) {
+                connection.release();
+                console.error('Error al guardar el método de cobro:', cmErr);
                 return res.status(500).json({ error: 'Error al guardar el método de cobro.' });
               }
 
-              res
-                .status(201)
-                .json({ message: 'Método de cobro creado', stripe_account_id: account.id });
-            });
-          });
-        } catch (stripeErr) {
-          connection.release();
-          console.error('Error al crear la cuenta de Stripe:', stripeErr);
-          res.status(500).json({ error: 'Error al crear la cuenta de cobro.' });
-        }
-      });
+              const updateQuery =
+                'UPDATE user_account SET date_of_birth = ?, nif = ?, stripe_account_id = ? WHERE id = ?';
+              connection.query(updateQuery, [date_of_birth, nif, account.id, id], (updErr) => {
+                connection.release();
+                if (updErr) {
+                  console.error('Error al actualizar el usuario:', updErr);
+                  return res.status(500).json({ error: 'Error al guardar la cuenta.' });
+                }
+                res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
+              });
+            }
+          );
+        });
+      } catch (stripeErr) {
+        connection.release();
+        console.error('Error al crear la cuenta de Stripe:', stripeErr);
+        res.status(500).json({ error: 'Error al crear la cuenta de cobro.' });
+      }
     });
   });
 });
