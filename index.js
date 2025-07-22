@@ -2792,12 +2792,13 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
       }
 
       const finalPrice = parseFloat(results[0].final_price || 0);
-      const commission = Math.max(finalPrice * 0.1, 1);
-      const amountToPay = finalPrice - commission;
+      if (finalPrice <= 0) {
+        return res.status(400).json({ error: 'El importe final es cero o negativo.' });
+      }
 
       try {
         const intent = await stripe.paymentIntents.create({
-          amount: Math.round(amountToPay * 100),
+          amount: Math.round(finalPrice * 100),
           currency: 'eur',
           metadata: { booking_id: id, type: 'final' }
         });
@@ -2970,9 +2971,10 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
         return res.status(400).json({ error: 'El profesional no tiene cuenta Stripe.' });
       }
 
-      const finalPrice = parseFloat(final_price || 0);
-      const commission = Math.max(finalPrice * 0.1, 1);
-      const amount = finalPrice - commission;
+      const amount = parseFloat(final_price || 0);
+      if (amount <= 0) {
+        return res.status(400).json({ error: 'El importe a transferir es cero o negativo.' });
+      }
 
       try {
         await stripe.transfers.create({
