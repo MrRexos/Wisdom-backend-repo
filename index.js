@@ -2811,7 +2811,7 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
 });
 
 // Crear método de cobro y cuenta Stripe Connect
-app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
+app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   const { id } = req.params;
   const {
     full_name,
