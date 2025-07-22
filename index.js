@@ -2992,6 +2992,80 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
   });
 });
 
+// Pago final y transferencia en una sola llamada
+app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const { payment_method_id } = req.body;
+
+  if (!payment_method_id) {
+    return res.status(400).json({ error: 'payment_method_id es requerido.' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `SELECT b.final_price, s.user_id, u.stripe_account_id
+                   FROM booking b
+                   JOIN service s ON b.service_id = s.id
+                   JOIN user_account u ON s.user_id = u.id
+                   WHERE b.id = ?`;
+
+    connection.query(query, [id], async (qErr, results) => {
+      connection.release();
+      if (qErr) {
+        console.error('Error al obtener la reserva:', qErr);
+        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
+
+      const { final_price, stripe_account_id } = results[0];
+      const amount = parseFloat(final_price || 0);
+
+      if (amount <= 0) {
+        return res.status(400).json({ error: 'El importe a pagar es cero o negativo.' });
+      }
+
+      if (!stripe_account_id) {
+        return res.status(400).json({ error: 'El profesional no tiene cuenta Stripe.' });
+      }
+
+      try {
+        // Crear y confirmar el pago final
+        const intent = await stripe.paymentIntents.create({
+          amount: Math.round(amount * 100),
+          currency: 'eur',
+          payment_method: payment_method_id,
+          confirm: true,
+          metadata: { booking_id: id, type: 'final' }
+        });
+
+        if (intent.status !== 'succeeded') {
+          return res.status(400).json({ error: 'Pago no completado.' });
+        }
+
+        // Transferir el importe al profesional
+        await stripe.transfers.create({
+          amount: Math.round(amount * 100),
+          currency: 'eur',
+          destination: stripe_account_id,
+          metadata: { booking_id: id }
+        });
+
+        res.status(200).json({ message: 'Pago y transferencia realizados con éxito' });
+      } catch (stripeErr) {
+        console.error('Error al procesar el pago o la transferencia:', stripeErr);
+        res.status(500).json({ error: 'Error al procesar el pago o la transferencia.' });
+      }
+    });
+  });
+});
+
 // Generar y descargar factura en PDF de una reserva pagada
 app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
   const { id } = req.params;
