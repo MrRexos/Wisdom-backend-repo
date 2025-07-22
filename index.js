@@ -2802,6 +2802,191 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
   });
 });
 
+// Crear método de cobro y cuenta Stripe Connect
+app.post('/api/user/:id/payout-account', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const {
+    user_id,
+    full_name,
+    date_of_birth,
+    nif,
+    iban,
+    address_type,
+    street_number,
+    address_1,
+    address_2,
+    postal_code,
+    city,
+    state,
+    country
+  } = req.body;
+
+  if (parseInt(id, 10) !== req.user.id || (user_id && parseInt(user_id, 10) !== req.user.id)) {
+    return res.status(403).json({ error: 'Acceso denegado' });
+  }
+
+  if (!full_name || !date_of_birth || !nif || !iban || !address_type || !address_1 || !postal_code || !city || !state || !country) {
+    return res.status(400).json({ error: 'Campos requeridos faltantes' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const userQuery = 'SELECT email, first_name, surname FROM user_account WHERE id = ?';
+    connection.query(userQuery, [id], async (userErr, userRes) => {
+      if (userErr) {
+        connection.release();
+        console.error('Error al obtener el usuario:', userErr);
+        return res.status(500).json({ error: 'Error al obtener el usuario.' });
+      }
+
+      if (userRes.length === 0) {
+        connection.release();
+        return res.status(404).json({ message: 'Usuario no encontrado' });
+      }
+
+      const user = userRes[0];
+      const [year, month, day] = date_of_birth.split('-').map(Number);
+
+      try {
+        const account = await stripe.accounts.create({
+          type: 'custom',
+          country: country.toUpperCase(),
+          email: user.email,
+          business_type: 'individual',
+          individual: {
+            first_name: user.first_name,
+            last_name: user.surname,
+            id_number: nif,
+            dob: { day, month, year },
+            address: {
+              line1: address_1,
+              line2: address_2 || undefined,
+              postal_code,
+              city,
+              state,
+              country: country.toUpperCase()
+            }
+          },
+          capabilities: {
+            card_payments: { requested: true },
+            transfers: { requested: true }
+          }
+        });
+
+        const bank = await stripe.accounts.createExternalAccount(account.id, {
+          external_account: {
+            object: 'bank_account',
+            country: country.toUpperCase(),
+            currency: 'eur',
+            account_holder_name: full_name,
+            account_number: iban
+          }
+        });
+
+        const addressQuery =
+          'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
+        const streetNumberValue = street_number || null;
+        const address2Value = address_2 || null;
+        const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country];
+        connection.query(addressQuery, addressValues, (addrErr, addrRes) => {
+          if (addrErr) {
+            connection.release();
+            console.error('Error al guardar la dirección:', addrErr);
+            return res.status(500).json({ error: 'Error al guardar la dirección.' });
+          }
+
+          const insertMethodQuery =
+            'INSERT INTO collection_method (user_account_id, type, external_account_id, last4, brand, address_id, full_name) VALUES (?, ?, ?, ?, ?, ?, ?)';
+          const last4 = iban.slice(-4);
+          connection.query(
+            insertMethodQuery,
+            [id, 'iban', bank.id, last4, null, addrRes.insertId, full_name],
+            (cmErr) => {
+              if (cmErr) {
+                connection.release();
+                console.error('Error al guardar el método de cobro:', cmErr);
+                return res.status(500).json({ error: 'Error al guardar el método de cobro.' });
+              }
+
+              const updateQuery =
+                'UPDATE user_account SET date_of_birth = ?, nif = ?, stripe_account_id = ? WHERE id = ?';
+              connection.query(updateQuery, [date_of_birth, nif, account.id, id], (updErr) => {
+                connection.release();
+                if (updErr) {
+                  console.error('Error al actualizar el usuario:', updErr);
+                  return res.status(500).json({ error: 'Error al guardar la cuenta.' });
+                }
+                res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
+              });
+            }
+          );
+        });
+      } catch (stripeErr) {
+        connection.release();
+        console.error('Error al crear la cuenta de Stripe:', stripeErr);
+        res.status(500).json({ error: 'Error al crear la cuenta de cobro.' });
+      }
+    });
+  });
+});
+
+// Transferir el pago final al profesional con Stripe Connect
+app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
+  const { id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `SELECT b.final_price, s.user_id, u.stripe_account_id
+                   FROM booking b
+                   JOIN service s ON b.service_id = s.id
+                   JOIN user_account u ON s.user_id = u.id
+                   WHERE b.id = ?`;
+
+    connection.query(query, [id], async (qErr, results) => {
+      connection.release();
+      if (qErr) {
+        console.error('Error al obtener la reserva:', qErr);
+        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
+
+      const { final_price, stripe_account_id } = results[0];
+
+      if (!stripe_account_id) {
+        return res.status(400).json({ error: 'El profesional no tiene cuenta Stripe.' });
+      }
+
+      const finalPrice = parseFloat(final_price || 0);
+      const commission = Math.max(finalPrice * 0.1, 1);
+      const amount = finalPrice - commission;
+
+      try {
+        await stripe.transfers.create({
+          amount: Math.round(amount * 100),
+          currency: 'eur',
+          destination: stripe_account_id,
+          metadata: { booking_id: id }
+        });
+        res.status(200).json({ message: 'Transferencia realizada con éxito' });
+      } catch (stripeErr) {
+        console.error('Error al realizar la transferencia:', stripeErr);
+        res.status(500).json({ error: 'Error al realizar la transferencia.' });
+      }
+    });
+  });
+});
+
 // Generar y descargar factura en PDF de una reserva pagada
 app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
   const { id } = req.params;
