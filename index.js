@@ -1747,6 +1747,7 @@ app.get('/api/user/:userId/bookings', (req, res) => {
           booking.booking_end_datetime,
           booking.service_duration,
           booking.final_price,
+          booking.commission,
           booking.is_paid,
           booking.booking_status,
           booking.order_datetime,
@@ -1829,6 +1830,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         booking.booking_end_datetime,
         booking.service_duration,
         booking.final_price,
+        booking.commission,
         booking.is_paid,
         booking.booking_status,
         booking.order_datetime,
@@ -2472,6 +2474,7 @@ app.post('/api/bookings', (req, res) => {
     promotion_id,
     service_duration,
     final_price,
+    commission,
     description // Nueva propiedad para la descripción
   } = req.body;
 
@@ -2509,20 +2512,20 @@ app.post('/api/bookings', (req, res) => {
         addressId = result.insertId; // ID de la dirección recién insertada
 
         // Paso 2: Insertar en la tabla `booking`
-        createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, description, res);
+        createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res);
       });
     } else {
       // Si no se necesita una dirección, se usa NULL para address_id
-      createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, description, res);
+      createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res);
     }
   });
 });
 
 // Función para crear la reserva 
-function createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, description, res) {
+function createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res) {
   const bookingQuery = `
-    INSERT INTO booking (user_id, service_id, address_id, payment_method_id, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, is_paid, booking_status, description, order_datetime) 
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, NOW())
+    INSERT INTO booking (user_id, service_id, address_id, payment_method_id, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, is_paid, booking_status, description, order_datetime)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, NOW())
   `;
   const bookingValues = [
     user_id,
@@ -2535,6 +2538,7 @@ function createBooking(connection, user_id, service_id, addressId, booking_start
     promotion_id || null,
     service_duration || null,
     final_price || null,
+    commission || null,
     false, // is_paid
     description || null // Se establece la descripción, puede ser null
   ];
@@ -2586,6 +2590,7 @@ app.get('/api/bookings/:id', (req, res) => {
         b.promotion_id,
         b.service_duration,
         b.final_price,
+        b.commission,
         b.is_paid,
         b.booking_status,
         b.order_datetime,
@@ -2632,7 +2637,7 @@ app.get('/api/bookings/:id', (req, res) => {
 // Actualizar una reserva
 app.put('/api/bookings/:id', (req, res) => {
   const { id } = req.params;
-  const { booking_start_datetime, booking_end_datetime, service_duration, final_price, description } = req.body;
+  const { booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description } = req.body;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2641,11 +2646,11 @@ app.put('/api/bookings/:id', (req, res) => {
     }
 
     const query = `
-      UPDATE booking SET booking_start_datetime = ?, booking_end_datetime = ?, service_duration = ?, final_price = ?, description = ?
+      UPDATE booking SET booking_start_datetime = ?, booking_end_datetime = ?, service_duration = ?, final_price = ?, commission = ?, description = ?
       WHERE id = ?
     `;
 
-    const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, description, id];
+    const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, id];
 
     connection.query(query, values, (err, result) => {
       connection.release();
@@ -2739,7 +2744,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const query = 'SELECT final_price FROM booking WHERE id = ?';
+    const query = 'SELECT final_price, commission FROM booking WHERE id = ?';
     connection.query(query, [id], async (err, results) => {
       connection.release();
       if (err) {
@@ -2752,7 +2757,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, (req, res) => {
       }
 
       const finalPrice = parseFloat(results[0].final_price || 0);
-      const commission = Math.max(finalPrice * 0.1, 1);
+      const commission = parseFloat(results[0].commission || 0);
 
       try {
         const intent = await stripe.paymentIntents.create({
@@ -2779,7 +2784,7 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const query = 'SELECT final_price FROM booking WHERE id = ?';
+    const query = 'SELECT final_price, commission FROM booking WHERE id = ?';
     connection.query(query, [id], async (err, results) => {
       connection.release();
       if (err) {
@@ -2792,13 +2797,14 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
       }
 
       const finalPrice = parseFloat(results[0].final_price || 0);
-      if (finalPrice <= 0) {
+      const amountToPay = Number((finalPrice <= 11 ? finalPrice - 1 : finalPrice / 1.1).toFixed(2));
+      if (amountToPay <= 0) {
         return res.status(400).json({ error: 'El importe final es cero o negativo.' });
       }
 
       try {
         const intent = await stripe.paymentIntents.create({
-          amount: Math.round(finalPrice * 100),
+          amount: Math.round(amountToPay * 100),
           currency: 'eur',
           metadata: { booking_id: id, type: 'final' }
         });
@@ -2948,7 +2954,7 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const query = `SELECT b.final_price, s.user_id, u.stripe_account_id
+    const query = `SELECT b.final_price, b.commission, s.user_id, u.stripe_account_id
                    FROM booking b
                    JOIN service s ON b.service_id = s.id
                    JOIN user_account u ON s.user_id = u.id
@@ -2965,13 +2971,14 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
         return res.status(404).json({ message: 'Reserva no encontrada.' });
       }
 
-      const { final_price, stripe_account_id } = results[0];
+      const { final_price, commission, stripe_account_id } = results[0];
 
       if (!stripe_account_id) {
         return res.status(400).json({ error: 'El profesional no tiene cuenta Stripe.' });
       }
 
-      const amount = parseFloat(final_price || 0);
+      const finalPrice = parseFloat(results[0].final_price || 0);
+      const amount = Number((finalPrice <= 11 ? finalPrice - 1 : finalPrice / 1.1).toFixed(2));
       if (amount <= 0) {
         return res.status(400).json({ error: 'El importe a transferir es cero o negativo.' });
       }
@@ -3015,7 +3022,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
 
       // 1. Lee la reserva FOR UPDATE para bloquear la fila
       const [[booking]] = await connection.query(
-        `SELECT b.final_price, b.is_paid, u.stripe_account_id
+        `SELECT b.final_price, b.commission, b.is_paid, u.stripe_account_id
          FROM booking b
          JOIN service s  ON b.service_id = s.id
          JOIN user_account u ON s.user_id = u.id
@@ -3026,9 +3033,12 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       if (!booking.stripe_account_id) throw new BadRequest('El profesional no tiene cuenta Stripe.');
       if (booking.final_price <= 0) throw new BadRequest('Importe no válido.');
 
+      const finalPrice = parseFloat(booking.final_price || 0);
+      const amountToPay = Number((finalPrice <= 11 ? finalPrice - 1 : finalPrice / 1.1).toFixed(2));
+
       // 2. Crea y confirma el PaymentIntent
       const intent = await stripe.paymentIntents.create({
-        amount: Math.round(booking.final_price * 100),
+        amount: Math.round(amountToPay * 100),
         currency: 'eur',
         payment_method: payment_method_id,
         confirm: true,
@@ -3074,9 +3084,10 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
     }
 
     const query = `
-      SELECT 
+      SELECT
         b.id AS booking_id,
         b.final_price,
+        b.commission,
         b.booking_start_datetime,
         b.booking_end_datetime,
         s.service_title,
@@ -3149,6 +3160,9 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.text(`Start: ${formatDateTime(data.booking_start_datetime)}`);
       doc.text(`End: ${formatDateTime(data.booking_end_datetime)}`);
       doc.text(`Final price: €${Number(data.final_price).toFixed(2)}`);
+      if (data.commission !== undefined) {
+        doc.text(`Commission: €${Number(data.commission).toFixed(2)}`);
+      }
 
       doc.moveDown();
       doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#E5E7EB').stroke();
