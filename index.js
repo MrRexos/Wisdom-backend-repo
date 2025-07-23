@@ -2797,7 +2797,8 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
       }
 
       const finalPrice = parseFloat(results[0].final_price || 0);
-      const amountToPay = Number((finalPrice <= 11 ? finalPrice - 1 : finalPrice / 1.1).toFixed(2));
+      const commission = parseFloat(results[0].commission || 0);
+      const amountToPay = Number((finalPrice - commission).toFixed(2));
       if (amountToPay <= 0) {
         return res.status(400).json({ error: 'El importe final es cero o negativo.' });
       }
@@ -2978,7 +2979,8 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
       }
 
       const finalPrice = parseFloat(results[0].final_price || 0);
-      const amount = Number((finalPrice <= 11 ? finalPrice - 1 : finalPrice / 1.1).toFixed(2));
+      const commissionAmount = parseFloat(results[0].commission || 0);
+      const amount = Number((finalPrice - commissionAmount).toFixed(2));
       if (amount <= 0) {
         return res.status(400).json({ error: 'El importe a transferir es cero o negativo.' });
       }
@@ -3034,7 +3036,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       if (booking.final_price <= 0) throw new BadRequest('Importe no válido.');
 
       const finalPrice = parseFloat(booking.final_price || 0);
-      const amountToPay = Number((finalPrice <= 11 ? finalPrice - 1 : finalPrice / 1.1).toFixed(2));
+      const commissionAmount = parseFloat(booking.commission || 0);
+      const amountToPay = Number((finalPrice - commissionAmount).toFixed(2));
 
       // 2. Crea y confirma el PaymentIntent
       const intent = await stripe.paymentIntents.create({
@@ -3162,6 +3165,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.text(`Final price: €${Number(data.final_price).toFixed(2)}`);
       if (data.commission !== undefined) {
         doc.text(`Commission: €${Number(data.commission).toFixed(2)}`);
+        doc.text(`Net amount: €${Number(data.final_price - data.commission).toFixed(2)}`);
       }
 
       doc.moveDown();
