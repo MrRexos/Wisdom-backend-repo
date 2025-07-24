@@ -3019,11 +3019,14 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
+    // Usa la versión basada en promesas del conector
+    const conn = connection.promise();
+
     try {
-      await connection.beginTransaction();
+      await conn.beginTransaction();
 
       // 1. Lee la reserva FOR UPDATE para bloquear la fila
-      const [[booking]] = await connection.query(
+      const [[booking]] = await conn.query(
         `SELECT b.final_price, b.commission, b.is_paid, u.stripe_account_id
          FROM booking b
          JOIN service s  ON b.service_id = s.id
@@ -3061,12 +3064,12 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       });
 
       // 4. Marca como pagada y confirma la transacción
-      await connection.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [id]);
-      await connection.commit();
+      await conn.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [id]);
+      await conn.commit();
 
       res.status(200).json({ message: 'Pago y transferencia OK', paymentIntentId: intent.id });
     } catch (e) {
-      await connection.rollback();
+      await conn.rollback();
       handleStripeRollbackIfNeeded(e);
       log.error(e);
       res.status(e.statusCode || 500).json({ error: e.message });
