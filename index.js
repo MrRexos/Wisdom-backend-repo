@@ -10,10 +10,22 @@ const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
 const nodemailer = require('nodemailer');
+const crypto = require("crypto");
 const PDFDocument = require('pdfkit');
 
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+async function handleStripeRollbackIfNeeded(error) {
+  try {
+    if (error && error.payment_intent) {
+      const intentId = typeof error.payment_intent === "string" ? error.payment_intent : error.payment_intent.id;
+      await stripe.paymentIntents.cancel(intentId);
+    }
+  } catch (cancelErr) {
+    console.error("Error cancelling payment intent:", cancelErr);
+  }
+}
+
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -3043,25 +3055,29 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       const amountToPay = Number((finalPrice - commissionAmount).toFixed(2));
 
       // 2. Crea y confirma el PaymentIntent
-      const intent = await stripe.paymentIntents.create({
-        amount: Math.round(amountToPay * 100),
-        currency: 'eur',
-        payment_method: payment_method_id,
-        confirm: true,
-        idempotencyKey: idemKey,
-        metadata: { booking_id: id, type: 'final' }
-      });
+      const intent = await stripe.paymentIntents.create(
+        {
+          amount: Math.round(amountToPay * 100),
+          currency: 'eur',
+          payment_method: payment_method_id,
+          confirm: true,
+          metadata: { booking_id: id, type: 'final' }
+        },
+        { idempotencyKey: idemKey }
+      );
 
       if (intent.status !== 'succeeded') throw new Error('Pago no completado.');
 
       // 3. Transferencia al profesional
-      await stripe.transfers.create({
-        amount: intent.amount,
-        currency: 'eur',
-        destination: booking.stripe_account_id,
-        idempotencyKey: idemKey,
-        metadata: { booking_id: id }
-      });
+      await stripe.transfers.create(
+        {
+          amount: intent.amount,
+          currency: 'eur',
+          destination: booking.stripe_account_id,
+          metadata: { booking_id: id }
+        },
+        { idempotencyKey: idemKey }
+      );
 
       // 4. Marca como pagada y confirma la transacción
       await conn.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [id]);
@@ -3070,8 +3086,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       res.status(200).json({ message: 'Pago y transferencia OK', paymentIntentId: intent.id });
     } catch (e) {
       await conn.rollback();
-      handleStripeRollbackIfNeeded(e);
-      log.error(e);
+      await handleStripeRollbackIfNeeded(e);
+      console.error(e);
       res.status(e.statusCode || 500).json({ error: e.message });
     } finally {
       connection.release();
