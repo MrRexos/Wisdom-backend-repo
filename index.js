@@ -3023,7 +3023,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
   }
 
   // Idempotency‑Key por request (p.e. un UUID en header X-Idempotency-Key)
-  const idemKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
+  const baseKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
 
   pool.getConnection(async (err, connection) => {
     if (err) {
@@ -3064,7 +3064,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           confirm: true,
           metadata: { booking_id: id, type: 'final' }
         },
-        { idempotencyKey: idemKey }
+        { idempotencyKey: `${baseKey}:pi` }
       );
 
       if (intent.status !== 'succeeded') throw new Error('Pago no completado.');
@@ -3077,7 +3077,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           destination: booking.stripe_account_id,
           metadata: { booking_id: id }
         },
-        { idempotencyKey: idemKey }
+        { idempotencyKey: `${baseKey}:tr` }
       );
 
       // 4. Marca como pagada y confirma la transacción
