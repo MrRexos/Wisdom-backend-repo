@@ -2897,6 +2897,14 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
           capabilities: {
             card_payments: { requested: true },
             transfers: { requested: true }
+          },
+          business_profile: {
+            mcc: '7299',                      // Servicios varios (cambia si procede)
+            product_description: 'Servicios profesionales'
+          },
+          tos_acceptance: {
+            date: Math.floor(Date.now() / 1000), // fecha en segundos
+            ip: req.ip                           // IP real del usuario que acepta
           }
         });
 
