@@ -3060,6 +3060,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           amount: Math.round(amountToPay * 100),
           currency: 'eur',
           payment_method: payment_method_id,
+          payment_method_types: ['card'],
           confirm: true,
           metadata: { booking_id: id, type: 'final' }
         },
