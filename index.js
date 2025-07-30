@@ -2965,7 +2965,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   });
 });
 
-// Transferir el pago final al profesional con Stripe Connect
+// Transferir el pago final al profesional con Stripe Connect (NO FUNCIONA! ERROR CON TRANSFERS:INVALID EN LAS CUENTAS DE STRIPE)
 app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
   const { id } = req.params;
 
@@ -3025,77 +3025,56 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { payment_method_id } = req.body;
-
   if (!payment_method_id) {
     return res.status(400).json({ error: 'payment_method_id es requerido.' });
   }
 
-  // Idempotency‑Key por request (p.e. un UUID en header X-Idempotency-Key)
   const baseKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
 
   pool.getConnection(async (err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    // Usa la versión basada en promesas del conector
+    if (err) return res.status(500).json({ error: 'Error al obtener la conexión.' });
     const conn = connection.promise();
 
     try {
       await conn.beginTransaction();
 
-      // 1. Lee la reserva FOR UPDATE para bloquear la fila
-      const [[booking]] = await conn.query(
-        `SELECT b.final_price, b.commission, b.is_paid, u.stripe_account_id
-         FROM booking b
-         JOIN service s  ON b.service_id = s.id
-         JOIN user_account u ON s.user_id = u.id
-         WHERE b.id = ? FOR UPDATE`, [id]);
+      const [[booking]] = await conn.query(`
+        SELECT b.final_price,
+               b.commission,
+               b.is_paid,
+               u.stripe_account_id
+        FROM booking b
+        JOIN service s  ON b.service_id = s.id
+        JOIN user_account u ON s.user_id = u.id
+        WHERE b.id = ? FOR UPDATE
+      `, [id]);
 
       if (!booking) throw new NotFound('Reserva no encontrada.');
-      if (booking.is_paid) throw new Conflict('Ya está pagada.');
+      if (booking.is_paid) throw new Conflict('Esta reserva ya está pagada.');
       if (!booking.stripe_account_id) throw new BadRequest('El profesional no tiene cuenta Stripe.');
-      if (booking.final_price <= 0) throw new BadRequest('Importe no válido.');
 
-      const finalPrice = parseFloat(booking.final_price || 0);
-      const commissionAmount = parseFloat(booking.commission || 0);
-      const amountToPay = Number((finalPrice - commissionAmount).toFixed(2));
+      const finalPrice       = parseFloat(booking.final_price  || 0);
+      const commissionAmount = parseFloat(booking.commission   || 0);
+      const amountToCharge   = Number((finalPrice - commissionAmount).toFixed(2));
+      if (amountToCharge <= 0) throw new BadRequest('Importe a cobrar inválido.');
 
-      // 2. Crea y confirma el PaymentIntent
-      const intent = await stripe.paymentIntents.create(
-        {
-          amount: Math.round(amountToPay * 100),
-          currency: 'eur',
-          payment_method: payment_method_id,
-          payment_method_types: ['card'],
-          confirm: true,
-          metadata: { booking_id: id, type: 'final' }
-        },
-        { idempotencyKey: `${baseKey}:pi` }
-      );
+      const intent = await stripe.paymentIntents.create({
+        amount: Math.round(amountToCharge * 100),      // cents
+        currency: 'eur',
+        payment_method: payment_method_id,
+        confirm: true,
+        transfer_data: { destination: booking.stripe_account_id },
+        metadata: { booking_id: id, type: 'final' }
+      }, { idempotencyKey: `${baseKey}:pi` });
 
       if (intent.status !== 'succeeded') throw new Error('Pago no completado.');
 
-      // 3. Transferencia al profesional
-      await stripe.transfers.create(
-        {
-          amount: intent.amount,
-          currency: 'eur',
-          destination: booking.stripe_account_id,
-          metadata: { booking_id: id }
-        },
-        { idempotencyKey: `${baseKey}:tr` }
-      );
-
-      // 4. Marca como pagada y confirma la transacción
       await conn.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [id]);
       await conn.commit();
 
-      res.status(200).json({ message: 'Pago y transferencia OK', paymentIntentId: intent.id });
+      res.status(200).json({ message: 'Pago enviado al profesional', paymentIntentId: intent.id });
     } catch (e) {
       await conn.rollback();
-      await handleStripeRollbackIfNeeded(e);
       console.error(e);
       res.status(e.statusCode || 500).json({ error: e.message });
     } finally {
