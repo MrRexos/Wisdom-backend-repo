@@ -3021,7 +3021,7 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
   });
 });
 
-// Pago final y transferencia automática al profesional (!)
+// Pago final y transferencia automática al profesional (destination charge!) 
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { payment_method_id } = req.body;
@@ -3063,6 +3063,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         currency: 'eur',
         payment_method: payment_method_id,
         confirm: true,
+        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
         transfer_data: { destination: booking.stripe_account_id },
         metadata: { booking_id: id, type: 'final' }
       }, { idempotencyKey: `${baseKey}:pi` });
