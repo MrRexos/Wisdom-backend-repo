@@ -146,14 +146,14 @@ app.get('/api/users', (req, res) => {
 
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
-  const { email, username, password, first_name, surname, language, allow_notis, profile_picture } = req.body;
+  const { email, username, password, first_name, surname, language, allow_notis, profile_picture, phone } = req.body;
 
   try {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, joined_datetime, language, allow_notis, profile_picture, is_verified) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0)';
-    const values = [email, username, hashedPassword, first_name, surname, language, allow_notis, profile_picture];
+    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0)';
+    const values = [email, username, hashedPassword, first_name, surname, phone, language, allow_notis, profile_picture];
 
     pool.getConnection((err, connection) => {
       if (err) {
@@ -626,7 +626,7 @@ app.post('/api/reset-password', async (req, res) => {
                 return res.status(500).json({ error: 'Error interno' });
               }
 
-              connection.query('SELECT id, email, username, first_name, surname, profile_picture, is_professional, language FROM user_account WHERE id = ?', [userId], (selErr, results) => {
+              connection.query('SELECT id, email, username, first_name, surname, phone, profile_picture, is_professional, language FROM user_account WHERE id = ?', [userId], (selErr, results) => {
                 connection.release();
                 if (selErr || results.length === 0) {
                   return res.status(500).json({ error: 'Error al obtener el usuario.' });
@@ -963,6 +963,7 @@ app.get('/api/lists/:id/items', (req, res) => {
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
+        user_account.phone,
         user_account.username,
         user_account.password,
         user_account.first_name,
@@ -1171,6 +1172,7 @@ app.get('/api/category/:id/services', (req, res) => {
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
+        user_account.phone,
         user_account.username,
         user_account.first_name,
         user_account.surname,
@@ -1595,6 +1597,7 @@ app.get('/api/service/:id', (req, res) => {
         p.price_type,
         ua.id AS user_id,
         ua.email,
+        ua.phone,
         ua.username,
         ua.first_name,
         ua.surname,
@@ -1619,11 +1622,12 @@ app.get('/api/service/:id', (req, res) => {
             'rating', r.rating, 
             'comment', r.comment, 
             'review_datetime', r.review_datetime,
-            'user', JSON_OBJECT('id', ua_r.id, 
-                                'email', ua_r.email, 
-                                'username', ua_r.username, 
-                                'first_name', ua_r.first_name, 
-                                'surname', ua_r.surname, 
+            'user', JSON_OBJECT('id', ua_r.id,
+                                'email', ua_r.email,
+                                'phone', ua_r.phone,
+                                'username', ua_r.username,
+                                'first_name', ua_r.first_name,
+                                'surname', ua_r.surname,
                                 'profile_picture', ua_r.profile_picture))
          )
          FROM review r 
@@ -1709,11 +1713,12 @@ app.get('/api/suggested_professional', (req, res) => {
 
     // Consulta para obtener el ID del servicio y toda la información del usuario, con un límite de 20 resultados
     const query = `
-      SELECT 
+      SELECT
         s.id AS service_id,
         s.service_title,
         ua.id AS user_id,
         ua.email,
+        ua.phone,
         ua.username,
         ua.first_name,
         ua.surname,
@@ -1781,6 +1786,7 @@ app.get('/api/user/:userId/bookings', (req, res) => {
           price.price_type,
           user_account.id AS service_user_id,
           user_account.email,
+          user_account.phone,
           user_account.username,
           user_account.first_name,
           user_account.surname,
@@ -1865,6 +1871,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         -- Información del usuario que presta el servicio
         service_user.id AS service_user_id,
         service_user.email AS service_user_email,
+        service_user.phone AS service_user_phone,
         service_user.username AS service_user_username,
         service_user.first_name AS service_user_first_name,
         service_user.surname AS service_user_surname,
@@ -1874,6 +1881,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         -- Información del usuario que realizó la reserva
         booking_user.id AS booking_user_id,
         booking_user.email AS booking_user_email,
+        booking_user.phone AS booking_user_phone,
         booking_user.username AS booking_user_username,
         booking_user.first_name AS booking_user_first_name,
         booking_user.surname AS booking_user_surname,
@@ -1948,6 +1956,7 @@ app.get('/api/user/:id/services', (req, res) => {
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
+        user_account.phone,
         user_account.username,
         user_account.first_name,
         user_account.surname,
@@ -2044,7 +2053,7 @@ app.get('/api/user/:id', (req, res) => {
     }
 
     const query = `
-      SELECT id, email, username, first_name, surname, profile_picture,
+      SELECT id, email, username, first_name, surname, phone, profile_picture,
              is_professional, language, joined_datetime
       FROM user_account
       WHERE id = ?;
@@ -2071,7 +2080,7 @@ app.get('/api/user/:id', (req, res) => {
 //Ruta para actualizar el profile
 app.put('/api/user/:id/profile', (req, res) => {
   const { id } = req.params; // ID del usuario
-  const { profile_picture, username, first_name, surname } = req.body; // Datos a actualizar
+  const { profile_picture, username, first_name, surname, phone } = req.body; // Datos a actualizar
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2083,11 +2092,11 @@ app.put('/api/user/:id/profile', (req, res) => {
     // Consulta para actualizar los valores en user_account
     const query = `
       UPDATE user_account
-      SET profile_picture = ?, username = ?, first_name = ?, surname = ?
+      SET profile_picture = ?, username = ?, first_name = ?, surname = ?, phone = ?
       WHERE id = ?;
     `;
 
-    connection.query(query, [profile_picture, username, first_name, surname, id], (err, result) => {
+    connection.query(query, [profile_picture, username, first_name, surname, phone, id], (err, result) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -3024,9 +3033,9 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
 // Pago final y transferencia automática al profesional (destination charge!) 
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { payment_method_id, phone, fileTokenAnverso, fileTokenReverso } = req.body;
-  if (!payment_method_id || !phone || !fileTokenAnverso || !fileTokenReverso) {
-    return res.status(400).json({ error: 'payment_method_id, phone y documentos son requeridos.' });
+  const { payment_method_id, fileTokenAnverso, fileTokenReverso } = req.body;
+  if (!payment_method_id || !fileTokenAnverso || !fileTokenReverso) {
+    return res.status(400).json({ error: 'payment_method_id y documentos son requeridos.' });
   }
 
   const baseKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
@@ -3043,7 +3052,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
                b.commission,
                b.is_paid,
                u.stripe_account_id,
-               u.email
+               u.email,
+               u.phone
         FROM booking b
         JOIN service s  ON b.service_id = s.id
         JOIN user_account u ON s.user_id = u.id
@@ -3058,11 +3068,12 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       const commissionAmount = parseFloat(booking.commission   || 0);
       const amountToCharge   = Number((finalPrice - commissionAmount).toFixed(2));
       if (amountToCharge <= 0) throw new BadRequest('Importe a cobrar inválido.');
+      if (!booking.phone) throw new BadRequest('El profesional no tiene teléfono registrado.');
 
       await stripe.accounts.update(booking.stripe_account_id, {
         email: booking.email,
         individual: {
-          phone,
+          phone: booking.phone,
           verification: {
             document: {
               front: fileTokenAnverso,
@@ -3118,9 +3129,11 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         s.service_title,
         s.description,
         cu.email AS customer_email,
+        cu.phone AS customer_phone,
         cu.first_name AS customer_first_name,
         cu.surname AS customer_surname,
         sp.email AS provider_email,
+        sp.phone AS provider_phone,
         sp.first_name AS provider_first_name,
         sp.surname AS provider_surname
       FROM booking b
@@ -3362,6 +3375,7 @@ app.get('/api/services', (req, res) => {
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
+        user_account.phone,
         user_account.username,
         user_account.first_name,
         user_account.surname,
@@ -3462,6 +3476,7 @@ app.get('/api/services/:id', (req, res) => {
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
+        user_account.phone,
         user_account.username,
         user_account.first_name,
         user_account.surname,
