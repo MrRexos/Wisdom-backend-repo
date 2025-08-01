@@ -3024,9 +3024,9 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
 // Pago final y transferencia automática al profesional (destination charge!) 
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { payment_method_id } = req.body;
-  if (!payment_method_id) {
-    return res.status(400).json({ error: 'payment_method_id es requerido.' });
+  const { payment_method_id, phone, fileTokenAnverso, fileTokenReverso } = req.body;
+  if (!payment_method_id || !phone || !fileTokenAnverso || !fileTokenReverso) {
+    return res.status(400).json({ error: 'payment_method_id, phone y documentos son requeridos.' });
   }
 
   const baseKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
@@ -3042,7 +3042,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         SELECT b.final_price,
                b.commission,
                b.is_paid,
-               u.stripe_account_id
+               u.stripe_account_id,
+               u.email
         FROM booking b
         JOIN service s  ON b.service_id = s.id
         JOIN user_account u ON s.user_id = u.id
@@ -3057,6 +3058,19 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       const commissionAmount = parseFloat(booking.commission   || 0);
       const amountToCharge   = Number((finalPrice - commissionAmount).toFixed(2));
       if (amountToCharge <= 0) throw new BadRequest('Importe a cobrar inválido.');
+
+      await stripe.accounts.update(booking.stripe_account_id, {
+        email: booking.email,
+        individual: {
+          phone,
+          verification: {
+            document: {
+              front: fileTokenAnverso,
+              back: fileTokenReverso
+            }
+          }
+        }
+      });
 
       const intent = await stripe.paymentIntents.create({
         amount: Math.round(amountToCharge * 100),      // cents
