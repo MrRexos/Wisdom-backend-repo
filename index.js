@@ -2854,10 +2854,27 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
     postal_code,
     city,
     state,
-    country
+    country,
+    phone,
+    fileTokenAnverso,
+    fileTokenReverso
   } = req.body;
 
-  if (!full_name || !date_of_birth || !nif || !iban || !address_type || !address_1 || !postal_code || !city || !state || !country) {
+  if (
+    !full_name ||
+    !date_of_birth ||
+    !nif ||
+    !iban ||
+    !address_type ||
+    !address_1 ||
+    !postal_code ||
+    !city ||
+    !state ||
+    !country ||
+    !phone ||
+    !fileTokenAnverso ||
+    !fileTokenReverso
+  ) {
     return res.status(400).json({ error: 'Campos requeridos faltantes' });
   }
 
@@ -2901,6 +2918,13 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
               city,
               state,
               country: country.toUpperCase()
+            },
+            phone,
+            verification: {
+              document: {
+                front: fileTokenAnverso,
+                back: fileTokenReverso
+              }
             }
           },
           capabilities: {
@@ -2953,8 +2977,8 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
               }
 
               const updateQuery =
-                'UPDATE user_account SET date_of_birth = ?, nif = ?, stripe_account_id = ? WHERE id = ?';
-              connection.query(updateQuery, [date_of_birth, nif, account.id, id], (updErr) => {
+                'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ? WHERE id = ?';
+              connection.query(updateQuery, [date_of_birth, nif, phone, account.id, id], (updErr) => {
                 connection.release();
                 if (updErr) {
                   console.error('Error al actualizar el usuario:', updErr);
@@ -3033,9 +3057,9 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
 // Pago final y transferencia automática al profesional (destination charge!) 
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { payment_method_id, fileTokenAnverso, fileTokenReverso } = req.body;
-  if (!payment_method_id || !fileTokenAnverso || !fileTokenReverso) {
-    return res.status(400).json({ error: 'payment_method_id y documentos son requeridos.' });
+  const { payment_method_id } = req.body;
+  if (!payment_method_id) {
+    return res.status(400).json({ error: 'payment_method_id es requerido.' });
   }
 
   const baseKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
@@ -3051,9 +3075,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         SELECT b.final_price,
                b.commission,
                b.is_paid,
-               u.stripe_account_id,
-               u.email,
-               u.phone
+               u.stripe_account_id
         FROM booking b
         JOIN service s  ON b.service_id = s.id
         JOIN user_account u ON s.user_id = u.id
@@ -3068,20 +3090,6 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       const commissionAmount = parseFloat(booking.commission   || 0);
       const amountToCharge   = Number((finalPrice - commissionAmount).toFixed(2));
       if (amountToCharge <= 0) throw new BadRequest('Importe a cobrar inválido.');
-      if (!booking.phone) throw new BadRequest('El profesional no tiene teléfono registrado.');
-
-      await stripe.accounts.update(booking.stripe_account_id, {
-        email: booking.email,
-        individual: {
-          phone: booking.phone,
-          verification: {
-            document: {
-              front: fileTokenAnverso,
-              back: fileTokenReverso
-            }
-          }
-        }
-      });
 
       const intent = await stripe.paymentIntents.create({
         amount: Math.round(amountToCharge * 100),      // cents
