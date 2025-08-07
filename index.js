@@ -12,6 +12,8 @@ const sharp = require('sharp');
 const nodemailer = require('nodemailer');
 const crypto = require("crypto");
 const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const os = require('os');
 
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -35,6 +37,17 @@ app.use(bodyParser.json());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 const upload = multer({ storage: multer.memoryStorage() });
+const uploadDni = multer({
+  dest: os.tmpdir(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'image/jpeg' || file.mimetype === 'image/png') {
+      cb(null, true);
+    } else {
+      cb(new Error('INVALID_FILE_TYPE'));
+    }
+  },
+});
 
 // CIDs for email images
 const wisdomLogoCid = 'wisdom_logo';
@@ -3567,6 +3580,41 @@ app.post('/api/services/:id/reviews', (req, res) => {
 
       res.status(201).json({ message: 'Review añadida con éxito', reviewId: result.insertId });
     });
+  });
+});
+
+app.post('/api/upload-dni', (req, res) => {
+  uploadDni.single('file')(req, res, async (err) => {
+    if (err) {
+      if (err.message === 'INVALID_FILE_TYPE') {
+        return res.status(400).json({ error: 'Invalid file type' });
+      }
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'File too large' });
+      }
+      return res.status(400).json({ error: err.message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: 'File is required' });
+    }
+
+    const filePath = req.file.path;
+    try {
+      const stripeFile = await stripe.files.create({
+        purpose: 'identity_document',
+        file: {
+          data: fs.createReadStream(filePath),
+          name: req.file.originalname,
+          type: req.file.mimetype,
+        },
+      });
+      await fs.promises.unlink(filePath);
+      return res.status(201).json({ fileToken: stripeFile.id });
+    } catch (stripeErr) {
+      await fs.promises.unlink(filePath).catch(() => {});
+      console.error('Stripe file upload error:', stripeErr);
+      return res.status(500).json({ error: 'Stripe upload failed' });
+    }
   });
 });
 
