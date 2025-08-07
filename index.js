@@ -2932,6 +2932,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
               state,
               country: country.toUpperCase()
             },
+            email: user.email, 
             phone,
             verification: {
               document: {
