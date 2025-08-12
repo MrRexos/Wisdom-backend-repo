@@ -3149,8 +3149,9 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         b.is_paid,
         b.booking_start_datetime,
         b.booking_end_datetime,
+        b.description AS booking_description,
         s.service_title,
-        s.description,
+        s.description AS service_description,
         cu.email AS customer_email,
         cu.phone AS customer_phone,
         cu.first_name AS customer_first_name,
@@ -3197,7 +3198,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       }
 
       const data = results[0];
-      const doc = new PDFDocument({ margin: 48 });
+      const doc = new PDFDocument({ margin: 64 });
 
       // Resource paths
       const assetsPath = path.join(__dirname, 'assets');
@@ -3249,7 +3250,9 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
 
       // Common header
       try {
-        doc.image(path.join(assetsPath, 'wisdom.png'), doc.page.width - 130, 32, { width: 100 });
+        const logoWidth = 50; // mitad del tamaño previo
+        const logoX = doc.page.width - doc.page.margins.right - logoWidth - 10;
+        doc.image(path.join(assetsPath, 'wisdom.png'), logoX, 32, { width: logoWidth });
       } catch (e) {
         console.warn('Logo not found:', e);
       }
@@ -3283,7 +3286,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       if (invoiceType === 'deposit') {
         doc.font('Inter').fontSize(11);
         doc.text('Name or company name: WISDOM, S.L.');
-        doc.text('Tax ID (NIF): 39414159W');
+        doc.text('Tax ID: 39414159W');
         doc.text('Address: Font dels Reis, 60, 008304, Mataró, Barcelona, Spain');
       } else {
         const providerFullName = `${data.provider_first_name || ''} ${data.provider_surname || ''}`.trim();
@@ -3315,7 +3318,9 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       // DESCRIPTION
       doc.font('Inter-Bold').fontSize(12).text('DESCRIPTION');
       doc.moveDown(0.3);
-      const serviceSummary = `${data.service_title || ''}${data.description ? ' - ' + data.description : ''}`.trim();
+      const serviceTitleQuoted = data.service_title ? `"${data.service_title}"` : '""';
+      const bookingDescQuoted = data.booking_description ? ` + "${data.booking_description}"` : '';
+      const serviceSummary = `${serviceTitleQuoted}${bookingDescQuoted}`.trim();
       if (invoiceType === 'deposit') {
         doc.font('Inter').fontSize(11).text(
           `Item: Service fee for intermediation in booking ${data.booking_id} of the service ${serviceSummary}, with scheduled date of provision ${formatDate(data.booking_start_datetime)}.`
