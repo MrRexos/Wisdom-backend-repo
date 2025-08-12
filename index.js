@@ -3012,7 +3012,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   });
 });
 
-// Transferir el pago final al profesional con Stripe Connect (NO FUNCIONA! ERROR CON TRANSFERS:INVALID EN LAS CUENTAS DE STRIPE)
+// Transferir el pago final al profesional con Stripe Connect (NO ACTIVO!)
 app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
   const { id } = req.params;
 
@@ -3068,7 +3068,7 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
   });
 });
 
-// Pago final y transferencia automática al profesional (destination charge!) 
+// Pago final y transferencia automática al profesional (destination charge!) ------
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { payment_method_id } = req.body;
@@ -3146,6 +3146,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         b.id AS booking_id,
         b.final_price,
         b.commission,
+        b.is_paid,
         b.booking_start_datetime,
         b.booking_end_datetime,
         s.service_title,
@@ -3154,15 +3155,34 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         cu.phone AS customer_phone,
         cu.first_name AS customer_first_name,
         cu.surname AS customer_surname,
+        sp.id AS provider_id,
         sp.email AS provider_email,
         sp.phone AS provider_phone,
         sp.first_name AS provider_first_name,
-        sp.surname AS provider_surname
+        sp.surname AS provider_surname,
+        sp.nif AS provider_nif,
+        a.address_1 AS provider_address_1,
+        a.address_2 AS provider_address_2,
+        a.street_number AS provider_street_number,
+        a.postal_code AS provider_postal_code,
+        a.city AS provider_city,
+        a.state AS provider_state,
+        a.country AS provider_country
       FROM booking b
       JOIN user_account cu ON b.user_id = cu.id
       JOIN service s ON b.service_id = s.id
       JOIN user_account sp ON s.user_id = sp.id
-      WHERE b.id = ?;
+      LEFT JOIN (
+        SELECT cm1.* FROM collection_method cm1
+        JOIN (
+          SELECT user_id, MAX(id) AS max_id
+          FROM collection_method
+          GROUP BY user_id
+        ) cm2 ON cm1.user_id = cm2.user_id AND cm1.id = cm2.max_id
+      ) cm ON cm.user_id = sp.id
+      LEFT JOIN address a ON a.id = cm.address_id
+      WHERE b.id = ?
+      LIMIT 1;
     `;
 
     connection.query(query, [id], (err, results) => {
@@ -3197,52 +3217,174 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         res.send(pdfData);
       });
 
-      /* ---------- Header ---------- */
-      // Logo top–right
+      // Helpers
+      const formatDate = (value) => {
+        try {
+          const d = new Date(value);
+          const dd = String(d.getDate()).padStart(2, '0');
+          const mm = String(d.getMonth() + 1).padStart(2, '0');
+          const yyyy = d.getFullYear();
+          return `${dd}/${mm}/${yyyy}`;
+        } catch (_) {
+          return '';
+        }
+      };
+      const toCurrency = (amount) => `€${Number(amount || 0).toFixed(2)}`;
+
+      // Decide invoice type
+      const typeParam = String(req.query.type || '').toLowerCase();
+      const invoiceType = (typeParam === 'deposit' || typeParam === 'final')
+        ? typeParam
+        : (data.is_paid ? 'final' : 'deposit');
+
+      // VAT configuration (only used for provider invoice)
+      const vatRateParam = req.query.vat_rate;
+      let vatRateProvider = 21; // default 21%
+      if (vatRateParam !== undefined) {
+        const parsed = parseInt(vatRateParam, 10);
+        if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 21) vatRateProvider = parsed;
+      }
+      const isExempt = String(req.query.exempt || '').toLowerCase() === 'true';
+      const isReverseCharge = String(req.query.reverse_charge || '').toLowerCase() === 'true';
+
+      // Common header
       try {
         doc.image(path.join(assetsPath, 'wisdom.png'), doc.page.width - 130, 32, { width: 100 });
       } catch (e) {
         console.warn('Logo not found:', e);
       }
-
-      // Centered title
       doc.font('Inter-Bold').fontSize(20).text('INVOICE', 0, 40, { align: 'center' });
-      doc.moveDown(2);
+      doc.moveDown(1.2);
 
-      /* ---------- Booking details ---------- */
-      doc.font('Inter-Bold').fontSize(12).text('Booking details');
-      doc.moveDown(0.3);
+      // Metadata
+      const now = new Date();
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const seriesNumber = invoiceType === 'deposit'
+        ? `WISDOM-${yyyy}-${mm}-${data.booking_id}`
+        : `PRO-${data.provider_id}-${yyyy}-${mm}-${data.booking_id}`;
 
-      doc.font('Inter').fontSize(11);
-      doc.text(`Booking #${data.booking_id}`);
-      doc.text(`Service: ${data.service_title}`);
-      if (data.description) doc.text(`Description: ${data.description}`);
-      doc.text(`Start: ${formatDateTime(data.booking_start_datetime)}`);
-      doc.text(`End: ${formatDateTime(data.booking_end_datetime)}`);
-      doc.text(`Final price: €${Number(data.final_price).toFixed(2)}`);
-      if (data.commission !== undefined) {
-        doc.text(`Commission: €${Number(data.commission).toFixed(2)}`);
-        doc.text(`Net amount: €${Number(data.final_price - data.commission).toFixed(2)}`);
-      }
+      doc.font('Inter-Bold').fontSize(11).text('Series & No.');
+      doc.font('Inter').fontSize(11).text(seriesNumber);
+      doc.moveDown(0.4);
+      doc.font('Inter-Bold').text('Issue date');
+      doc.font('Inter').text(formatDate(now));
+      doc.moveDown(0.4);
+      doc.font('Inter-Bold').text(invoiceType === 'deposit' ? 'Date of the transaction' : 'Date of the transaction (if different)');
+      doc.font('Inter').text(invoiceType === 'deposit' ? '—' : formatDate(data.booking_end_datetime || data.booking_start_datetime));
 
       doc.moveDown();
       doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#E5E7EB').stroke();
       doc.moveDown();
 
-      /* ---------- Customer ---------- */
-      doc.font('Inter-Bold').text('Customer');
-      doc.font('Inter').text(`${data.customer_first_name} ${data.customer_surname}`);
-      doc.text(data.customer_email);
+      // ISSUER
+      doc.font('Inter-Bold').fontSize(12).text('ISSUER');
+      doc.moveDown(0.3);
+      if (invoiceType === 'deposit') {
+        doc.font('Inter').fontSize(11);
+        doc.text('Name or company name: WISDOM, S.L.');
+        doc.text('Tax ID (NIF): 39414159W');
+        doc.text('Address: Font dels Reis, 60, 008304, Mataró, Barcelona, Spain');
+      } else {
+        const providerFullName = `${data.provider_first_name || ''} ${data.provider_surname || ''}`.trim();
+        const addrParts = [
+          [data.provider_address_1, data.provider_street_number].filter(Boolean).join(' '),
+          [data.provider_postal_code, data.provider_city].filter(Boolean).join(', '),
+          [data.provider_state, data.provider_country].filter(Boolean).join(', ')
+        ].filter(Boolean).join(', ');
+
+        doc.font('Inter').fontSize(11);
+        doc.text(`Name or company name: ${providerFullName || '—'}`);
+        doc.text(`Tax ID: ${data.provider_nif || '__________'}`);
+        doc.text(`Address: ${addrParts || '—'}`);
+      }
 
       doc.moveDown();
 
-      /* ---------- Provider ---------- */
-      doc.font('Inter-Bold').text('Provider');
-      doc.font('Inter').text(`${data.provider_first_name} ${data.provider_surname}`);
-      doc.text(data.provider_email);
+      // RECIPIENT
+      doc.font('Inter-Bold').fontSize(12).text('RECIPIENT');
+      doc.moveDown(0.3);
+      const customerFullName = `${data.customer_first_name || ''} ${data.customer_surname || ''}`.trim();
+      doc.font('Inter').fontSize(11);
+      doc.text(`Full name: ${customerFullName || '—'}`);
+      doc.text('Tax ID: —');
+      doc.text('Address: —');
 
-      // Final horizontal rule
+      doc.moveDown();
+
+      // DESCRIPTION
+      doc.font('Inter-Bold').fontSize(12).text('DESCRIPTION');
+      doc.moveDown(0.3);
+      const serviceSummary = `${data.service_title || ''}${data.description ? ' - ' + data.description : ''}`.trim();
+      if (invoiceType === 'deposit') {
+        doc.font('Inter').fontSize(11).text(
+          `Item: Service fee for intermediation in booking ${data.booking_id} of the service ${serviceSummary}, with scheduled date of provision ${formatDate(data.booking_start_datetime)}.`
+        );
+      } else {
+        doc.font('Inter').fontSize(11).text(
+          `Item: Provision of the service ${serviceSummary} carried out on ${formatDate(data.booking_end_datetime || data.booking_start_datetime)}. Booking reference in Wisdom: ${data.booking_id}`
+        );
+      }
+
+      doc.moveDown();
+
+      // TAX DETAILS
+      doc.font('Inter-Bold').fontSize(12).text('TAX DETAILS');
+      doc.moveDown(0.3);
+
+      let taxableBase = 0;
+      let vatRate = 21;
+      let vatAmount = 0;
+      let invoiceTotal = 0;
+
+      if (invoiceType === 'deposit') {
+        invoiceTotal = Number(data.commission || 0);
+        vatRate = 21;
+        taxableBase = Number((invoiceTotal / (1 + vatRate / 100)).toFixed(2));
+        vatAmount = Number((invoiceTotal - taxableBase).toFixed(2));
+      } else {
+        invoiceTotal = Number((Number(data.final_price || 0) - Number(data.commission || 0)).toFixed(2));
+        vatRate = isExempt || isReverseCharge ? 0 : vatRateProvider;
+        if (vatRate > 0) {
+          taxableBase = Number((invoiceTotal / (1 + vatRate / 100)).toFixed(2));
+          vatAmount = Number((invoiceTotal - taxableBase).toFixed(2));
+        } else {
+          taxableBase = invoiceTotal;
+          vatAmount = 0;
+        }
+      }
+
+      doc.font('Inter').fontSize(11);
+      doc.text(`Taxable base: ${toCurrency(taxableBase)}`);
+      doc.text(`VAT rate: ${vatRate > 0 ? `${vatRate}%` : (isExempt ? 'exempt' : (isReverseCharge ? 'reverse charge' : '0%'))}`);
+      doc.text(`VAT amount: ${toCurrency(vatAmount)}`);
+      doc.text(`Invoice total: ${toCurrency(invoiceTotal)}`);
+
+      doc.moveDown();
+
+      if (invoiceType === 'deposit') {
+        doc.font('Inter').fontSize(10).fillColor('#6B7280').text(
+          `This invoice refers exclusively to Wisdom’s intermediation service fee. The professional service will be invoiced by the service provider upon completion.`,
+          { align: 'left' }
+        );
+      } else {
+        doc.font('Inter').fontSize(10).fillColor('#6B7280').text(
+          `Issued by a third party on behalf of and in the name of the issuer (Wisdom), pursuant to Article 5 of the Spanish Invoicing Regulations.`,
+          { align: 'left' }
+        );
+        if (isExempt) {
+          doc.moveDown(0.2);
+          doc.text(`exempt under Art. 20 LIVA`, { align: 'left' });
+        }
+        if (isReverseCharge) {
+          doc.moveDown(0.2);
+          doc.text(`reverse charge`, { align: 'left' });
+        }
+      }
+
+      // Footer divider
       doc.moveDown(2);
+      doc.fillColor('#000000');
       doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#E5E7EB').stroke();
 
       doc.end();
