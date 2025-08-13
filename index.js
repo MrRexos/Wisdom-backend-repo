@@ -1442,19 +1442,30 @@ app.post('/api/service', (req, res) => {
                 }
               });
             }
-
-            // Commit final
-            connection.commit(err => {
+            // 8. Marcar al usuario como profesional si aún no lo es
+            const professionalQuery = 'UPDATE user_account SET is_professional = 1 WHERE id = ? AND is_professional = 0';
+            connection.query(professionalQuery, [user_id], err => {
               if (err) {
                 return connection.rollback(() => {
-                  console.error('Error al hacer commit de la transacción:', err);
-                  connection.release(); // Liberar conexión en caso de error
-                  res.status(500).json({ error: 'Error al hacer commit de la transacción.' });
+                  console.error('Error al actualizar el usuario como profesional:', err);
+                  connection.release();
+                  res.status(500).json({ error: 'Error al actualizar el usuario.' });
                 });
               }
 
-              connection.release(); // Liberar conexión después del commit exitoso
-              res.status(201).json({ message: 'Servicio creado con éxito.' });
+              // Commit final
+              connection.commit(err => {
+                if (err) {
+                  return connection.rollback(() => {
+                    console.error('Error al hacer commit de la transacción:', err);
+                    connection.release(); // Liberar conexión en caso de error
+                    res.status(500).json({ error: 'Error al hacer commit de la transacción.' });
+                  });
+                }
+
+                connection.release(); // Liberar conexión después del commit exitoso
+                res.status(201).json({ message: 'Servicio creado con éxito.' });
+              });
             });
           });
         };
@@ -2991,7 +3002,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
               }
 
               const updateQuery =
-                'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ? WHERE id = ?';
+                'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1 WHERE id = ?';
               connection.query(updateQuery, [date_of_birth, nif, phone, account.id, id], (updErr) => {
                 connection.release();
                 if (updErr) {
