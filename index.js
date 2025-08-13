@@ -3276,9 +3276,12 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       // Título debajo del logo (o del hueco del logo si no se pudo cargar)
       const titleY = logoY + (logoHeight || logoWidth) + 8;
       doc.font('Inter-Bold').fontSize(20);
-      const title = 'INVOICE';
-      const titleX = logoX + (logoWidth - doc.widthOfString(title)) / 2;
-      doc.text(title, titleX, titleY, { lineBreak: false });
+      doc.font('Inter-Bold').fontSize(20);
+      const innerWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+      doc.text('INVOICE', doc.page.margins.left, titleY, {
+        width: innerWidth,
+        align: 'center'
+      });
 
       // Vuelve el cursor al margen izquierdo para el resto de contenido
       doc.x = doc.page.margins.left;
@@ -3350,7 +3353,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.font('Inter-Bold').fontSize(12).text('DESCRIPTION');
       doc.moveDown(0.3);
       const serviceTitleQuoted = data.service_title ? `"${data.service_title}"` : '""';
-      const bookingDescQuoted = data.booking_description ? `with description "${data.booking_description}"` : '';
+      const bookingDescQuoted = data.booking_description ? ` with description "${data.booking_description}"` : '';
       const serviceSummary = `${serviceTitleQuoted}${bookingDescQuoted}`.trim();
       if (invoiceType === 'deposit') {
         doc.font('Inter').fontSize(11).text(
