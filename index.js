@@ -3249,20 +3249,44 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       const isReverseCharge = String(req.query.reverse_charge || '').toLowerCase() === 'true';
 
       // Common header
+      let logoX, logoY, logoWidth, logoHeight;
+      logoWidth = 60;
+      logoX = doc.page.width - doc.page.margins.right - logoWidth;
+      logoY = doc.page.margins.top;
+      logoHeight = 0; // por defecto
+
       try {
         const logoPath = path.join(assetsPath, 'wisdom.png');
-        const logoImg = doc.openImage(logoPath);
-        const logoWidth = 60;
-        const logoHeight = Math.round(logoWidth * (logoImg.height / logoImg.width));
-        const logoX = doc.page.width - doc.page.margins.right - logoWidth;
-        const logoY = doc.page.margins.top;
+
+        // Si tu versión de PDFKit soporta openImage, úsalo para conocer el alto real
+        if (typeof doc.openImage === 'function') {
+          const img = doc.openImage(logoPath);
+          logoHeight = Math.round(logoWidth * (img.height / img.width));
+        } else {
+          // fallback razonable si no hay openImage (supón cuadrado)
+          logoHeight = logoWidth;
+        }
+
         doc.image(logoPath, logoX, logoY, { width: logoWidth });
       } catch (e) {
         console.warn('Logo not found:', e);
+        // mantenemos logoHeight como esté (0 o fallback) y seguimos
       }
-      doc.font('Inter-Bold').fontSize(20).text('INVOICE', logoX, logoY + logoHeight + 8, { width: logoWidth, align: 'center' });
-      doc.moveDown(1.2);
+
+      // Título debajo del logo (o del hueco del logo si no se pudo cargar)
+      const titleY = logoY + (logoHeight || logoWidth) + 8;
+      doc.font('Inter-Bold').fontSize(20).text('INVOICE', logoX, titleY, { width: logoWidth, align: 'center' });
+
+      // Vuelve el cursor al margen izquierdo para el resto de contenido
       doc.x = doc.page.margins.left;
+      doc.moveDown(1.2);
+
+      // (opcional, evita que un error de PDF mate el dyno)
+      doc.on('error', (err) => {
+        console.error('PDF error:', err);
+        if (!res.headersSent) res.status(500).send('PDF generation error');
+      });
+
 
       // Metadata
       const now = new Date();
