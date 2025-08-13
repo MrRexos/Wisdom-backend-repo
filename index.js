@@ -3275,7 +3275,10 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
 
       // Título debajo del logo (o del hueco del logo si no se pudo cargar)
       const titleY = logoY + (logoHeight || logoWidth) + 8;
-      doc.font('Inter-Bold').fontSize(20).text('INVOICE', logoX, titleY, { width: logoWidth, align: 'center' });
+      doc.font('Inter-Bold').fontSize(20);
+      const title = 'INVOICE';
+      const titleX = logoX + (logoWidth - doc.widthOfString(title)) / 2;
+      doc.text(title, titleX, titleY, { lineBreak: false });
 
       // Vuelve el cursor al margen izquierdo para el resto de contenido
       doc.x = doc.page.margins.left;
