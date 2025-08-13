@@ -3411,6 +3411,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.text(`Invoice total: ${toCurrency(invoiceTotal)}`);
 
       doc.moveDown();
+      doc.moveDown();
 
       if (invoiceType === 'deposit') {
         doc.font('Inter').fontSize(10).fillColor('#6B7280').text(
