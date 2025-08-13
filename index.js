@@ -3198,7 +3198,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       }
 
       const data = results[0];
-      const doc = new PDFDocument({ margin: 64 });
+      const doc = new PDFDocument({ margins: { top: 64, left: 64, right: 64, bottom: 64 } });
 
       // Resource paths
       const assetsPath = path.join(__dirname, 'assets');
@@ -3250,14 +3250,19 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
 
       // Common header
       try {
-        const logoWidth = 50; // mitad del tamaño previo
-        const logoX = doc.page.width - doc.page.margins.right - logoWidth - 10;
-        doc.image(path.join(assetsPath, 'wisdom.png'), logoX, 32, { width: logoWidth });
+        const logoPath = path.join(assetsPath, 'wisdom.png');
+        const logoImg = doc.openImage(logoPath);
+        const logoWidth = 60;
+        const logoHeight = Math.round(logoWidth * (logoImg.height / logoImg.width));
+        const logoX = doc.page.width - doc.page.margins.right - logoWidth;
+        const logoY = doc.page.margins.top;
+        doc.image(logoPath, logoX, logoY, { width: logoWidth });
       } catch (e) {
         console.warn('Logo not found:', e);
       }
-      doc.font('Inter-Bold').fontSize(20).text('INVOICE', 0, 40, { align: 'center' });
+      doc.font('Inter-Bold').fontSize(20).text('INVOICE', logoX, logoY + logoHeight + 8, { width: logoWidth, align: 'center' });
       doc.moveDown(1.2);
+      doc.x = doc.page.margins.left;
 
       // Metadata
       const now = new Date();
@@ -3277,7 +3282,6 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.font('Inter').text(invoiceType === 'deposit' ? '—' : formatDate(data.booking_end_datetime || data.booking_start_datetime));
 
       doc.moveDown();
-      doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#E5E7EB').stroke();
       doc.moveDown();
 
       // ISSUER
@@ -3319,7 +3323,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.font('Inter-Bold').fontSize(12).text('DESCRIPTION');
       doc.moveDown(0.3);
       const serviceTitleQuoted = data.service_title ? `"${data.service_title}"` : '""';
-      const bookingDescQuoted = data.booking_description ? ` + "${data.booking_description}"` : '';
+      const bookingDescQuoted = data.booking_description ? `with description "${data.booking_description}"` : '';
       const serviceSummary = `${serviceTitleQuoted}${bookingDescQuoted}`.trim();
       if (invoiceType === 'deposit') {
         doc.font('Inter').fontSize(11).text(
@@ -3390,7 +3394,6 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       // Footer divider
       doc.moveDown(2);
       doc.fillColor('#000000');
-      doc.moveTo(doc.x, doc.y).lineTo(doc.page.width - doc.page.margins.right, doc.y).strokeColor('#E5E7EB').stroke();
 
       doc.end();
     });
