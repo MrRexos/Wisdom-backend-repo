@@ -3131,7 +3131,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
   });
 });
 
-// Generar y descargar factura en PDF de una reserva pagada
+// Generar y descargar factura en PDF de una reserva pagada (2 facturas)
 app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
   const { id } = req.params;
 
