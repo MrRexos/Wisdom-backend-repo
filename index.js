@@ -2802,7 +2802,9 @@ app.post('/api/bookings/:id/deposit', authenticateToken, (req, res) => {
       }
 
       const finalPrice = parseFloat(results[0].final_price || 0);
-      const commission = parseFloat(results[0].commission || 0);
+      let commission = parseFloat(results[0].commission || 0);
+      // Robustez: mínimo depósito de 1€ siempre
+      if (!isFinite(commission) || commission < 1) commission = 1;
 
       try {
         const intent = await stripe.paymentIntents.create({
