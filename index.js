@@ -2993,7 +2993,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   });
 });
 
-// Pago de comisión al crear la reserva (10% o mínimo 1€)
+//Cobra la comisión 10% (mín 1€)
 app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
@@ -3001,12 +3001,17 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   const baseKey = stableKey(['booking', id, 'deposit']);
 
   let booking;
+  let payment;
+  let commissionCents;
+
+  // Transacción corta: validar y preparar
   const connection = await pool.promise().getConnection();
   try {
     await connection.beginTransaction();
 
     const [rows] = await connection.query(
-      `SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status, u.email AS customer_email
+      `SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status,
+              u.email AS customer_email
        FROM booking b
        JOIN user_account u ON b.user_id = u.id
        WHERE b.id = ? FOR UPDATE`,
@@ -3023,7 +3028,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
-    const commissionCents = Math.max(100, toCents(booking.commission || 0));
+    commissionCents = Math.max(100, toCents(booking.commission || 0));
 
     await upsertPaymentRow(connection, {
       bookingId: id,
@@ -3032,11 +3037,20 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       status: 'creating'
     });
 
-    const payment = await getPaymentRow(connection, id, 'deposit');
+    payment = await getPaymentRow(connection, id, 'deposit');
 
     await connection.commit();
+  } catch (err) {
+    try { await connection.rollback(); } catch {}
+    connection.release();
+    return res.status(400).json({ error: 'No se pudo crear el depósito.' });
+  }
+  // Liberar conexión ANTES de llamar a Stripe
+  connection.release();
 
-    let intent;
+  // Llamada a Stripe fuera de transacción
+  let intent;
+  try {
     if (payment.payment_intent_id) {
       intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id);
     } else {
@@ -3051,44 +3065,43 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         { idempotencyKey: baseKey }
       );
     }
-
-    const conn2 = await pool.promise().getConnection();
-    try {
-      await conn2.beginTransaction();
-      await upsertPayment(conn2, {
-        bookingId: id,
-        type: 'deposit',
-        paymentIntentId: intent.id,
-        amountCents: commissionCents,
-        status: mapStatus(intent.status)
-      });
-      await conn2.commit();
-    } catch (e) {
-      await conn2.rollback();
-      throw e;
-    } finally {
-      conn2.release();
-    }
-
-    if (intent.status === 'requires_action') {
-      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
-    }
-    if (intent.status === 'processing') {
-      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
-    }
-    if (intent.status === 'succeeded') {
-      return res.status(200).json({ message: 'Depósito pagado', paymentIntentId: intent.id });
-    }
-    return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
   } catch (err) {
-    try { await connection.rollback(); } catch {}
-    return res.status(400).json({ error: 'No se pudo crear el depósito.' });
-  } finally {
-    connection.release();
+    return res.status(400).json({ error: 'Error con el proveedor de pagos.' });
   }
+
+  // Persistir intent/estado con segunda conexión corta
+  const conn2 = await pool.promise().getConnection();
+  try {
+    await conn2.beginTransaction();
+    await upsertPayment(conn2, {
+      bookingId: id,
+      type: 'deposit',
+      paymentIntentId: intent.id,
+      amountCents: commissionCents,
+      status: mapStatus(intent.status)
+    });
+    await conn2.commit();
+  } catch (e) {
+    try { await conn2.rollback(); } catch {}
+    return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
+  } finally {
+    conn2.release();
+  }
+
+  if (intent.status === 'requires_action') {
+    return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+  }
+  if (intent.status === 'processing') {
+    return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+  }
+  if (intent.status === 'succeeded') {
+    return res.status(200).json({ message: 'Depósito pagado', paymentIntentId: intent.id });
+  }
+  return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
 });
 
-// Pago final y transferencia automática al profesional (destination charge!)
+
+//Cargo final con transferencia al profesional (destination charge)
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
@@ -3098,6 +3111,10 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
   const baseKey = stableKey(['booking', id, 'final']);
 
   let booking;
+  let payment;
+  let amountToCharge;
+
+  // Transacción corta: validar y preparar
   const connection = await pool.promise().getConnection();
   try {
     await connection.beginTransaction();
@@ -3130,7 +3147,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
 
     const finalCents = toCents(booking.final_price || 0);
     const commissionCents = toCents(booking.commission || 0);
-    const amountToCharge = finalCents - commissionCents;
+    amountToCharge = finalCents - commissionCents;
     if (amountToCharge <= 0) throw new Error('Importe inválido');
 
     await upsertPaymentRow(connection, {
@@ -3139,15 +3156,24 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       amountCents: amountToCharge,
       status: 'creating'
     });
-    const payment = await getPaymentRow(connection, id, 'final');
+    payment = await getPaymentRow(connection, id, 'final');
 
     await connection.commit();
+  } catch (err) {
+    try { await connection.rollback(); } catch {}
+    connection.release();
+    return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
+  }
+  // Liberar conexión ANTES de llamar a Stripe
+  connection.release();
 
-    let intent;
+  // Llamada a Stripe fuera de transacción
+  let intent;
+  try {
     if (payment.payment_intent_id) {
       intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id);
       if (intent.status === 'requires_payment_method') {
-        intent = await stripe.paymentIntents.update(intent.id, { payment_method: payment_method_id });
+        await stripe.paymentIntents.update(intent.id, { payment_method: payment_method_id });
         intent = await stripe.paymentIntents.confirm(intent.id, { payment_method: payment_method_id });
       }
     } else {
@@ -3167,41 +3193,39 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         { idempotencyKey: baseKey }
       );
     }
-
-    const conn2 = await pool.promise().getConnection();
-    try {
-      await conn2.beginTransaction();
-      await upsertPayment(conn2, {
-        bookingId: id,
-        type: 'final',
-        paymentIntentId: intent.id,
-        amountCents: amountToCharge,
-        status: mapStatus(intent.status)
-      });
-      await conn2.commit();
-    } catch (e) {
-      await conn2.rollback();
-      throw e;
-    } finally {
-      conn2.release();
-    }
-
-    if (intent.status === 'succeeded') {
-      return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
-    }
-    if (intent.status === 'requires_action') {
-      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
-    }
-    if (intent.status === 'processing') {
-      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
-    }
-    return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
   } catch (err) {
-    try { await connection.rollback(); } catch {}
-    return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
-  } finally {
-    connection.release();
+    return res.status(400).json({ error: 'Error con el proveedor de pagos.' });
   }
+
+  // Persistir intent/estado con segunda conexión corta
+  const conn2 = await pool.promise().getConnection();
+  try {
+    await conn2.beginTransaction();
+    await upsertPayment(conn2, {
+      bookingId: id,
+      type: 'final',
+      paymentIntentId: intent.id,
+      amountCents: amountToCharge,
+      status: mapStatus(intent.status)
+    });
+    await conn2.commit();
+  } catch (e) {
+    try { await conn2.rollback(); } catch {}
+    return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
+  } finally {
+    conn2.release();
+  }
+
+  if (intent.status === 'succeeded') {
+    return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
+  }
+  if (intent.status === 'requires_action') {
+    return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+  }
+  if (intent.status === 'processing') {
+    return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+  }
+  return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
 });
 
 // Pago final de una reserva completada (NO ACTIVO!)
