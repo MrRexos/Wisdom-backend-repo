@@ -96,6 +96,13 @@ function formatDateTime(date) {
   });
 }
 
+//Conversión segura a céntimos
+const toCents = (n) => {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round(x * 100);
+};
+
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({
   host: process.env.DB_HOST, //process.env.HOST process.env.USER process.env.PASSWORD process.env.DATABASE
@@ -2779,92 +2786,6 @@ app.patch('/api/bookings/:id/is_paid', (req, res) => {
   });
 });
 
-// Pago de comisión al crear la reserva (10% o mínimo 1€)
-app.post('/api/bookings/:id/deposit', authenticateToken, (req, res) => {
-  const { id } = req.params;
-
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    const query = 'SELECT final_price, commission FROM booking WHERE id = ?';
-    connection.query(query, [id], async (err, results) => {
-      connection.release();
-      if (err) {
-        console.error('Error al obtener la reserva:', err);
-        return res.status(500).json({ error: 'Error al obtener la reserva.' });
-      }
-
-      if (results.length === 0) {
-        return res.status(404).json({ message: 'Reserva no encontrada.' });
-      }
-
-      const finalPrice = parseFloat(results[0].final_price || 0);
-      let commission = parseFloat(results[0].commission || 0);
-      // Robustez: mínimo depósito de 1€ siempre
-      if (!isFinite(commission) || commission < 1) commission = 1;
-
-      try {
-        const intent = await stripe.paymentIntents.create({
-          amount: Math.round(commission * 100),
-          currency: 'eur',
-          metadata: { booking_id: id, type: 'deposit' }
-        });
-        res.status(200).json({ clientSecret: intent.client_secret });
-      } catch (stripeErr) {
-        console.error('Error al crear el pago:', stripeErr);
-        res.status(500).json({ error: 'Error al procesar el pago.' });
-      }
-    });
-  });
-});
-
-// Pago final de una reserva completada
-app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
-  const { id } = req.params;
-
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    const query = 'SELECT final_price, commission FROM booking WHERE id = ?';
-    connection.query(query, [id], async (err, results) => {
-      connection.release();
-      if (err) {
-        console.error('Error al obtener la reserva:', err);
-        return res.status(500).json({ error: 'Error al obtener la reserva.' });
-      }
-
-      if (results.length === 0) {
-        return res.status(404).json({ message: 'Reserva no encontrada.' });
-      }
-
-      const finalPrice = parseFloat(results[0].final_price || 0);
-      const commission = parseFloat(results[0].commission || 0);
-      const amountToPay = Number((finalPrice - commission).toFixed(2));
-      if (amountToPay <= 0) {
-        return res.status(400).json({ error: 'El importe final es cero o negativo.' });
-      }
-
-      try {
-        const intent = await stripe.paymentIntents.create({
-          amount: Math.round(amountToPay * 100),
-          currency: 'eur',
-          metadata: { booking_id: id, type: 'final' }
-        });
-        res.status(200).json({ clientSecret: intent.client_secret });
-      } catch (stripeErr) {
-        console.error('Error al crear el pago final:', stripeErr);
-        res.status(500).json({ error: 'Error al procesar el pago final.' });
-      }
-    });
-  });
-});
-
 // Crear método de cobro y cuenta Stripe Connect
 app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   const { id } = req.params;
@@ -3025,6 +2946,179 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   });
 });
 
+// Pago de comisión al crear la reserva (10% o mínimo 1€)
+app.post('/api/bookings/:id/deposit', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const baseKey = (req.headers['x-idempotency-key'] || crypto.randomUUID()) + `:booking:${id}:deposit`;
+
+  pool.getConnection(async (err, connection) => {
+    if (err) return res.status(500).json({ error: 'Conn error.' });
+    const conn = connection.promise();
+
+    try {
+      await conn.beginTransaction();
+
+      // Autoriza: la reserva debe pertenecer al usuario o rol permitido
+      const [[booking]] = await conn.query(`
+        SELECT b.final_price, b.commission, b.status, b.customer_stripe_id, b.customer_email
+        FROM booking b
+        WHERE b.id = ? FOR UPDATE
+      `, [id]);
+
+      if (!booking) { throw new Error('Reserva no encontrada'); }
+      // Ej: no permitir depósito si cancelada
+      if (booking.status === 'cancelled') { throw new Error('Reserva cancelada'); }
+
+      const commissionCents = Math.max(100, toCents(booking.commission)); // mínimo 1€
+      // Si ya tienes un PI para depósito registrado en tu BD, reutilízalo aquí
+
+      const intent = await stripe.paymentIntents.create({
+        amount: commissionCents,
+        currency: 'eur',
+        customer: booking.customer_stripe_id || undefined,
+        receipt_email: booking.customer_email || undefined,
+        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+        metadata: { booking_id: String(id), type: 'deposit' }
+      }, { idempotencyKey: baseKey });
+
+      // Guarda relación PI–reserva en tu BD para deduplicación y conciliación
+      await conn.query(`
+        INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, status)
+        VALUES (?, 'deposit', ?, ?, ?)
+        ON DUPLICATE KEY UPDATE payment_intent_id = VALUES(payment_intent_id), amount_cents = VALUES(amount_cents), status = VALUES(status)
+      `, [id, intent.id, commissionCents, intent.status]);
+
+      await conn.commit();
+      res.status(200).json({ clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    } catch (e) {
+      await conn.rollback();
+      res.status(400).json({ error: 'No se pudo crear el depósito.' });
+    } finally {
+      connection.release();
+    }
+  });
+});
+
+// Pago final y transferencia automática al profesional (destination charge!) - EN USO ACTUALMENTE
+app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const { payment_method_id } = req.body;
+  if (!payment_method_id) return res.status(400).json({ error: 'payment_method_id requerido.' });
+
+  const baseKey = (req.headers['x-idempotency-key'] || crypto.randomUUID()) + `:booking:${id}:final`;
+
+  pool.getConnection(async (err, connection) => {
+    if (err) return res.status(500).json({ error: 'Conn error.' });
+    const conn = connection.promise();
+
+    try {
+      await conn.beginTransaction();
+
+      const [[booking]] = await conn.query(`
+        SELECT b.final_price, b.commission, b.is_paid, b.customer_stripe_id,
+               u.stripe_account_id
+        FROM booking b
+        JOIN service s  ON b.service_id = s.id
+        JOIN user_account u ON s.user_id = u.id
+        WHERE b.id = ? FOR UPDATE
+      `, [id]);
+
+      if (!booking) throw new Error('Reserva no encontrada');
+      if (booking.is_paid) throw new Error('Reserva ya pagada');
+      if (!booking.stripe_account_id?.startsWith('acct_')) throw new Error('Cuenta Stripe inválida');
+
+      // Autorización: el usuario que paga debe ser el cliente de la reserva
+      if (req.user.id !== booking.customer_id) throw new Error('No autorizado');
+
+      const finalCents       = toCents(booking.final_price);
+      const commissionCents  = toCents(booking.commission);
+      const amountToCharge   = finalCents - commissionCents;
+      if (amountToCharge <= 0) throw new Error('Importe inválido');
+
+      const intent = await stripe.paymentIntents.create({
+        amount: amountToCharge,
+        currency: 'eur',
+        customer: booking.customer_stripe_id || undefined,
+        payment_method: payment_method_id,
+        confirm: true,
+        off_session: true, // mejora UX si la tarjeta permite SCA frictionless
+        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+        transfer_data: { destination: booking.stripe_account_id },
+        on_behalf_of: booking.stripe_account_id, // recomendable en EEE para SCA/branding
+        // Si NO cobras comisión por aquí porque ya la cobraste como depósito, no pongas application_fee_amount.
+        metadata: { booking_id: String(id), type: 'final' }
+      }, { idempotencyKey: baseKey });
+
+      // Manejo de estados
+      if (intent.status === 'succeeded') {
+        // NO marques is_paid aquí; espera webhook payment_intent.succeeded
+        return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
+      }
+
+      if (intent.status === 'requires_action') {
+        // Devuelve client_secret para que el cliente complete 3DS si hace falta
+        return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+      }
+
+      if (intent.status === 'processing') {
+        return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+      }
+
+      // Otras: requires_payment_method, canceled...
+      return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
+    } catch (e) {
+      await conn.rollback();
+      res.status(400).json({ error: 'No se pudo procesar el pago final.' });
+    } finally {
+      connection.release();
+    }
+  });
+});
+
+// Pago final de una reserva completada (NO ACTIVO!)
+app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
+  const { id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = 'SELECT final_price, commission FROM booking WHERE id = ?';
+    connection.query(query, [id], async (err, results) => {
+      connection.release();
+      if (err) {
+        console.error('Error al obtener la reserva:', err);
+        return res.status(500).json({ error: 'Error al obtener la reserva.' });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
+
+      const finalPrice = parseFloat(results[0].final_price || 0);
+      const commission = parseFloat(results[0].commission || 0);
+      const amountToPay = Number((finalPrice - commission).toFixed(2));
+      if (amountToPay <= 0) {
+        return res.status(400).json({ error: 'El importe final es cero o negativo.' });
+      }
+
+      try {
+        const intent = await stripe.paymentIntents.create({
+          amount: Math.round(amountToPay * 100),
+          currency: 'eur',
+          metadata: { booking_id: id, type: 'final' }
+        });
+        res.status(200).json({ clientSecret: intent.client_secret });
+      } catch (stripeErr) {
+        console.error('Error al crear el pago final:', stripeErr);
+        res.status(500).json({ error: 'Error al procesar el pago final.' });
+      }
+    });
+  });
+});
+
 // Transferir el pago final al profesional con Stripe Connect (NO ACTIVO!)
 app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
   const { id } = req.params;
@@ -3078,69 +3172,6 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
         res.status(500).json({ error: 'Error al realizar la transferencia.' });
       }
     });
-  });
-});
-
-// Pago final y transferencia automática al profesional (destination charge!) ------
-app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { payment_method_id } = req.body;
-  if (!payment_method_id) {
-    return res.status(400).json({ error: 'payment_method_id es requerido.' });
-  }
-
-  const baseKey = req.headers['x-idempotency-key'] || crypto.randomUUID();
-
-  pool.getConnection(async (err, connection) => {
-    if (err) return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    const conn = connection.promise();
-
-    try {
-      await conn.beginTransaction();
-
-      const [[booking]] = await conn.query(`
-        SELECT b.final_price,
-               b.commission,
-               b.is_paid,
-               u.stripe_account_id
-        FROM booking b
-        JOIN service s  ON b.service_id = s.id
-        JOIN user_account u ON s.user_id = u.id
-        WHERE b.id = ? FOR UPDATE
-      `, [id]);
-
-      if (!booking) throw new NotFound('Reserva no encontrada.');
-      if (booking.is_paid) throw new Conflict('Esta reserva ya está pagada.');
-      if (!booking.stripe_account_id) throw new BadRequest('El profesional no tiene cuenta Stripe.');
-
-      const finalPrice       = parseFloat(booking.final_price  || 0);
-      const commissionAmount = parseFloat(booking.commission   || 0);
-      const amountToCharge   = Number((finalPrice - commissionAmount).toFixed(2));
-      if (amountToCharge <= 0) throw new BadRequest('Importe a cobrar inválido.');
-
-      const intent = await stripe.paymentIntents.create({
-        amount: Math.round(amountToCharge * 100),      // cents
-        currency: 'eur',
-        payment_method: payment_method_id,
-        confirm: true,
-        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-        transfer_data: { destination: booking.stripe_account_id },
-        metadata: { booking_id: id, type: 'final' }
-      }, { idempotencyKey: `${baseKey}:pi` });
-
-      if (intent.status !== 'succeeded') throw new Error('Pago no completado.');
-
-      await conn.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [id]);
-      await conn.commit();
-
-      res.status(200).json({ message: 'Pago enviado al profesional', paymentIntentId: intent.id });
-    } catch (e) {
-      await conn.rollback();
-      console.error(e);
-      res.status(e.statusCode || 500).json({ error: e.message });
-    } finally {
-      connection.release();
-    }
   });
 });
 
