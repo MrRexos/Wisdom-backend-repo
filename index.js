@@ -17,6 +17,7 @@ const os = require('os');
 
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 async function handleStripeRollbackIfNeeded(error) {
   try {
     if (error && error.payment_intent) {
@@ -32,7 +33,10 @@ async function handleStripeRollbackIfNeeded(error) {
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware para parsear JSON. 
+// Asegura que los webhooks de Stripe se procesen con el cuerpo sin parsear
+app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
+
+// Middleware para parsear JSON.
 app.use(bodyParser.json());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -102,6 +106,29 @@ const toCents = (n) => {
   if (!Number.isFinite(x)) return 0;
   return Math.round(x * 100);
 };
+
+// Conversión de estados del PaymentIntent a nuestra convención interna
+const mapStatus = (piStatus) => {
+  switch (piStatus) {
+    case 'succeeded': return 'succeeded';
+    case 'processing': return 'processing';
+    case 'requires_payment_method':
+    case 'requires_action': return 'requires_action';
+    default: return String(piStatus || 'unknown');
+  }
+};
+
+// UPSERT helper para la tabla payments
+async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, status, transferGroup }) {
+  await conn.query(`
+    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, status, transfer_group, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, NOW())
+    ON DUPLICATE KEY UPDATE
+      amount_cents = VALUES(amount_cents),
+      status       = VALUES(status),
+      transfer_group = VALUES(transfer_group)
+  `, [bookingId, type, paymentIntentId, amountCents ?? 0, status, transferGroup || null]);
+}
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({
@@ -3840,6 +3867,132 @@ app.post('/api/upload-dni', (req, res) => {
       await fs.promises.unlink(filePath).catch(() => {});
       console.error('Stripe file upload error:', stripeErr);
       return res.status(500).json({ error: 'Stripe upload failed' });
+    }
+  });
+});
+
+// Webhook Stripe
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err) {
+    console.error('❌ Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  pool.getConnection(async (err, connection) => {
+    if (err) {
+      console.error('DB connection error (webhook):', err);
+      return res.status(500).end();
+    }
+    const conn = connection.promise();
+
+    try {
+      switch (event.type) {
+        case 'payment_intent.succeeded': {
+          const pi = event.data.object;
+          const bookingId = pi?.metadata?.booking_id;
+          const type = pi?.metadata?.type;
+          if (!bookingId || !type) break;
+
+          await conn.beginTransaction();
+          await upsertPayment(conn, {
+            bookingId,
+            type,
+            paymentIntentId: pi.id,
+            amountCents: pi.amount_received ?? pi.amount ?? 0,
+            status: mapStatus(pi.status),
+            transferGroup: pi.transfer_group || null
+          });
+
+          if (type === 'final') {
+            await conn.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [bookingId]);
+          }
+
+          await conn.commit();
+          break;
+        }
+
+        case 'payment_intent.payment_failed': {
+          const pi = event.data.object;
+          const bookingId = pi?.metadata?.booking_id;
+          const type = pi?.metadata?.type;
+          if (!bookingId || !type) break;
+
+          await conn.beginTransaction();
+          await upsertPayment(conn, {
+            bookingId,
+            type,
+            paymentIntentId: pi.id,
+            amountCents: pi.amount ?? 0,
+            status: 'payment_failed',
+            transferGroup: pi.transfer_group || null
+          });
+          await conn.commit();
+          break;
+        }
+
+        case 'charge.refunded': {
+          const charge = event.data.object;
+          const piId = charge.payment_intent;
+          const fullyRefunded = charge.amount_refunded >= (charge.amount_captured || charge.amount);
+          if (!piId) break;
+
+          await conn.beginTransaction();
+          const [[payment]] = await conn.query(
+            'SELECT booking_id, type FROM payments WHERE payment_intent_id = ? FOR UPDATE',
+            [piId]
+          );
+
+          if (payment) {
+            await conn.query(
+              'UPDATE payments SET status = ? WHERE payment_intent_id = ?',
+              ['refunded', piId]
+            );
+
+            if (payment.type === 'final' && fullyRefunded) {
+              await conn.query('UPDATE booking SET is_paid = 0 WHERE id = ?', [payment.booking_id]);
+            }
+          }
+
+          await conn.commit();
+          break;
+        }
+
+        case 'payment_intent.processing':
+        case 'payment_intent.requires_action': {
+          const pi = event.data.object;
+          const bookingId = pi?.metadata?.booking_id;
+          const type = pi?.metadata?.type;
+          if (!bookingId || !type) break;
+
+          await conn.beginTransaction();
+          await upsertPayment(conn, {
+            bookingId,
+            type,
+            paymentIntentId: pi.id,
+            amountCents: pi.amount ?? 0,
+            status: mapStatus(event.type === 'payment_intent.processing' ? 'processing' : 'requires_action'),
+            transferGroup: pi.transfer_group || null
+          });
+          await conn.commit();
+          break;
+        }
+
+        default:
+          break;
+      }
+
+      res.status(200).json({ received: true });
+    } catch (e) {
+      console.error('Webhook handling error:', e);
+      try { await conn.rollback(); } catch {}
+      res.status(500).end();
+    } finally {
+      connection.release();
     }
   });
 });
