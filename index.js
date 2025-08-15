@@ -118,6 +118,26 @@ const mapStatus = (piStatus) => {
   }
 };
 
+// Helpers adicionales para pagos
+const stableKey = (parts) => parts.join(':');
+
+async function getPaymentRow(conn, bookingId, type) {
+  const [rows] = await conn.query(
+    'SELECT id, booking_id, type, payment_intent_id, amount_cents, status FROM payments WHERE booking_id = ? AND type = ? FOR UPDATE',
+    [bookingId, type]
+  );
+  return rows[0] || null;
+}
+
+async function upsertPaymentRow(conn, { bookingId, type, amountCents, status }) {
+  await conn.query(
+    `INSERT INTO payments (booking_id, type, amount_cents, status)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE amount_cents = VALUES(amount_cents), status = VALUES(status)`,
+    [bookingId, type, amountCents, status]
+  );
+}
+
 // UPSERT helper para la tabla payments
 async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, status, transferGroup }) {
   await conn.query(`
@@ -2974,132 +2994,214 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
 });
 
 // Pago de comisión al crear la reserva (10% o mínimo 1€)
-app.post('/api/bookings/:id/deposit', authenticateToken, (req, res) => {
-  const { id } = req.params;
-  const baseKey = (req.headers['x-idempotency-key'] || crypto.randomUUID()) + `:booking:${id}:deposit`;
+app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
 
-  pool.getConnection(async (err, connection) => {
-    if (err) return res.status(500).json({ error: 'Conn error.' });
-    const conn = connection.promise();
+  const baseKey = stableKey(['booking', id, 'deposit']);
 
-    try {
-      await conn.beginTransaction();
+  let booking;
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
 
-      // Autoriza: la reserva debe pertenecer al usuario o rol permitido
-      const [[booking]] = await conn.query(`
-        SELECT b.final_price, b.commission, b.status, b.customer_stripe_id, b.customer_email
-        FROM booking b
-        WHERE b.id = ? FOR UPDATE
-      `, [id]);
+    const [rows] = await connection.query(
+      `SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status, u.email AS customer_email
+       FROM booking b
+       JOIN user_account u ON b.user_id = u.id
+       WHERE b.id = ? FOR UPDATE`,
+      [id]
+    );
+    booking = rows[0];
+    if (!booking) throw new Error('Reserva no encontrada');
+    if (booking.booking_status === 'cancelled') throw new Error('Reserva cancelada');
 
-      if (!booking) { throw new Error('Reserva no encontrada'); }
-      // Ej: no permitir depósito si cancelada
-      if (booking.status === 'cancelled') { throw new Error('Reserva cancelada'); }
-
-      const commissionCents = Math.max(100, toCents(booking.commission)); // mínimo 1€
-      // Si ya tienes un PI para depósito registrado en tu BD, reutilízalo aquí
-
-      const intent = await stripe.paymentIntents.create({
-        amount: commissionCents,
-        currency: 'eur',
-        customer: booking.customer_stripe_id || undefined,
-        receipt_email: booking.customer_email || undefined,
-        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-        metadata: { booking_id: String(id), type: 'deposit' }
-      }, { idempotencyKey: baseKey });
-
-      // Guarda relación PI–reserva en tu BD para deduplicación y conciliación
-      await conn.query(`
-        INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, status)
-        VALUES (?, 'deposit', ?, ?, ?)
-        ON DUPLICATE KEY UPDATE payment_intent_id = VALUES(payment_intent_id), amount_cents = VALUES(amount_cents), status = VALUES(status)
-      `, [id, intent.id, commissionCents, intent.status]);
-
-      await conn.commit();
-      res.status(200).json({ clientSecret: intent.client_secret, paymentIntentId: intent.id });
-    } catch (e) {
-      await conn.rollback();
-      res.status(400).json({ error: 'No se pudo crear el depósito.' });
-    } finally {
-      connection.release();
+    const isOwner = req.user && Number(req.user.id) === Number(booking.user_id);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'No autorizado' });
     }
-  });
+
+    const commissionCents = Math.max(100, toCents(booking.commission || 0));
+
+    await upsertPaymentRow(connection, {
+      bookingId: id,
+      type: 'deposit',
+      amountCents: commissionCents,
+      status: 'creating'
+    });
+
+    const payment = await getPaymentRow(connection, id, 'deposit');
+
+    await connection.commit();
+
+    let intent;
+    if (payment.payment_intent_id) {
+      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id);
+    } else {
+      intent = await stripe.paymentIntents.create(
+        {
+          amount: commissionCents,
+          currency: 'eur',
+          receipt_email: booking.customer_email || undefined,
+          automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+          metadata: { booking_id: String(id), type: 'deposit' }
+        },
+        { idempotencyKey: baseKey }
+      );
+    }
+
+    const conn2 = await pool.promise().getConnection();
+    try {
+      await conn2.beginTransaction();
+      await upsertPayment(conn2, {
+        bookingId: id,
+        type: 'deposit',
+        paymentIntentId: intent.id,
+        amountCents: commissionCents,
+        status: mapStatus(intent.status)
+      });
+      await conn2.commit();
+    } catch (e) {
+      await conn2.rollback();
+      throw e;
+    } finally {
+      conn2.release();
+    }
+
+    if (intent.status === 'requires_action') {
+      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'processing') {
+      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'succeeded') {
+      return res.status(200).json({ message: 'Depósito pagado', paymentIntentId: intent.id });
+    }
+    return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
+  } catch (err) {
+    try { await connection.rollback(); } catch {}
+    return res.status(400).json({ error: 'No se pudo crear el depósito.' });
+  } finally {
+    connection.release();
+  }
 });
 
-// Pago final y transferencia automática al profesional (destination charge!) - EN USO ACTUALMENTE
-app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, (req, res) => {
-  const { id } = req.params;
+// Pago final y transferencia automática al profesional (destination charge!)
+app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
   if (!payment_method_id) return res.status(400).json({ error: 'payment_method_id requerido.' });
 
-  const baseKey = (req.headers['x-idempotency-key'] || crypto.randomUUID()) + `:booking:${id}:final`;
+  const baseKey = stableKey(['booking', id, 'final']);
 
-  pool.getConnection(async (err, connection) => {
-    if (err) return res.status(500).json({ error: 'Conn error.' });
-    const conn = connection.promise();
+  let booking;
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
 
-    try {
-      await conn.beginTransaction();
+    const [rows] = await connection.query(
+      `SELECT b.id, b.user_id, b.final_price, b.commission, b.is_paid,
+              cust.email AS customer_email,
+              provider.stripe_account_id
+       FROM booking b
+       JOIN service s ON b.service_id = s.id
+       JOIN user_account provider ON s.user_id = provider.id
+       JOIN user_account cust ON b.user_id = cust.id
+       WHERE b.id = ? FOR UPDATE`,
+      [id]
+    );
+    booking = rows[0];
+    if (!booking) throw new Error('Reserva no encontrada');
+    if (booking.is_paid) throw new Error('Reserva ya pagada');
 
-      const [[booking]] = await conn.query(`
-        SELECT b.final_price, b.commission, b.is_paid, b.customer_stripe_id,
-               u.stripe_account_id
-        FROM booking b
-        JOIN service s  ON b.service_id = s.id
-        JOIN user_account u ON s.user_id = u.id
-        WHERE b.id = ? FOR UPDATE
-      `, [id]);
-
-      if (!booking) throw new Error('Reserva no encontrada');
-      if (booking.is_paid) throw new Error('Reserva ya pagada');
-      if (!booking.stripe_account_id?.startsWith('acct_')) throw new Error('Cuenta Stripe inválida');
-
-      // Autorización: el usuario que paga debe ser el cliente de la reserva
-      if (req.user.id !== booking.customer_id) throw new Error('No autorizado');
-
-      const finalCents       = toCents(booking.final_price);
-      const commissionCents  = toCents(booking.commission);
-      const amountToCharge   = finalCents - commissionCents;
-      if (amountToCharge <= 0) throw new Error('Importe inválido');
-
-      const intent = await stripe.paymentIntents.create({
-        amount: amountToCharge,
-        currency: 'eur',
-        customer: booking.customer_stripe_id || undefined,
-        payment_method: payment_method_id,
-        confirm: true,
-        off_session: true, // mejora UX si la tarjeta permite SCA frictionless
-        automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-        transfer_data: { destination: booking.stripe_account_id },
-        on_behalf_of: booking.stripe_account_id, // recomendable en EEE para SCA/branding
-        // Si NO cobras comisión por aquí porque ya la cobraste como depósito, no pongas application_fee_amount.
-        metadata: { booking_id: String(id), type: 'final' }
-      }, { idempotencyKey: baseKey });
-
-      // Manejo de estados
-      if (intent.status === 'succeeded') {
-        // NO marques is_paid aquí; espera webhook payment_intent.succeeded
-        return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
-      }
-
-      if (intent.status === 'requires_action') {
-        // Devuelve client_secret para que el cliente complete 3DS si hace falta
-        return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
-      }
-
-      if (intent.status === 'processing') {
-        return res.status(202).json({ processing: true, paymentIntentId: intent.id });
-      }
-
-      // Otras: requires_payment_method, canceled...
-      return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
-    } catch (e) {
-      await conn.rollback();
-      res.status(400).json({ error: 'No se pudo procesar el pago final.' });
-    } finally {
-      connection.release();
+    const isOwner = req.user && Number(req.user.id) === Number(booking.user_id);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'No autorizado' });
     }
-  });
+
+    if (!booking.stripe_account_id || !booking.stripe_account_id.startsWith('acct_')) {
+      throw new Error('Cuenta Stripe inválida');
+    }
+
+    const finalCents = toCents(booking.final_price || 0);
+    const commissionCents = toCents(booking.commission || 0);
+    const amountToCharge = finalCents - commissionCents;
+    if (amountToCharge <= 0) throw new Error('Importe inválido');
+
+    await upsertPaymentRow(connection, {
+      bookingId: id,
+      type: 'final',
+      amountCents: amountToCharge,
+      status: 'creating'
+    });
+    const payment = await getPaymentRow(connection, id, 'final');
+
+    await connection.commit();
+
+    let intent;
+    if (payment.payment_intent_id) {
+      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id);
+      if (intent.status === 'requires_payment_method') {
+        intent = await stripe.paymentIntents.update(intent.id, { payment_method: payment_method_id });
+        intent = await stripe.paymentIntents.confirm(intent.id, { payment_method: payment_method_id });
+      }
+    } else {
+      intent = await stripe.paymentIntents.create(
+        {
+          amount: amountToCharge,
+          currency: 'eur',
+          payment_method: payment_method_id,
+          confirm: true,
+          off_session: true,
+          receipt_email: booking.customer_email || undefined,
+          automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+          transfer_data: { destination: booking.stripe_account_id },
+          on_behalf_of: booking.stripe_account_id,
+          metadata: { booking_id: String(id), type: 'final' }
+        },
+        { idempotencyKey: baseKey }
+      );
+    }
+
+    const conn2 = await pool.promise().getConnection();
+    try {
+      await conn2.beginTransaction();
+      await upsertPayment(conn2, {
+        bookingId: id,
+        type: 'final',
+        paymentIntentId: intent.id,
+        amountCents: amountToCharge,
+        status: mapStatus(intent.status)
+      });
+      await conn2.commit();
+    } catch (e) {
+      await conn2.rollback();
+      throw e;
+    } finally {
+      conn2.release();
+    }
+
+    if (intent.status === 'succeeded') {
+      return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
+    }
+    if (intent.status === 'requires_action') {
+      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'processing') {
+      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+    }
+    return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
+  } catch (err) {
+    try { await connection.rollback(); } catch {}
+    return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
+  } finally {
+    connection.release();
+  }
 });
 
 // Pago final de una reserva completada (NO ACTIVO!)
