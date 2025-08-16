@@ -121,6 +121,25 @@ const mapStatus = (piStatus) => {
 // Helpers adicionales para pagos
 const stableKey = (parts) => parts.join(':');
 
+// Garantiza un Customer y lo persiste en user_account.stripe_customer_id
+async function ensureStripeCustomerId(conn, { userId, email }) {
+  const [[row]] = await conn.query(
+    `SELECT stripe_customer_id FROM user_account WHERE id = ? FOR UPDATE`,
+    [userId]
+  );
+  let customerId = row?.stripe_customer_id || null;
+
+  if (!customerId) {
+    const customer = await stripe.customers.create({ email });
+    customerId = customer.id;
+    await conn.query(
+      `UPDATE user_account SET stripe_customer_id = ? WHERE id = ?`,
+      [customerId, userId]
+    );
+  }
+  return customerId;
+}
+
 async function getPaymentRow(conn, bookingId, type) {
   const [rows] = await conn.query(
     'SELECT id, booking_id, type, payment_intent_id, amount_cents, status FROM payments WHERE booking_id = ? AND type = ? FOR UPDATE',
@@ -129,25 +148,29 @@ async function getPaymentRow(conn, bookingId, type) {
   return rows[0] || null;
 }
 
-async function upsertPaymentRow(conn, { bookingId, type, amountCents, status }) {
+async function upsertPaymentRow(conn, { bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status }) {
   await conn.query(
-    `INSERT INTO payments (booking_id, type, amount_cents, status)
-     VALUES (?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE amount_cents = VALUES(amount_cents), status = VALUES(status)`,
-    [bookingId, type, amountCents, status]
+    `INSERT INTO payments (booking_id, type, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE amount_cents = VALUES(amount_cents), commission_snapshot_cents = VALUES(commission_snapshot_cents), final_price_snapshot_cents = VALUES(final_price_snapshot_cents), status = VALUES(status)`,
+    [bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status]
   );
 }
 
 // UPSERT helper para la tabla payments
-async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, status, transferGroup }) {
+async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, transferGroup, paymentMethodId, paymentMethodLast4 }) {
   await conn.query(`
-    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, status, transfer_group, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, NOW())
+    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, transfer_group, payment_method_id, payment_method_last4, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ON DUPLICATE KEY UPDATE
       amount_cents = VALUES(amount_cents),
+      commission_snapshot_cents = VALUES(commission_snapshot_cents),
+      final_price_snapshot_cents = VALUES(final_price_snapshot_cents),
       status       = VALUES(status),
-      transfer_group = VALUES(transfer_group)
-  `, [bookingId, type, paymentIntentId, amountCents ?? 0, status, transferGroup || null]);
+      transfer_group = VALUES(transfer_group),
+      payment_method_id = VALUES(payment_method_id),
+      payment_method_last4 = VALUES(payment_method_last4)
+  `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null]);
 }
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
@@ -2998,23 +3021,22 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
 
-  const baseKey = stableKey(['booking', id, 'deposit']);
-
   let booking;
   let payment;
   let commissionCents;
 
-  // Transacción corta: validar y preparar
   const connection = await pool.promise().getConnection();
   try {
     await connection.beginTransaction();
 
     const [rows] = await connection.query(
-      `SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status,
-              u.email AS customer_email
-       FROM booking b
-       JOIN user_account u ON b.user_id = u.id
-       WHERE b.id = ? FOR UPDATE`,
+      `
+      SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status,
+             u.email AS customer_email, u.stripe_customer_id
+      FROM booking b
+      JOIN user_account u ON b.user_id = u.id
+      WHERE b.id = ? FOR UPDATE
+      `,
       [id]
     );
     booking = rows[0];
@@ -3028,106 +3050,131 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
+    const finalCentsSnapshot = toCents(booking.final_price || 0);
     commissionCents = Math.max(100, toCents(booking.commission || 0));
 
+    // Garantiza Customer y persiste si no existe
+    const customerId = await ensureStripeCustomerId(connection, {
+      userId: booking.user_id,
+      email: booking.customer_email,
+    });
+
+    // Congelar importes creando fila de pago (para poder atar idempotencia a payment.id)
     await upsertPaymentRow(connection, {
       bookingId: id,
       type: 'deposit',
       amountCents: commissionCents,
-      status: 'creating'
+      commissionSnapshotCents: commissionCents,
+      finalPriceSnapshotCents: finalCentsSnapshot,
+      status: 'creating',
     });
 
     payment = await getPaymentRow(connection, id, 'deposit');
 
     await connection.commit();
-  } catch (err) {
-    try { await connection.rollback(); } catch {}
-    connection.release();
-    return res.status(400).json({ error: 'No se pudo crear el depósito.' });
-  }
-  // Liberar conexión ANTES de llamar a Stripe
-  connection.release();
 
-  // Llamada a Stripe fuera de transacción
-  let intent;
-  try {
+    // A partir de aquí, fuera de transacción
+    const transferGroup = `booking-${id}`;
+    const idemKey = stableKey(['payment', payment.id]);
+
+    let intent;
     if (payment.payment_intent_id) {
-      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id);
+      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
+        expand: ['payment_method', 'latest_charge.payment_method_details'],
+      });
     } else {
       intent = await stripe.paymentIntents.create(
         {
           amount: commissionCents,
           currency: 'eur',
+          customer: customerId,
+          setup_future_usage: 'off_session',
           receipt_email: booking.customer_email || undefined,
           automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-          metadata: { booking_id: String(id), type: 'deposit' }
+          transfer_group: transferGroup,
+          metadata: { booking_id: String(id), type: 'deposit' },
         },
-        { idempotencyKey: baseKey }
+        { idempotencyKey: idemKey }
       );
     }
+
+    // Persistir intent/estado + transfer_group + PM last4 si disponible
+    const pmId = intent.payment_method ?? intent?.latest_charge?.payment_method;
+    const last4 =
+      intent?.payment_method?.card?.last4 ||
+      intent?.latest_charge?.payment_method_details?.card?.last4 ||
+      null;
+
+    const conn2 = await pool.promise().getConnection();
+    try {
+      await conn2.beginTransaction();
+      await upsertPayment(conn2, {
+        bookingId: id,
+        type: 'deposit',
+        paymentIntentId: intent.id,
+        amountCents: commissionCents,
+        commissionSnapshotCents: commissionCents,
+        finalPriceSnapshotCents: finalCentsSnapshot,
+        status: mapStatus(intent.status),
+        transferGroup,
+        paymentMethodId: pmId || null,
+        paymentMethodLast4: last4 || null,
+      });
+      await conn2.commit();
+    } catch (e) {
+      try { await conn2.rollback(); } catch {}
+      return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
+    } finally {
+      conn2.release();
+    }
+
+    if (intent.status === 'requires_action') {
+      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'processing') {
+      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'succeeded') {
+      return res.status(200).json({ message: 'Depósito pagado', paymentIntentId: intent.id });
+    }
+    return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
   } catch (err) {
-    return res.status(400).json({ error: 'Error con el proveedor de pagos.' });
-  }
-
-  // Persistir intent/estado con segunda conexión corta
-  const conn2 = await pool.promise().getConnection();
-  try {
-    await conn2.beginTransaction();
-    await upsertPayment(conn2, {
-      bookingId: id,
-      type: 'deposit',
-      paymentIntentId: intent.id,
-      amountCents: commissionCents,
-      status: mapStatus(intent.status)
-    });
-    await conn2.commit();
-  } catch (e) {
-    try { await conn2.rollback(); } catch {}
-    return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
+    try { await connection.rollback(); } catch {}
+    return res.status(400).json({ error: 'No se pudo crear el depósito.' });
   } finally {
-    conn2.release();
+    connection.release(); // release solo en finally (evita doble release)
   }
-
-  if (intent.status === 'requires_action') {
-    return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
-  }
-  if (intent.status === 'processing') {
-    return res.status(202).json({ processing: true, paymentIntentId: intent.id });
-  }
-  if (intent.status === 'succeeded') {
-    return res.status(200).json({ message: 'Depósito pagado', paymentIntentId: intent.id });
-  }
-  return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
 });
 
 
-//Cargo final con transferencia al profesional (destination charge)
+// Cargo final (destination charge) con validaciones extra, Customer, reutilización/validación PM, transfer_group y validación de capacidades
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
-  if (!payment_method_id) return res.status(400).json({ error: 'payment_method_id requerido.' });
-
-  const baseKey = stableKey(['booking', id, 'final']);
 
   let booking;
   let payment;
   let amountToCharge;
+  let commissionCents;
+  let finalCents;
 
-  // Transacción corta: validar y preparar
   const connection = await pool.promise().getConnection();
   try {
     await connection.beginTransaction();
 
+    // Bloquear la reserva y obtener datos necesarios
     const [rows] = await connection.query(
-      `SELECT b.id, b.user_id, b.final_price, b.commission, b.is_paid,
-              cust.email AS customer_email,
-              provider.stripe_account_id
-       FROM booking b
-       JOIN service s ON b.service_id = s.id
-       JOIN user_account provider ON s.user_id = provider.id
-       JOIN user_account cust ON b.user_id = cust.id
-       WHERE b.id = ? FOR UPDATE`,
+      `
+      SELECT b.id, b.user_id, b.final_price, b.commission, b.is_paid,
+             cust.email AS customer_email, cust.stripe_customer_id AS customer_id,
+             provider.stripe_account_id
+      FROM booking b
+      JOIN service s ON b.service_id = s.id
+      JOIN user_account provider ON s.user_id = provider.id
+      JOIN user_account cust ON b.user_id = cust.id
+      WHERE b.id = ? FOR UPDATE
+      `,
       [id]
     );
     booking = rows[0];
@@ -3140,92 +3187,175 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       await connection.rollback();
       return res.status(403).json({ error: 'No autorizado' });
     }
-
     if (!booking.stripe_account_id || !booking.stripe_account_id.startsWith('acct_')) {
       throw new Error('Cuenta Stripe inválida');
     }
 
-    const finalCents = toCents(booking.final_price || 0);
-    const commissionCents = toCents(booking.commission || 0);
-    amountToCharge = finalCents - commissionCents;
-    if (amountToCharge <= 0) throw new Error('Importe inválido');
+    // Garantiza Customer
+    const customerId = booking.customer_id || (await ensureStripeCustomerId(connection, {
+      userId: booking.user_id,
+      email: booking.customer_email,
+    }));
 
+    // Verificar depósito succeeded
+    const [dep] = await connection.query(
+      `SELECT id FROM payments WHERE booking_id = ? AND type = 'deposit' AND status = 'succeeded' LIMIT 1 FOR UPDATE`,
+      [id]
+    );
+    if (dep.length === 0) {
+      await connection.rollback();
+      return res.status(412).json({ error: 'Depósito no confirmado (requerido).' });
+    }
+
+    // Bloquear segundo cobro final si ya hay uno en curso o realizado (incluye requires_action)
+    const [existingFinal] = await connection.query(
+      `SELECT id, status FROM payments WHERE booking_id = ? AND type = 'final' AND status IN ('requires_action','processing','succeeded') LIMIT 1 FOR UPDATE`,
+      [id]
+    );
+    if (existingFinal.length > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Ya existe un cobro final en curso o realizado.' });
+    }
+
+    // Validar precondición: final_price >= commission > 0
+    finalCents = toCents(booking.final_price || 0);
+    const commissionRaw = toCents(booking.commission || 0);
+    commissionCents = Math.max(100, commissionRaw);
+    if (!(commissionCents > 0 && finalCents >= commissionCents)) {
+      await connection.rollback();
+      return res.status(412).json({ error: 'Precondición: final_price >= commission > 0 no cumplida.' });
+    }
+
+    amountToCharge = finalCents - commissionCents;
+    if (amountToCharge <= 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Importe inválido para el pago final.' });
+    }
+
+    // Congelar snapshots en la fila del pago final (para idempotencia por payment.id)
     await upsertPaymentRow(connection, {
       bookingId: id,
       type: 'final',
       amountCents: amountToCharge,
-      status: 'creating'
+      commissionSnapshotCents: commissionCents,
+      finalPriceSnapshotCents: finalCents,
+      status: 'creating',
     });
     payment = await getPaymentRow(connection, id, 'final');
 
     await connection.commit();
-  } catch (err) {
-    try { await connection.rollback(); } catch {}
-    connection.release();
-    return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
-  }
-  // Liberar conexión ANTES de llamar a Stripe
-  connection.release();
 
-  // Llamada a Stripe fuera de transacción
-  let intent;
-  try {
+    // Validar capacidades de la conectada antes de crear el Intent
+    const acct = await stripe.accounts.retrieve(booking.stripe_account_id);
+    const canCard = acct.capabilities?.card_payments === 'active';
+    const canTransfers = acct.capabilities?.transfers === 'active';
+    const canPayouts = !!acct.payouts_enabled;
+    if (!canCard || !canTransfers || !canPayouts) {
+      return res.status(412).json({ error: 'La cuenta conectada no está lista para cobrar y transferir.' });
+    }
+
+    // Determinar PM a usar: preferir el guardado del depósito si existe
+    const connPM = await pool.promise().getConnection();
+    let savedPmId = null;
+    try {
+      const [[pmRow]] = await connPM.query(
+        `SELECT payment_method_id FROM payments WHERE booking_id = ? AND type='deposit' AND status='succeeded' ORDER BY id DESC LIMIT 1`,
+        [id]
+      );
+      savedPmId = pmRow?.payment_method_id || null;
+    } finally {
+      connPM.release();
+    }
+
+    const pmToUse = savedPmId || payment_method_id || null;
+    if (!pmToUse) {
+      return res.status(400).json({ error: 'No hay método de pago disponible. Proporcione payment_method_id.' });
+    }
+
+    // Validar que el PM pertenece al customer
+    const pm = await stripe.paymentMethods.retrieve(pmToUse);
+    if (pm.customer !== customerId) {
+      return res.status(409).json({ error: 'payment_method_id no pertenece al customer de la reserva.' });
+    }
+
+    // Stripe fuera de transacción: crear/confirmar Intent
+    const transferGroup = `booking-${id}`;
+    const idemKey = stableKey(['payment', payment.id]);
+
+    let intent;
     if (payment.payment_intent_id) {
-      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id);
+      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
+        expand: ['payment_method', 'latest_charge.payment_method_details'],
+      });
       if (intent.status === 'requires_payment_method') {
-        await stripe.paymentIntents.update(intent.id, { payment_method: payment_method_id });
-        intent = await stripe.paymentIntents.confirm(intent.id, { payment_method: payment_method_id });
+        await stripe.paymentIntents.update(intent.id, { payment_method: pmToUse, customer: customerId });
+        intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
       }
     } else {
       intent = await stripe.paymentIntents.create(
         {
           amount: amountToCharge,
           currency: 'eur',
-          payment_method: payment_method_id,
+          customer: customerId,
+          payment_method: pmToUse,
           confirm: true,
           off_session: true,
           receipt_email: booking.customer_email || undefined,
           automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
           transfer_data: { destination: booking.stripe_account_id },
           on_behalf_of: booking.stripe_account_id,
-          metadata: { booking_id: String(id), type: 'final' }
+          transfer_group: transferGroup,
+          metadata: { booking_id: String(id), type: 'final' },
         },
-        { idempotencyKey: baseKey }
+        { idempotencyKey: idemKey }
       );
     }
+
+    const last4 =
+      intent?.payment_method?.card?.last4 ||
+      intent?.latest_charge?.payment_method_details?.card?.last4 ||
+      null;
+
+    // Persistir intent/estado + snapshots + transfer_group + PM last4
+    const conn2 = await pool.promise().getConnection();
+    try {
+      await conn2.beginTransaction();
+      await upsertPayment(conn2, {
+        bookingId: id,
+        type: 'final',
+        paymentIntentId: intent.id,
+        amountCents: amountToCharge,
+        commissionSnapshotCents: commissionCents,
+        finalPriceSnapshotCents: finalCents,
+        status: mapStatus(intent.status),
+        transferGroup,
+        paymentMethodId: pmToUse,
+        paymentMethodLast4: last4 || null,
+      });
+      await conn2.commit();
+    } catch (e) {
+      try { await conn2.rollback(); } catch {}
+      return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
+    } finally {
+      conn2.release();
+    }
+
+    if (intent.status === 'succeeded') {
+      return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
+    }
+    if (intent.status === 'requires_action') {
+      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'processing') {
+      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+    }
+    return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
   } catch (err) {
-    return res.status(400).json({ error: 'Error con el proveedor de pagos.' });
-  }
-
-  // Persistir intent/estado con segunda conexión corta
-  const conn2 = await pool.promise().getConnection();
-  try {
-    await conn2.beginTransaction();
-    await upsertPayment(conn2, {
-      bookingId: id,
-      type: 'final',
-      paymentIntentId: intent.id,
-      amountCents: amountToCharge,
-      status: mapStatus(intent.status)
-    });
-    await conn2.commit();
-  } catch (e) {
-    try { await conn2.rollback(); } catch {}
-    return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
+    try { await connection.rollback(); } catch {}
+    return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
   } finally {
-    conn2.release();
+    connection.release(); // release solo en finally
   }
-
-  if (intent.status === 'succeeded') {
-    return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
-  }
-  if (intent.status === 'requires_action') {
-    return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
-  }
-  if (intent.status === 'processing') {
-    return res.status(202).json({ processing: true, paymentIntentId: intent.id });
-  }
-  return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
 });
 
 // Pago final de una reserva completada (NO ACTIVO!)
@@ -3997,11 +4127,10 @@ app.post('/api/upload-dni', (req, res) => {
   });
 });
 
-// Webhook Stripe
+// Webhook Stripe: añade payment_intent.canceled y charge.dispute.*, guarda last4 y corrige el send(...)
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
-
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) {
@@ -4009,118 +4138,112 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  pool.getConnection(async (err, connection) => {
-    if (err) {
-      console.error('DB connection error (webhook):', err);
-      return res.status(500).end();
-    }
-    const conn = connection.promise();
+  const connection = await pool.promise().getConnection();
+  try {
+    switch (event.type) {
+      case 'payment_intent.succeeded':
+      case 'payment_intent.processing':
+      case 'payment_intent.requires_action':
+      case 'payment_intent.payment_failed':
+      case 'payment_intent.canceled': {
+        const pi = event.data.object;
+        const bookingId = pi?.metadata?.booking_id;
+        const type = pi?.metadata?.type;
+        if (!bookingId || !type) break;
 
-    try {
-      switch (event.type) {
-        case 'payment_intent.succeeded': {
-          const pi = event.data.object;
-          const bookingId = pi?.metadata?.booking_id;
-          const type = pi?.metadata?.type;
-          if (!bookingId || !type) break;
+        const last4 =
+          pi?.payment_method?.card?.last4 ||
+          pi?.latest_charge?.payment_method_details?.card?.last4 ||
+          null;
+        const pmId = pi?.payment_method || pi?.latest_charge?.payment_method || null;
 
-          await conn.beginTransaction();
-          await upsertPayment(conn, {
-            bookingId,
-            type,
-            paymentIntentId: pi.id,
-            amountCents: pi.amount_received ?? pi.amount ?? 0,
-            status: mapStatus(pi.status),
-            transferGroup: pi.transfer_group || null
-          });
+        await connection.beginTransaction();
+        await upsertPayment(connection, {
+          bookingId,
+          type,
+          paymentIntentId: pi.id,
+          amountCents: pi.amount_received ?? pi.amount ?? 0,
+          status: mapStatus(pi.status),
+          transferGroup: pi.transfer_group || null,
+          paymentMethodId: pmId || null,
+          paymentMethodLast4: last4 || null,
+        });
 
-          if (type === 'final') {
-            await conn.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [bookingId]);
-          }
-
-          await conn.commit();
-          break;
+        if (event.type === 'payment_intent.succeeded' && type === 'final') {
+          await connection.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [bookingId]);
+        }
+        if (event.type === 'payment_intent.canceled' && type === 'final') {
+          // opcional: revertir is_paid si fuera necesario en tu dominio
         }
 
-        case 'payment_intent.payment_failed': {
-          const pi = event.data.object;
-          const bookingId = pi?.metadata?.booking_id;
-          const type = pi?.metadata?.type;
-          if (!bookingId || !type) break;
-
-          await conn.beginTransaction();
-          await upsertPayment(conn, {
-            bookingId,
-            type,
-            paymentIntentId: pi.id,
-            amountCents: pi.amount ?? 0,
-            status: 'payment_failed',
-            transferGroup: pi.transfer_group || null
-          });
-          await conn.commit();
-          break;
-        }
-
-        case 'charge.refunded': {
-          const charge = event.data.object;
-          const piId = charge.payment_intent;
-          const fullyRefunded = charge.amount_refunded >= (charge.amount_captured || charge.amount);
-          if (!piId) break;
-
-          await conn.beginTransaction();
-          const [[payment]] = await conn.query(
-            'SELECT booking_id, type FROM payments WHERE payment_intent_id = ? FOR UPDATE',
-            [piId]
-          );
-
-          if (payment) {
-            await conn.query(
-              'UPDATE payments SET status = ? WHERE payment_intent_id = ?',
-              ['refunded', piId]
-            );
-
-            if (payment.type === 'final' && fullyRefunded) {
-              await conn.query('UPDATE booking SET is_paid = 0 WHERE id = ?', [payment.booking_id]);
-            }
-          }
-
-          await conn.commit();
-          break;
-        }
-
-        case 'payment_intent.processing':
-        case 'payment_intent.requires_action': {
-          const pi = event.data.object;
-          const bookingId = pi?.metadata?.booking_id;
-          const type = pi?.metadata?.type;
-          if (!bookingId || !type) break;
-
-          await conn.beginTransaction();
-          await upsertPayment(conn, {
-            bookingId,
-            type,
-            paymentIntentId: pi.id,
-            amountCents: pi.amount ?? 0,
-            status: mapStatus(event.type === 'payment_intent.processing' ? 'processing' : 'requires_action'),
-            transferGroup: pi.transfer_group || null
-          });
-          await conn.commit();
-          break;
-        }
-
-        default:
-          break;
+        await connection.commit();
+        break;
       }
 
-      res.status(200).json({ received: true });
-    } catch (e) {
-      console.error('Webhook handling error:', e);
-      try { await conn.rollback(); } catch {}
-      res.status(500).end();
-    } finally {
-      connection.release();
+      case 'charge.refunded': {
+        const charge = event.data.object;
+        const piId = charge.payment_intent;
+        const fullyRefunded = charge.amount_refunded >= (charge.amount_captured || charge.amount);
+        if (!piId) break;
+        await connection.beginTransaction();
+        const [[payment]] = await connection.query(
+          'SELECT booking_id, type FROM payments WHERE payment_intent_id = ? FOR UPDATE',
+          [piId]
+        );
+        if (payment) {
+          await connection.query(
+            'UPDATE payments SET status = ? WHERE payment_intent_id = ?',
+            ['refunded', piId]
+          );
+          if (payment.type === 'final' && fullyRefunded) {
+            await connection.query('UPDATE booking SET is_paid = 0 WHERE id = ?', [payment.booking_id]);
+          }
+        }
+        await connection.commit();
+        break;
+      }
+
+      // Disputas
+      case 'charge.dispute.created':
+      case 'charge.dispute.funds_withdrawn': {
+        const dispute = event.data.object;
+        const piId = dispute.charge?.payment_intent || dispute.payment_intent;
+        if (!piId) break;
+        await connection.beginTransaction();
+        await connection.query(
+          "UPDATE payments SET status = 'dispute_open' WHERE payment_intent_id = ?",
+          [piId]
+        );
+        await connection.commit();
+        break;
+      }
+      case 'charge.dispute.closed':
+      case 'charge.dispute.funds_reinstated': {
+        const dispute = event.data.object;
+        const piId = dispute.charge?.payment_intent || dispute.payment_intent;
+        if (!piId) break;
+        const won = dispute.status === 'won';
+        await connection.beginTransaction();
+        await connection.query(
+          "UPDATE payments SET status = ? WHERE payment_intent_id = ?",
+          [won ? 'dispute_won' : 'dispute_lost', piId]
+        );
+        await connection.commit();
+        break;
+      }
+
+      default:
+        break;
     }
-  });
+
+    res.status(200).json({ received: true });
+  } catch (e) {
+    console.error('Webhook handling error:', e);
+    try { await connection.rollback(); } catch {}
+    res.status(500).end();
+  } finally {
+    connection.release();
+  }
 });
 
 // Inicia el servidor
