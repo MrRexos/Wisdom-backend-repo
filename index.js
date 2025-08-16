@@ -3020,6 +3020,13 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
 app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
+  
+  console.log('Iniciando proceso de depósito:', {
+    bookingId: id,
+    userId: req.user?.id,
+    userRole: req.user?.role,
+    timestamp: new Date().toISOString()
+  });
 
   let booking;
   let payment;
@@ -3042,6 +3049,16 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     booking = rows[0];
     if (!booking) throw new Error('Reserva no encontrada');
     if (booking.booking_status === 'cancelled') throw new Error('Reserva cancelada');
+    
+    console.log('Información de reserva obtenida:', {
+      bookingId: id,
+      userId: booking.user_id,
+      finalPrice: booking.final_price,
+      commission: booking.commission,
+      status: booking.booking_status,
+      customerEmail: booking.customer_email,
+      hasStripeCustomer: !!booking.stripe_customer_id
+    });
 
     const isOwner = req.user && Number(req.user.id) === Number(booking.user_id);
     const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
@@ -3078,24 +3095,47 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     const idemKey = stableKey(['payment', payment.id]);
 
     let intent;
-    if (payment.payment_intent_id) {
-      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
-        expand: ['payment_method', 'latest_charge.payment_method_details'],
-      });
-    } else {
-      intent = await stripe.paymentIntents.create(
-        {
-          amount: commissionCents,
-          currency: 'eur',
-          customer: customerId,
-          setup_future_usage: 'off_session',
-          receipt_email: booking.customer_email || undefined,
-          automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-          transfer_group: transferGroup,
-          metadata: { booking_id: String(id), type: 'deposit' },
+    try {
+      if (payment.payment_intent_id) {
+        intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
+          expand: ['payment_method', 'latest_charge.payment_method_details'],
+        });
+      } else {
+        intent = await stripe.paymentIntents.create(
+          {
+            amount: commissionCents,
+            currency: 'eur',
+            customer: customerId,
+            setup_future_usage: 'off_session',
+            receipt_email: booking.customer_email || undefined,
+            automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+            transfer_group: transferGroup,
+            metadata: { booking_id: String(id), type: 'deposit' },
+          },
+          { idempotencyKey: idemKey }
+        );
+      }
+    } catch (stripeError) {
+      console.error('Error de Stripe al crear/recuperar PaymentIntent:', {
+        bookingId: id,
+        userId: req.user?.id,
+        stripeError: {
+          type: stripeError.type,
+          code: stripeError.code,
+          message: stripeError.message,
+          declineCode: stripeError.decline_code,
+          param: stripeError.param,
+          requestId: stripeError.requestId
         },
-        { idempotencyKey: idemKey }
-      );
+        paymentData: {
+          amountCents: commissionCents,
+          customerId,
+          transferGroup,
+          idemKey
+        }
+      });
+      
+      throw stripeError; // Re-lanzar para que sea capturado por el catch principal
     }
 
     // Persistir intent/estado + transfer_group + PM last4 si disponible
@@ -3123,11 +3163,28 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       await conn2.commit();
     } catch (e) {
       try { await conn2.rollback(); } catch {}
-      return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
+      console.error('Error al actualizar el estado del pago en BD:', {
+        bookingId: id,
+        userId: req.user?.id,
+        error: e.message,
+        stack: e.stack
+      });
+      return res.status(400).json({ 
+        error: 'No se pudo actualizar el estado del pago.',
+        details: e.message 
+      });
     } finally {
       conn2.release();
     }
 
+    console.log('PaymentIntent creado exitosamente:', {
+      bookingId: id,
+      paymentIntentId: intent.id,
+      status: intent.status,
+      amountCents: commissionCents,
+      transferGroup
+    });
+    
     if (intent.status === 'requires_action') {
       return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
     }
@@ -3140,7 +3197,35 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
   } catch (err) {
     try { await connection.rollback(); } catch {}
-    return res.status(400).json({ error: 'No se pudo crear el depósito.' });
+    
+    // Log detallado del error para debugging
+    console.error('Error en depósito de reserva:', {
+      bookingId: id,
+      userId: req.user?.id,
+      error: err.message,
+      stack: err.stack,
+      stripeError: err.type || err.code || null,
+      stripeMessage: err.decline_code || err.param || null
+    });
+    
+    // Si es un error de Stripe, devolver más detalles
+    if (err.type && err.type.startsWith('Stripe')) {
+      return res.status(400).json({ 
+        error: 'Error de Stripe en el depósito',
+        details: {
+          type: err.type,
+          code: err.code,
+          message: err.message,
+          declineCode: err.decline_code,
+          param: err.param
+        }
+      });
+    }
+    
+    return res.status(400).json({ 
+      error: 'No se pudo crear el depósito.',
+      details: err.message 
+    });
   } finally {
     connection.release(); // release solo en finally (evita doble release)
   }
