@@ -76,6 +76,11 @@ transporter.verify().catch(err => {
 
 // Middleware para verificar tokens JWT
 function authenticateToken(req, res, next) {
+  // Los webhooks de Stripe no envían JWT, por lo que deben quedar excluidos
+  if (req.path.startsWith('/webhooks/stripe')) {
+    return next();
+  }
+
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
