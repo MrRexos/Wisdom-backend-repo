@@ -192,6 +192,25 @@ const pool = mysql.createPool({
   connectTimeout: 20000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada.
 });
 
+const cron = require('node-cron');
+
+// cron diario a las 3:00 AM
+cron.schedule('0 3 * * *', async () => {
+  try {
+    await pool.promise().query(`
+      DELETE b FROM booking b
+      LEFT JOIN payments p
+        ON p.booking_id = b.id AND p.type = 'deposit'
+      WHERE b.booking_status = 'pending_deposit'
+        AND b.created_at < (NOW() - INTERVAL 24 HOUR)
+        AND (p.id IS NULL OR p.status IN ('requires_payment_method','canceled','payment_failed'));
+    `);
+    console.log('[CRON] Limpieza de reservas pending_deposit ejecutada');
+  } catch (e) {
+    console.error('Error en cron cleanup:', e);
+  }
+});
+
 const credentials = JSON.parse(process.env.GCLOUD_KEYFILE_JSON);
 
 // Configura el almacenamiento de Google Cloud
@@ -2652,7 +2671,7 @@ app.post('/api/bookings', (req, res) => {
 function createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res) {
   const bookingQuery = `
     INSERT INTO booking (user_id, service_id, address_id, payment_method_id, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, is_paid, booking_status, description, order_datetime)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, NOW())
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_deposit', ?, NOW())
   `;
   const bookingValues = [
     user_id,
@@ -3021,7 +3040,35 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
   });
 });
 
-//Cobra la comisión 10% (mín 1€)
+// Marca booking como failed si no se ha pagado el deposit
+app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const conn = await pool.promise().getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[b]] = await conn.query(
+      'SELECT user_id, booking_status FROM booking WHERE id = ? FOR UPDATE', [id]
+    );
+    if (!b) { await conn.rollback(); return res.status(404).json({ error: 'Reserva no encontrada' }); }
+    const isOwner = req.user && Number(req.user.id) === Number(b.user_id);
+    const isStaff = req.user && ['admin','support'].includes(req.user.role);
+    if (!isOwner && !isStaff) { await conn.rollback(); return res.status(403).json({ error: 'No autorizado' }); }
+    const [[pdep]] = await conn.query(
+      "SELECT status FROM payments WHERE booking_id = ? AND type='deposit' LIMIT 1", [id]
+    );
+    const succeeded = pdep && pdep.status === 'succeeded';
+    if (!succeeded && b.booking_status === 'pending_deposit') {
+      await conn.query("UPDATE booking SET booking_status='payment_failed' WHERE id=?", [id]);
+    }
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (e) {
+    try { await conn.rollback(); } catch {}
+    res.status(500).json({ error: 'No se pudo cancelar la reserva impagada' });
+  } finally { conn.release(); }
+});
+
+// Cobra la comisión 10% (mín 1€)
 app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
@@ -3165,6 +3212,17 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         paymentMethodId: pmId || null,
         paymentMethodLast4: last4 || null,
       });
+      if (intent.status === 'succeeded') {
+        await conn2.query(
+          'UPDATE booking SET booking_status = "requested" WHERE id = ?',
+          [id]
+        );
+      } else if (intent.status === 'canceled' || intent.status === 'requires_payment_method') {
+        await conn2.query(
+          'UPDATE booking SET booking_status = "payment_failed" WHERE id = ? AND booking_status = "pending_deposit"',
+          [id]
+        );
+      }
       await conn2.commit();
     } catch (e) {
       try { await conn2.rollback(); } catch {}
@@ -3236,8 +3294,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   }
 });
 
-
-// Cargo final (destination charge) con validaciones extra, Customer, reutilización/validación PM, transfer_group y validación de capacidades
+// Cargo final (destination charge)
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
@@ -3340,7 +3397,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     const canCard = acct.capabilities?.card_payments === 'active';
     const canTransfers = acct.capabilities?.transfers === 'active';
     const canPayouts = !!acct.payouts_enabled;
-    if (!canCard || !canTransfers || !canPayouts) {
+    const chargesEnabled = !!acct.charges_enabled;
+    if (!chargesEnabled || !canCard || !canTransfers || !canPayouts) {
       return res.status(412).json({ error: 'La cuenta conectada no está lista para cobrar y transferir.' });
     }
 
@@ -4224,7 +4282,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err) {
-    console.error('❌ Webhook signature verification failed:', err.message);
+    console.error('Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
@@ -4259,9 +4317,18 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           paymentMethodLast4: last4 || null,
         });
 
+        if (event.type === 'payment_intent.succeeded' && type === 'deposit') {
+            await connection.query('UPDATE booking SET booking_status = "requested" WHERE id = ?', [bookingId]);
+          }
         if (event.type === 'payment_intent.succeeded' && type === 'final') {
           await connection.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [bookingId]);
         }
+        if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'deposit') {
+            await connection.query(
+              'UPDATE booking SET booking_status = "payment_failed" WHERE id = ? AND booking_status = "pending_deposit"',
+              [bookingId]
+            );
+          }
         if (event.type === 'payment_intent.canceled' && type === 'final') {
           // opcional: revertir is_paid si fuera necesario en tu dominio
         }
