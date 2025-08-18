@@ -1925,7 +1925,8 @@ app.get('/api/user/:userId/bookings', (req, res) => {
       LEFT JOIN service ON booking.service_id = service.id
       LEFT JOIN price ON service.price_id = price.id
       LEFT JOIN user_account ON service.user_id = user_account.id
-      WHERE booking.user_id = ?`;
+      WHERE booking.user_id = ?
+      AND booking.booking_status NOT IN ('pending_deposit', 'payment_failed')`;
 
       const params = [userId];
       if (status) {
@@ -2022,7 +2023,8 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
       JOIN price ON service.price_id = price.id
       JOIN user_account AS service_user ON service.user_id = service_user.id -- Usuario que presta el servicio
       JOIN user_account AS booking_user ON booking.user_id = booking_user.id -- Usuario que realizó la reserva
-      WHERE service.user_id = ?`;
+      WHERE service.user_id = ?
+      AND booking.booking_status NOT IN ('pending_deposit', 'payment_failed')`;
 
     const params = [userId];
     if (status) {
