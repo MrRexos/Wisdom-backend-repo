@@ -216,7 +216,7 @@ const credentials = JSON.parse(process.env.GCLOUD_KEYFILE_JSON);
 // Configura el almacenamiento de Google Cloud
 const storage = new Storage({
   projectId: credentials.project_id,
-  credentials: credentials, 
+  credentials: credentials,
 });
 
 const bucket = storage.bucket(process.env.GCLOUD_BUCKET_NAME);
@@ -314,7 +314,7 @@ app.post('/api/signup', async (req, res) => {
                 { filename: 'instagram.png', path: path.join(__dirname, 'assets', 'instagram.png'), cid: instagramLogoCid },
                 { filename: 'twitter.png', path: path.join(__dirname, 'assets', 'twitter.png'), cid: twitterLogoCid }
               ],
-              html:`
+              html: `
               <table
                 width="100%"
                 cellpadding="0"
@@ -675,7 +675,7 @@ app.post('/api/forgot-password', (req, res) => {
           res.json({ message: 'Reset code sent' });
         }
       );
-    }); 
+    });
   });
 });
 
@@ -779,7 +779,7 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
       res.status(400).send('No se subió ningún archivo.');
       return;
     }
-    
+
     // Detecta el formato de la imagen
     const image = sharp(req.file.buffer);
     const metadata = await image.metadata();
@@ -1019,7 +1019,7 @@ app.post('/api/list/share', (req, res) => {
 
       if (results.length === 0) {
         connection.release(); // Libera la conexión
-        return res.status(201).json({ notFound:true });
+        return res.status(201).json({ notFound: true });
       }
 
       const userId = results[0].id;
@@ -1123,7 +1123,7 @@ app.get('/api/lists/:id/items', (req, res) => {
       if (itemsWithService.length > 0) {
         res.status(200).json(itemsWithService);
       } else {
-        res.status(200).json({empty: true,  message: 'No se encontraron ítems para esta lista.' });
+        res.status(200).json({ empty: true, message: 'No se encontraron ítems para esta lista.' });
       }
     });
   });
@@ -1340,51 +1340,51 @@ app.post('/api/upload-images', upload.array('files'), async (req, res, next) => 
 
 
   try {
-      const results = await Promise.all(req.files.map(async (file, index) => {
-          const image = sharp(file.buffer);
-          const metadata = await image.metadata();
-          let compressedImage;
+    const results = await Promise.all(req.files.map(async (file, index) => {
+      const image = sharp(file.buffer);
+      const metadata = await image.metadata();
+      let compressedImage;
 
-          if (metadata.format === 'jpeg' || metadata.format === 'jpg') {
-              compressedImage = await image
-                  .resize({ width: 800 })
-                  .jpeg({ quality: 80 })
-                  .toBuffer();
-          } else if (metadata.format === 'png') {
-              compressedImage = await image
-                  .resize({ width: 800 })
-                  .png({ quality: 60 })
-                  .toBuffer();
-          } else if (metadata.format === 'webp') {
-              compressedImage = await image
-                  .resize({ width: 800 })
-                  .webp({ quality: 60 })
-                  .toBuffer();
-          } else if (metadata.format === 'heif') {
-              compressedImage = await image
-                  .resize({ width: 800 })
-                  .toBuffer();  // Usar toBuffer() para HEIF si no soporta compresión
-          } else {
-              throw new Error('Formato de archivo no soportado.');
-          }
+      if (metadata.format === 'jpeg' || metadata.format === 'jpg') {
+        compressedImage = await image
+          .resize({ width: 800 })
+          .jpeg({ quality: 80 })
+          .toBuffer();
+      } else if (metadata.format === 'png') {
+        compressedImage = await image
+          .resize({ width: 800 })
+          .png({ quality: 60 })
+          .toBuffer();
+      } else if (metadata.format === 'webp') {
+        compressedImage = await image
+          .resize({ width: 800 })
+          .webp({ quality: 60 })
+          .toBuffer();
+      } else if (metadata.format === 'heif') {
+        compressedImage = await image
+          .resize({ width: 800 })
+          .toBuffer();  // Usar toBuffer() para HEIF si no soporta compresión
+      } else {
+        throw new Error('Formato de archivo no soportado.');
+      }
 
-          const blob = bucket.file(`${Date.now()}_${file.originalname}`);
-          const blobStream = blob.createWriteStream();
+      const blob = bucket.file(`${Date.now()}_${file.originalname}`);
+      const blobStream = blob.createWriteStream();
 
-          return new Promise((resolve, reject) => {
-              blobStream.on('error', reject);
-              blobStream.on('finish', () => {
-                  const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
-                  resolve({ url: publicUrl, order: index + 1 });
-              });
-              blobStream.end(compressedImage);
-          });
-      }));
+      return new Promise((resolve, reject) => {
+        blobStream.on('error', reject);
+        blobStream.on('finish', () => {
+          const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
+          resolve({ url: publicUrl, order: index + 1 });
+        });
+        blobStream.end(compressedImage);
+      });
+    }));
 
-      res.status(200).send(results);
+    res.status(200).send(results);
   } catch (error) {
-      console.error('Error en la carga de imágenes:', error);
-      res.status(500).send(error.message);
+    console.error('Error en la carga de imágenes:', error);
+    res.status(500).send(error.message);
   }
 });
 
@@ -1409,10 +1409,10 @@ app.post('/api/service', (req, res) => {
     is_individual,
     allow_discounts,
     discount_rate,
-    languages,     
-    tags,           
-    experiences,   
-    images,         
+    languages,
+    tags,
+    experiences,
+    images,
     hobbies
   } = req.body;
 
@@ -1526,7 +1526,7 @@ app.post('/api/service', (req, res) => {
                   console.log('Experiencias insertadas correctamente');
                 }
               });
-            } 
+            }
 
             // 7. Insertar imágenes en 'service_image'
             if (images && images.length > 0) {
@@ -1651,7 +1651,7 @@ app.post('/api/lists/:list_id/items', (req, res) => {
       // Si ya existe, no añadir el nuevo item
       if (results.length > 0) {
         connection.release();
-        return res.status(201).json({ message: 'El item ya existe en la lista.', alreadyExists:true });
+        return res.status(201).json({ message: 'El item ya existe en la lista.', alreadyExists: true });
       }
 
       // Si no existe, proceder con la inserción
@@ -1928,14 +1928,14 @@ app.get('/api/user/:userId/bookings', (req, res) => {
       WHERE booking.user_id = ?
       AND booking.booking_status NOT IN ('pending_deposit', 'payment_failed')`;
 
-      const params = [userId];
-      if (status) {
-        query += ' AND booking.booking_status = ?';
-        params.push(status);
-      }
-      query += ' ORDER BY booking.booking_start_datetime DESC;';
-  
-      connection.query(query, params, (err, bookingsData) => {
+    const params = [userId];
+    if (status) {
+      query += ' AND booking.booking_status = ?';
+      params.push(status);
+    }
+    query += ' ORDER BY booking.booking_start_datetime DESC;';
+
+    connection.query(query, params, (err, bookingsData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -2366,41 +2366,41 @@ app.put('/api/user/:id/allow_notis', (req, res) => {
 
   // Verificar que el valor de `allow_notis` sea válido (booleano)
   if (typeof allow_notis !== 'boolean') {
-      res.status(400).json({ error: 'El valor de allow_notis debe ser un booleano.' });
-      return;
+    res.status(400).json({ error: 'El valor de allow_notis debe ser un booleano.' });
+    return;
   }
 
   // Obtener una conexión del pool de MySQL
   pool.getConnection((err, connection) => {
-      if (err) {
-          console.error('Error al obtener la conexión:', err);
-          res.status(500).json({ error: 'Error al obtener la conexión.' });
-          return;
-      }
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
 
-      // Consulta SQL para actualizar el campo `allow_notis`
-      const query = `
+    // Consulta SQL para actualizar el campo `allow_notis`
+    const query = `
           UPDATE user_account
           SET allow_notis = ?
           WHERE id = ?;
       `;
 
-      // Ejecutar la consulta
-      connection.query(query, [allow_notis, id], (err, result) => {
-          connection.release();  // Liberar la conexión después de usarla
+    // Ejecutar la consulta
+    connection.query(query, [allow_notis, id], (err, result) => {
+      connection.release();  // Liberar la conexión después de usarla
 
-          if (err) {
-              console.error('Error al actualizar allow_notis:', err);
-              res.status(500).json({ error: 'Error al actualizar allow_notis.' });
-              return;
-          }
+      if (err) {
+        console.error('Error al actualizar allow_notis:', err);
+        res.status(500).json({ error: 'Error al actualizar allow_notis.' });
+        return;
+      }
 
-          if (result.affectedRows > 0) {
-              res.status(200).json({ message: 'allow_notis actualizado exitosamente.' });
-          } else {
-              res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
-          }
-      });
+      if (result.affectedRows > 0) {
+        res.status(200).json({ message: 'allow_notis actualizado exitosamente.' });
+      } else {
+        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      }
+    });
   });
 });
 
@@ -2962,7 +2962,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
               state,
               country: country.toUpperCase()
             },
-            email: user.email, 
+            email: user.email,
             phone,
             verification: {
               document: {
@@ -3053,7 +3053,7 @@ app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, re
     );
     if (!b) { await conn.rollback(); return res.status(404).json({ error: 'Reserva no encontrada' }); }
     const isOwner = req.user && Number(req.user.id) === Number(b.user_id);
-    const isStaff = req.user && ['admin','support'].includes(req.user.role);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
     if (!isOwner && !isStaff) { await conn.rollback(); return res.status(403).json({ error: 'No autorizado' }); }
     const [[pdep]] = await conn.query(
       "SELECT status FROM payments WHERE booking_id = ? AND type='deposit' LIMIT 1", [id]
@@ -3065,7 +3065,7 @@ app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, re
     await conn.commit();
     res.json({ ok: true });
   } catch (e) {
-    try { await conn.rollback(); } catch {}
+    try { await conn.rollback(); } catch { }
     res.status(500).json({ error: 'No se pudo cancelar la reserva impagada' });
   } finally { conn.release(); }
 });
@@ -3074,7 +3074,7 @@ app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, re
 app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
-  
+
   console.log('Iniciando proceso de depósito:', {
     bookingId: id,
     userId: req.user?.id,
@@ -3103,7 +3103,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     booking = rows[0];
     if (!booking) throw new Error('Reserva no encontrada');
     if (booking.booking_status === 'cancelled') throw new Error('Reserva cancelada');
-    
+
     console.log('Información de reserva obtenida:', {
       bookingId: id,
       userId: booking.user_id,
@@ -3188,7 +3188,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
           idemKey
         }
       });
-      
+
       throw stripeError; // Re-lanzar para que sea capturado por el catch principal
     }
 
@@ -3227,16 +3227,16 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       }
       await conn2.commit();
     } catch (e) {
-      try { await conn2.rollback(); } catch {}
+      try { await conn2.rollback(); } catch { }
       console.error('Error al actualizar el estado del pago en BD:', {
         bookingId: id,
         userId: req.user?.id,
         error: e.message,
         stack: e.stack
       });
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'No se pudo actualizar el estado del pago.',
-        details: e.message 
+        details: e.message
       });
     } finally {
       conn2.release();
@@ -3249,7 +3249,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       amountCents: commissionCents,
       transferGroup
     });
-    
+
     if (intent.status === 'requires_action') {
       return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
     }
@@ -3261,8 +3261,8 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     }
     return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
   } catch (err) {
-    try { await connection.rollback(); } catch {}
-    
+    try { await connection.rollback(); } catch { }
+
     // Log detallado del error para debugging
     console.error('Error en depósito de reserva:', {
       bookingId: id,
@@ -3272,10 +3272,10 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       stripeError: err.type || err.code || null,
       stripeMessage: err.decline_code || err.param || null
     });
-    
+
     // Si es un error de Stripe, devolver más detalles
     if (err.type && err.type.startsWith('Stripe')) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Error de Stripe en el depósito',
         details: {
           type: err.type,
@@ -3286,10 +3286,10 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         }
       });
     }
-    
-    return res.status(400).json({ 
+
+    return res.status(400).json({
       error: 'No se pudo crear el depósito.',
-      details: err.message 
+      details: err.message
     });
   } finally {
     connection.release(); // release solo en finally (evita doble release)
@@ -3301,6 +3301,14 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
   const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
+
+  console.log('Iniciando proceso de pago final:', {
+    bookingId: id,
+    userId: req.user?.id,
+    userRole: req.user?.role,
+    timestamp: new Date().toISOString(),
+    paymentMethodId: payment_method_id || null,
+  });
 
   let booking;
   let payment;
@@ -3339,6 +3347,17 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     if (!booking.stripe_account_id || !booking.stripe_account_id.startsWith('acct_')) {
       throw new Error('Cuenta Stripe inválida');
     }
+
+    console.log('Información de reserva obtenida (pago final):', {
+      bookingId: id,
+      userId: booking.user_id,
+      finalPrice: booking.final_price,
+      commission: booking.commission,
+      isPaid: !!booking.is_paid,
+      customerEmail: booking.customer_email,
+      hasStripeCustomer: !!booking.customer_id,
+      providerAccountId: booking.stripe_account_id,
+    });
 
     // Garantiza Customer
     const customerId = booking.customer_id || (await ensureStripeCustomerId(connection, {
@@ -3433,32 +3452,55 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     const idemKey = stableKey(['payment', payment.id]);
 
     let intent;
-    if (payment.payment_intent_id) {
-      intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
-        expand: ['payment_method', 'latest_charge.payment_method_details'],
-      });
-      if (intent.status === 'requires_payment_method') {
-        await stripe.paymentIntents.update(intent.id, { payment_method: pmToUse, customer: customerId });
-        intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
+    try {
+      if (payment.payment_intent_id) {
+        intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
+          expand: ['payment_method', 'latest_charge.payment_method_details'],
+        });
+        if (intent.status === 'requires_payment_method') {
+          await stripe.paymentIntents.update(intent.id, { payment_method: pmToUse, customer: customerId });
+          intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
+        }
+      } else {
+        intent = await stripe.paymentIntents.create(
+          {
+            amount: amountToCharge,
+            currency: 'eur',
+            customer: customerId,
+            payment_method: pmToUse,
+            confirm: true,
+            off_session: true,
+            receipt_email: booking.customer_email || undefined,
+            automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+            transfer_data: { destination: booking.stripe_account_id },
+            on_behalf_of: booking.stripe_account_id,
+            transfer_group: transferGroup,
+            metadata: { booking_id: String(id), type: 'final' },
+          },
+          { idempotencyKey: idemKey }
+        );
       }
-    } else {
-      intent = await stripe.paymentIntents.create(
-        {
-          amount: amountToCharge,
-          currency: 'eur',
-          customer: customerId,
-          payment_method: pmToUse,
-          confirm: true,
-          off_session: true,
-          receipt_email: booking.customer_email || undefined,
-          automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-          transfer_data: { destination: booking.stripe_account_id },
-          on_behalf_of: booking.stripe_account_id,
-          transfer_group: transferGroup,
-          metadata: { booking_id: String(id), type: 'final' },
+    } catch (stripeError) {
+      console.error('Error de Stripe al crear/recuperar PaymentIntent (pago final):', {
+        bookingId: id,
+        userId: req.user?.id,
+        stripeError: {
+          type: stripeError.type,
+          code: stripeError.code,
+          message: stripeError.message,
+          declineCode: stripeError.decline_code,
+          param: stripeError.param,
+          requestId: stripeError.requestId,
         },
-        { idempotencyKey: idemKey }
-      );
+        paymentData: {
+          amountCents: amountToCharge,
+          customerId,
+          transferGroup,
+          idemKey,
+          destination: booking.stripe_account_id,
+        },
+      });
+      throw stripeError;
     }
 
     const last4 =
@@ -3484,11 +3526,26 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       });
       await conn2.commit();
     } catch (e) {
-      try { await conn2.rollback(); } catch {}
+      try { await conn2.rollback(); } catch { }
+      console.error('Error al actualizar el estado del pago final en BD:', {
+        bookingId: id,
+        userId: req.user?.id,
+        error: e.message,
+        stack: e.stack,
+      });
       return res.status(400).json({ error: 'No se pudo actualizar el estado del pago.' });
     } finally {
       conn2.release();
     }
+
+    console.log('PaymentIntent final creado/actualizado:', {
+      bookingId: id,
+      paymentIntentId: intent.id,
+      status: intent.status,
+      amountCents: amountToCharge,
+      transferGroup,
+      destination: booking.stripe_account_id,
+    });
 
     if (intent.status === 'succeeded') {
       return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
@@ -3501,7 +3558,15 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     }
     return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
   } catch (err) {
-    try { await connection.rollback(); } catch {}
+    try { await connection.rollback(); } catch { }
+    console.error('Error en pago final de reserva:', {
+      bookingId: id,
+      userId: req.user?.id,
+      error: err.message,
+      stack: err.stack,
+      stripeError: err.type || err.code || null,
+      stripeMessage: err.decline_code || err.param || null,
+    });
     return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
   } finally {
     connection.release(); // release solo en finally
@@ -3973,8 +4038,8 @@ app.get('/api/suggestions', (req, res) => {
     `;
 
     // Ejecutar la consulta
-    connection.query(searchQuery, 
-      [searchPattern, searchPattern, searchPattern, searchPattern], 
+    connection.query(searchQuery,
+      [searchPattern, searchPattern, searchPattern, searchPattern],
       (err, results) => {
         connection.release(); // Liberar la conexión después de usarla
 
@@ -4014,7 +4079,7 @@ app.get('/api/suggestions', (req, res) => {
         }
 
         // Devolver las sugerencias encontradas
-        res.status(200).json({ suggestions }); 
+        res.status(200).json({ suggestions });
       }
     );
   });
@@ -4205,7 +4270,7 @@ app.get('/api/services/:id', (req, res) => {
       }
     });
   });
-}); 
+});
 
 
 
@@ -4270,7 +4335,7 @@ app.post('/api/upload-dni', (req, res) => {
       await fs.promises.unlink(filePath);
       return res.status(201).json({ fileToken: stripeFile.id });
     } catch (stripeErr) {
-      await fs.promises.unlink(filePath).catch(() => {});
+      await fs.promises.unlink(filePath).catch(() => { });
       console.error('Stripe file upload error:', stripeErr);
       return res.status(500).json({ error: 'Stripe upload failed' });
     }
@@ -4320,17 +4385,17 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         });
 
         if (event.type === 'payment_intent.succeeded' && type === 'deposit') {
-            await connection.query('UPDATE booking SET booking_status = "requested" WHERE id = ?', [bookingId]);
-          }
+          await connection.query('UPDATE booking SET booking_status = "requested" WHERE id = ?', [bookingId]);
+        }
         if (event.type === 'payment_intent.succeeded' && type === 'final') {
           await connection.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [bookingId]);
         }
         if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'deposit') {
-            await connection.query(
-              'UPDATE booking SET booking_status = "payment_failed" WHERE id = ? AND booking_status = "pending_deposit"',
-              [bookingId]
-            );
-          }
+          await connection.query(
+            'UPDATE booking SET booking_status = "payment_failed" WHERE id = ? AND booking_status = "pending_deposit"',
+            [bookingId]
+          );
+        }
         if (event.type === 'payment_intent.canceled' && type === 'final') {
           // opcional: revertir is_paid si fuera necesario en tu dominio
         }
@@ -4398,7 +4463,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
     res.status(200).json({ received: true });
   } catch (e) {
     console.error('Webhook handling error:', e);
-    try { await connection.rollback(); } catch {}
+    try { await connection.rollback(); } catch { }
     res.status(500).end();
   } finally {
     connection.release();
