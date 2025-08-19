@@ -1933,7 +1933,7 @@ app.get('/api/user/:userId/bookings', (req, res) => {
       query += ' AND booking.booking_status = ?';
       params.push(status);
     }
-    query += ' ORDER BY booking.booking_start_datetime DESC;';
+    query += ' ORDER BY booking.order_datetime DESC;';
 
     connection.query(query, params, (err, bookingsData) => {
       connection.release(); // Liberar la conexión después de usarla
@@ -2031,7 +2031,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
       query += ' AND booking.booking_status = ?';
       params.push(status);
     }
-    query += ' ORDER BY booking.booking_start_datetime DESC;';
+    query += ' ORDER BY booking.order_datetime DESC;';
 
     connection.query(query, params, (err, bookingsData) => {
       connection.release(); // Liberar la conexión después de usarla
@@ -2829,6 +2829,9 @@ app.patch('/api/bookings/:id/status', (req, res) => {
     if (typeof status !== 'undefined') {
       fields.push('booking_status = ?');
       values.push(status);
+      if (String(status).toLowerCase() === 'accepted') {
+        fields.push('booking_start_datetime = IF(booking_start_datetime IS NULL, NOW(), booking_start_datetime)');
+      }
     }
     if (typeof is_paid !== 'undefined') {
       fields.push('is_paid = ?');
