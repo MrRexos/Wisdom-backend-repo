@@ -2856,13 +2856,10 @@ app.patch('/api/bookings/:id/update-data', (req, res) => {
       values.push(commission);
     }
 
-    // Autocompletar fin y duración cuando se marque como completada
+    // Autocompletar fin  cuando se marque como completada
     if (typeof status !== 'undefined' && String(status).toLowerCase() === 'completed') {
       if (typeof booking_end_datetime === 'undefined') {
         fields.push('booking_end_datetime = IFNULL(booking_end_datetime, NOW())');
-      }
-      if (typeof service_duration === 'undefined') {
-        fields.push('service_duration = IFNULL(service_duration, TIMESTAMPDIFF(MINUTE, booking_start_datetime, COALESCE(booking_end_datetime, NOW())))');
       }
     }
 
