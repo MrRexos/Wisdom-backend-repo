@@ -2812,10 +2812,10 @@ app.put('/api/bookings/:id', (req, res) => {
   });
 });
 
-// Actualizar el estado de una reserva
-app.patch('/api/bookings/:id/status', (req, res) => {
+// Actualizar datos de una reserva
+app.patch('/api/bookings/:id/update-data', (req, res) => {
   const { id } = req.params;
-  const { status, is_paid } = req.body;
+  const { status, is_paid, booking_end_datetime, service_duration, final_price, commission } = req.body;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2836,6 +2836,34 @@ app.patch('/api/bookings/:id/status', (req, res) => {
     if (typeof is_paid !== 'undefined') {
       fields.push('is_paid = ?');
       values.push(is_paid);
+    }
+
+    // Campos extra de la reserva (fin, duración, precio final, comisión)
+    if (typeof booking_end_datetime !== 'undefined') {
+      fields.push('booking_end_datetime = ?');
+      values.push(booking_end_datetime);
+    }
+    if (typeof service_duration !== 'undefined') {
+      fields.push('service_duration = ?');
+      values.push(service_duration);
+    }
+    if (typeof final_price !== 'undefined') {
+      fields.push('final_price = ?');
+      values.push(final_price);
+    }
+    if (typeof commission !== 'undefined') {
+      fields.push('commission = ?');
+      values.push(commission);
+    }
+
+    // Autocompletar fin y duración cuando se marque como completada
+    if (typeof status !== 'undefined' && String(status).toLowerCase() === 'completed') {
+      if (typeof booking_end_datetime === 'undefined') {
+        fields.push('booking_end_datetime = IFNULL(booking_end_datetime, NOW())');
+      }
+      if (typeof service_duration === 'undefined') {
+        fields.push('service_duration = IFNULL(service_duration, TIMESTAMPDIFF(MINUTE, booking_start_datetime, COALESCE(booking_end_datetime, NOW())))');
+      }
     }
 
     if (fields.length === 0) {
