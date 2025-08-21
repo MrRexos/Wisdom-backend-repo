@@ -126,6 +126,39 @@ const mapStatus = (piStatus) => {
 // Helpers adicionales para pagos
 const stableKey = (parts) => parts.join(':');
 
+// Redondeos consistentes con frontend (BookingScreen)
+const round1 = (n) => {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round(x * 10) / 10;
+};
+const round2 = (n) => {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round(x * 100) / 100;
+};
+
+// Recalcula base, comisión y total como en BookingScreen.pricing
+function computePricing({ priceType, unitPrice, durationMinutes }) {
+  const type = String(priceType || '').toLowerCase();
+  const unit = Number.parseFloat(unitPrice) || 0;
+  const minutes = Math.max(0, Math.round(Number(durationMinutes) || 0));
+  const hours = minutes / 60;
+
+  let base = 0;
+  if (type === 'hour') base = unit * hours;
+  else base = unit;
+  base = round2(base);
+
+  let commission;
+  commission = Math.max(1, round1(base * 0.1));
+
+  const shouldNullFinal = (type === 'hour' || type === 'budget') && minutes <= 0;
+  const final = round2(base + commission);
+
+  return { base, commission, final, minutes };
+}
+
 // Garantiza un Customer y lo persiste en user_account.stripe_customer_id
 async function ensureStripeCustomerId(conn, { userId, email }) {
   const [[row]] = await conn.query(
@@ -3324,7 +3357,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   }
 });
 
-// Cargo final (destination charge)
+// Cargo final (destination charge) - FALTA COMISION EXTRA DE WISDOM SI VARIA PRECIO FINAL
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
@@ -3341,8 +3374,12 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
   let booking;
   let payment;
   let amountToCharge;
-  let commissionCents;
-  let finalCents;
+  let commissionCents; // almacenada
+  let finalCents;      // almacenado
+  let commissionCalcCents; // recalculada
+  let finalCalcCents;      // recalculado
+  let commissionChosenCents; // usada para cobrar
+  let finalChosenCents;      // usado para cobrar
 
   const connection = await pool.promise().getConnection();
   try {
@@ -3352,10 +3389,13 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     const [rows] = await connection.query(
       `
       SELECT b.id, b.user_id, b.final_price, b.commission, b.is_paid,
+             b.service_duration, b.booking_start_datetime, b.booking_end_datetime,
              cust.email AS customer_email, cust.stripe_customer_id AS customer_id,
-             provider.stripe_account_id
+             provider.stripe_account_id,
+             p.price AS unit_price, p.price_type
       FROM booking b
       JOIN service s ON b.service_id = s.id
+      JOIN price p ON s.price_id = p.id
       JOIN user_account provider ON s.user_id = provider.id
       JOIN user_account cust ON b.user_id = cust.id
       WHERE b.id = ? FOR UPDATE
@@ -3413,16 +3453,51 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       return res.status(409).json({ error: 'Ya existe un cobro final en curso o realizado.' });
     }
 
-    // Validar precondición: final_price >= commission > 0
+    // Recalcular pricing como en BookingScreen
+    // Determinar minutos: usar service_duration si existe; si no, derivar de start/end
+    const storedDurationMin = Number.isFinite(Number(booking.service_duration)) ? Number(booking.service_duration) : null;
+    let derivedMinutes = null;
+    try {
+      if (!storedDurationMin && booking.booking_start_datetime && booking.booking_end_datetime) {
+        const t0 = new Date(booking.booking_start_datetime);
+        const t1 = new Date(booking.booking_end_datetime);
+        if (!Number.isNaN(t0.getTime()) && !Number.isNaN(t1.getTime())) {
+          const diffMs = Math.max(0, t1.getTime() - t0.getTime());
+          derivedMinutes = Math.round(diffMs / 60000);
+        }
+      }
+    } catch (_) { /* noop safe derive */ }
+
+    const effectiveMinutes = storedDurationMin ?? derivedMinutes ?? 0;
+    const pricing = computePricing({ priceType: booking.price_type, unitPrice: booking.unit_price, durationMinutes: effectiveMinutes });
+
+    // Convertir a céntimos para comparar en entero
     finalCents = toCents(booking.final_price || 0);
-    const commissionRaw = toCents(booking.commission || 0);
-    commissionCents = Math.max(100, commissionRaw);
-    if (!(commissionCents > 0 && finalCents >= commissionCents)) {
-      await connection.rollback();
-      return res.status(412).json({ error: 'Precondición: final_price >= commission > 0 no cumplida.' });
+    commissionCents = Math.max(100, toCents(booking.commission || 0));
+    finalCalcCents = toCents(pricing.final || 0);
+    commissionCalcCents = Math.max(100, toCents(pricing.commission || 0));
+
+    // Elegir final y comisión a usar
+    const commissionMatches = commissionCents === commissionCalcCents;
+    const isBudget = String(booking.price_type || '').toLowerCase() === 'budget';
+    if (isBudget) {
+      // Para budget: usar el final de DB y calcular comisión sobre ese final (10% mín 1€)
+      finalChosenCents = finalCents;
+      const commissionFromFinalEuros = Math.max(1, round1((finalCents / 100) * 0.1));
+      commissionChosenCents = toCents(commissionFromFinalEuros);
+    } else {
+      // Resto: mantener final de DB y elegir comisión recalculada si difiere
+      finalChosenCents = finalCents;
+      commissionChosenCents = commissionMatches ? commissionCents : commissionCalcCents;
     }
 
-    amountToCharge = finalCents - commissionCents;
+    // Validar precondición con los elegidos
+    if (!(commissionChosenCents > 0 && finalChosenCents >= commissionChosenCents)) {
+      await connection.rollback();
+      return res.status(412).json({ error: 'Precondición: final >= commission > 0 no cumplida.' });
+    }
+
+    amountToCharge = finalChosenCents - commissionChosenCents;
     if (amountToCharge <= 0) {
       await connection.rollback();
       return res.status(400).json({ error: 'Importe inválido para el pago final.' });
@@ -3433,8 +3508,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       bookingId: id,
       type: 'final',
       amountCents: amountToCharge,
-      commissionSnapshotCents: commissionCents,
-      finalPriceSnapshotCents: finalCents,
+      commissionSnapshotCents: commissionChosenCents,
+      finalPriceSnapshotCents: finalChosenCents,
       status: 'creating',
     });
     payment = await getPaymentRow(connection, id, 'final');
@@ -3545,8 +3620,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         type: 'final',
         paymentIntentId: intent.id,
         amountCents: amountToCharge,
-        commissionSnapshotCents: commissionCents,
-        finalPriceSnapshotCents: finalCents,
+        commissionSnapshotCents: commissionChosenCents,
+        finalPriceSnapshotCents: finalChosenCents,
         status: mapStatus(intent.status),
         transferGroup,
         paymentMethodId: pmToUse,
@@ -3878,8 +3953,8 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.font('Inter-Bold').text('Issue date');
       doc.font('Inter').text(formatDate(now));
       doc.moveDown(0.4);
-      doc.font('Inter-Bold').text(invoiceType === 'deposit' ? 'Date of the transaction' : 'Date of the transaction (if different)');
-      doc.font('Inter').text(invoiceType === 'deposit' ? '—' : formatDate(data.booking_end_datetime || data.booking_start_datetime));
+      doc.font('Inter-Bold').text('Date of the transaction');
+      font('Inter').text(formatDate(now));
 
       doc.moveDown();
       doc.moveDown();
