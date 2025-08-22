@@ -3154,8 +3154,13 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     const [rows] = await connection.query(
       `
       SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status,
+             b.service_duration, b.booking_start_datetime, b.booking_end_datetime,
+             s.id AS service_id,
+             p.price AS unit_price, p.price_type,
              u.email AS customer_email, u.stripe_customer_id
       FROM booking b
+      JOIN service s ON b.service_id = s.id
+      JOIN price   p ON s.price_id = p.id
       JOIN user_account u ON b.user_id = u.id
       WHERE b.id = ? FOR UPDATE
       `,
@@ -3182,8 +3187,48 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'No autorizado' });
     }
 
-    const finalCentsSnapshot = toCents(booking.final_price || 0);
-    commissionCents = Math.max(100, toCents(booking.commission || 0));
+    // Helpers de redondeo como en el front
+    const round1 = (x) => Number((Math.round(Number(x) * 10) / 10).toFixed(1));
+    const round2 = (n) => {
+      const x = Number(n);
+      if (!Number.isFinite(x)) return 0;
+      return Math.round((x + Number.EPSILON) * 100) / 100;
+    };
+
+    // Duración efectiva
+    const storedDurationMin = Number.isFinite(Number(booking.service_duration)) ? Number(booking.service_duration) : null;
+    let derivedMinutes = null;
+    try {
+      if (!storedDurationMin && booking.booking_start_datetime && booking.booking_end_datetime) {
+        const t0 = new Date(booking.booking_start_datetime);
+        const t1 = new Date(booking.booking_end_datetime);
+        if (!Number.isNaN(t0.getTime()) && !Number.isNaN(t1.getTime())) {
+          derivedMinutes = Math.round(Math.max(0, t1.getTime() - t0.getTime()) / 60000);
+        }
+      }
+    } catch {}
+    const effectiveMinutes = storedDurationMin ?? derivedMinutes ?? 0;
+
+    // Pricing server-side
+    const priceType = String(booking.price_type || '').toLowerCase();
+    const unit = Number(booking.unit_price || 0);
+    const hours = effectiveMinutes / 60;
+    let base = 0;
+    if (priceType === 'hour') base = unit * hours;
+    else if (priceType === 'fix') base = unit;
+    base = round2(base);
+
+    const commissionEuros = (priceType === 'budget')
+      ? 1
+      : Math.max(1, round1(base * 0.1));
+
+    const finalEuros =
+      (priceType === 'budget' || (priceType === 'hour' && effectiveMinutes <= 0))
+        ? null
+        : round2(base + commissionEuros);
+
+    commissionCents = Math.max(100, toCents(commissionEuros || 0));
+    const finalCentsSnapshot = toCents(finalEuros || 0);
 
     // Garantiza Customer y persiste si no existe
     const customerId = await ensureStripeCustomerId(connection, {
@@ -3280,7 +3325,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
           'UPDATE booking SET booking_status = "requested" WHERE id = ?',
           [id]
         );
-      } else if (intent.status === 'canceled' || intent.status === 'requires_payment_method') {
+      } else if (intent.status === 'canceled') {
         await conn2.query(
           'UPDATE booking SET booking_status = "payment_failed" WHERE id = ? AND booking_status = "pending_deposit"',
           [id]
@@ -3311,6 +3356,13 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       transferGroup
     });
 
+    if (intent.status === 'requires_payment_method') {
+      return res.status(202).json({
+        requiresPaymentMethod: true,
+        clientSecret: intent.client_secret,
+        paymentIntentId: intent.id
+      });
+    }
     if (intent.status === 'requires_action') {
       return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
     }
@@ -3954,7 +4006,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       doc.font('Inter').text(formatDate(now));
       doc.moveDown(0.4);
       doc.font('Inter-Bold').text('Date of the transaction');
-      font('Inter').text(formatDate(now));
+      doc.font('Inter').text(formatDate(now));
 
       doc.moveDown();
       doc.moveDown();
