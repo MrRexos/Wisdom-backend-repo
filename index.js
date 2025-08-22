@@ -202,12 +202,12 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ON DUPLICATE KEY UPDATE
       amount_cents = VALUES(amount_cents),
-      commission_snapshot_cents = VALUES(commission_snapshot_cents),
-      final_price_snapshot_cents = VALUES(final_price_snapshot_cents),
+      commission_snapshot_cents = COALESCE(VALUES(commission_snapshot_cents), commission_snapshot_cents),
+      final_price_snapshot_cents = COALESCE(VALUES(final_price_snapshot_cents), final_price_snapshot_cents),
       status       = VALUES(status),
-      transfer_group = VALUES(transfer_group),
-      payment_method_id = VALUES(payment_method_id),
-      payment_method_last4 = VALUES(payment_method_last4)
+      transfer_group = COALESCE(VALUES(transfer_group), transfer_group),
+      payment_method_id = COALESCE(VALUES(payment_method_id), payment_method_id),
+      payment_method_last4 = COALESCE(VALUES(payment_method_last4), payment_method_last4)
   `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null]);
 }
 
@@ -3206,7 +3206,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
           derivedMinutes = Math.round(Math.max(0, t1.getTime() - t0.getTime()) / 60000);
         }
       }
-    } catch {}
+    } catch { }
     const effectiveMinutes = storedDurationMin ?? derivedMinutes ?? 0;
 
     // Pricing server-side
