@@ -2516,7 +2516,7 @@ app.post('/api/directions', (req, res) => {
           return res.status(500).json({ error: 'Error al insertar en directions.' });
         }
 
-        res.status(201).json({ message: 'Dirección añadida con éxito', directionsId: result.insertId });
+        res.status(201).json({ message: 'Dirección añadida con éxito', address_id: addressId });
       });
     });
   });
@@ -2600,7 +2600,7 @@ app.put('/api/address/:id', (req, res) => {
         return res.status(404).json({ error: 'Dirección no encontrada.' });
       }
 
-      res.status(200).json({ message: 'Dirección actualizada con éxito' });
+      res.status(200).json({ message: 'Dirección actualizada con éxito', address_id: Number(id) });
     });
   });
 });
