@@ -2818,7 +2818,7 @@ app.get('/api/bookings/:id', (req, res) => {
 // Actualizar una reserva
 app.put('/api/bookings/:id', (req, res) => {
   const { id } = req.params;
-  const { booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description } = req.body;
+  const { booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, address_id } = req.body;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2826,29 +2826,55 @@ app.put('/api/bookings/:id', (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const query = `
+    const queryWithAddress = `
+      UPDATE booking SET booking_start_datetime = ?, booking_end_datetime = ?, service_duration = ?, final_price = ?, commission = ?, description = ?, address_id = ?
+      WHERE id = ?
+    `;
+    const queryBase = `
       UPDATE booking SET booking_start_datetime = ?, booking_end_datetime = ?, service_duration = ?, final_price = ?, commission = ?, description = ?
       WHERE id = ?
     `;
 
-    const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, id];
+    if (typeof address_id !== 'undefined') {
+      connection.query('SELECT id FROM address WHERE id = ?', [address_id], (err, rows) => {
+        if (err) {
+          connection.release();
+          console.error('Error al validar address_id:', err);
+          return res.status(500).json({ error: 'Error al validar address_id.' });
+        }
+        if (!rows || rows.length === 0) {
+          connection.release();
+          return res.status(400).json({ error: 'address_id no existe.' });
+        }
 
-    connection.query(query, values, (err, result) => {
-      connection.release();
-      if (err) {
-        console.error('Error al actualizar la reserva:', err);
-        return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-      }
-
-      res.status(200).json({ message: 'Reserva actualizada con éxito' });
-    });
+        const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, address_id, id];
+        connection.query(queryWithAddress, values, (err, result) => {
+          connection.release();
+          if (err) {
+            console.error('Error al actualizar la reserva:', err);
+            return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+          }
+          res.status(200).json({ message: 'Reserva actualizada con éxito' });
+        });
+      });
+    } else {
+      const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, id];
+      connection.query(queryBase, values, (err, result) => {
+        connection.release();
+        if (err) {
+          console.error('Error al actualizar la reserva:', err);
+          return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+        }
+        res.status(200).json({ message: 'Reserva actualizada con éxito' });
+      });
+    }
   });
 });
 
 // Actualizar datos de una reserva
 app.patch('/api/bookings/:id/update-data', (req, res) => {
   const { id } = req.params;
-  const { status, is_paid, booking_end_datetime, service_duration, final_price, commission } = req.body;
+  const { status, is_paid, booking_end_datetime, service_duration, final_price, commission, address_id } = req.body;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2888,6 +2914,10 @@ app.patch('/api/bookings/:id/update-data', (req, res) => {
       fields.push('commission = ?');
       values.push(commission);
     }
+    if (typeof address_id !== 'undefined') {
+      fields.push('address_id = ?');
+      values.push(address_id);
+    }
 
     // Autocompletar fin  cuando se marque como completada
     if (typeof status !== 'undefined' && String(status).toLowerCase() === 'completed') {
@@ -2901,17 +2931,35 @@ app.patch('/api/bookings/:id/update-data', (req, res) => {
       return res.status(400).json({ error: 'No fields to update.' });
     }
 
-    const query = `UPDATE booking SET ${fields.join(', ')} WHERE id = ?`;
-    values.push(id);
+    const proceedUpdate = () => {
+      const query = `UPDATE booking SET ${fields.join(', ')} WHERE id = ?`;
+      values.push(id);
+      connection.query(query, values, (err, result) => {
+        connection.release();
+        if (err) {
+          console.error('Error al actualizar el estado de la reserva:', err);
+          return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+        }
+        res.status(200).json({ message: 'Estado actualizado' });
+      });
+    };
 
-    connection.query(query, values, (err, result) => {
-      connection.release();
-      if (err) {
-        console.error('Error al actualizar el estado de la reserva:', err);
-        return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-      }
-      res.status(200).json({ message: 'Estado actualizado' });
-    });
+    if (typeof address_id !== 'undefined') {
+      connection.query('SELECT id FROM address WHERE id = ?', [address_id], (err, rows) => {
+        if (err) {
+          connection.release();
+          console.error('Error al validar address_id:', err);
+          return res.status(500).json({ error: 'Error al validar address_id.' });
+        }
+        if (!rows || rows.length === 0) {
+          connection.release();
+          return res.status(400).json({ error: 'address_id no existe.' });
+        }
+        proceedUpdate();
+      });
+    } else {
+      proceedUpdate();
+    }
   });
 });
 
