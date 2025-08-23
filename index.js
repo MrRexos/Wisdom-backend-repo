@@ -2818,7 +2818,7 @@ app.get('/api/bookings/:id', (req, res) => {
 // Actualizar una reserva
 app.put('/api/bookings/:id', (req, res) => {
   const { id } = req.params;
-  const {
+  let {
     booking_start_datetime,
     booking_end_datetime,
     service_duration,
@@ -2827,6 +2827,11 @@ app.put('/api/bookings/:id', (req, res) => {
     description,
     address_id
   } = req.body;
+
+  // Normaliza posibles valores del front
+  if (Object.prototype.hasOwnProperty.call(req.body, 'address_id')) {
+    if (address_id === 'null' || address_id === '') address_id = null;
+  }
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2849,16 +2854,15 @@ app.put('/api/bookings/:id', (req, res) => {
       description
     ];
 
-    // Solo tocar commission si viene en el body
     if (Object.prototype.hasOwnProperty.call(req.body, 'commission')) {
       setParts.push('commission = ?');
       values.push(commission);
     }
 
-    // Solo tocar address_id si viene en el body
-    if (typeof address_id !== 'undefined') {
+    // Si viene address_id en el body, lo actualizamos (puede ser null)
+    if (Object.prototype.hasOwnProperty.call(req.body, 'address_id')) {
       setParts.push('address_id = ?');
-      values.push(address_id);
+      values.push(address_id); // <-- puede ser null y MySQL lo guardará como NULL
     }
 
     const runUpdate = () => {
@@ -2873,7 +2877,8 @@ app.put('/api/bookings/:id', (req, res) => {
       });
     };
 
-    if (typeof address_id !== 'undefined') {
+    // Solo validamos contra address si address_id NO es null
+    if (Object.prototype.hasOwnProperty.call(req.body, 'address_id') && address_id !== null) {
       connection.query('SELECT id FROM address WHERE id = ?', [address_id], (err3, rows) => {
         if (err3) {
           connection.release();
@@ -2887,6 +2892,7 @@ app.put('/api/bookings/:id', (req, res) => {
         runUpdate();
       });
     } else {
+      // address_id no viene o es null => no validar, solo actualizar (quedará a NULL si lo pasaste)
       runUpdate();
     }
   });
