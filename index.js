@@ -2818,7 +2818,15 @@ app.get('/api/bookings/:id', (req, res) => {
 // Actualizar una reserva
 app.put('/api/bookings/:id', (req, res) => {
   const { id } = req.params;
-  const { booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, address_id } = req.body;
+  const {
+    booking_start_datetime,
+    booking_end_datetime,
+    service_duration,
+    final_price,
+    commission,
+    description,
+    address_id
+  } = req.body;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2826,47 +2834,60 @@ app.put('/api/bookings/:id', (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const queryWithAddress = `
-      UPDATE booking SET booking_start_datetime = ?, booking_end_datetime = ?, service_duration = ?, final_price = ?, commission = ?, description = ?, address_id = ?
-      WHERE id = ?
-    `;
-    const queryBase = `
-      UPDATE booking SET booking_start_datetime = ?, booking_end_datetime = ?, service_duration = ?, final_price = ?, commission = ?, description = ?
-      WHERE id = ?
-    `;
+    const setParts = [
+      'booking_start_datetime = ?',
+      'booking_end_datetime = ?',
+      'service_duration = ?',
+      'final_price = ?',
+      'description = ?'
+    ];
+    const values = [
+      booking_start_datetime,
+      booking_end_datetime,
+      service_duration,
+      final_price,
+      description
+    ];
+
+    // Solo tocar commission si viene en el body
+    if (Object.prototype.hasOwnProperty.call(req.body, 'commission')) {
+      setParts.push('commission = ?');
+      values.push(commission);
+    }
+
+    // Solo tocar address_id si viene en el body
+    if (typeof address_id !== 'undefined') {
+      setParts.push('address_id = ?');
+      values.push(address_id);
+    }
+
+    const runUpdate = () => {
+      const sql = `UPDATE booking SET ${setParts.join(', ')} WHERE id = ?`;
+      connection.query(sql, [...values, id], (err2) => {
+        connection.release();
+        if (err2) {
+          console.error('Error al actualizar la reserva:', err2);
+          return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+        }
+        res.status(200).json({ message: 'Reserva actualizada con éxito' });
+      });
+    };
 
     if (typeof address_id !== 'undefined') {
-      connection.query('SELECT id FROM address WHERE id = ?', [address_id], (err, rows) => {
-        if (err) {
+      connection.query('SELECT id FROM address WHERE id = ?', [address_id], (err3, rows) => {
+        if (err3) {
           connection.release();
-          console.error('Error al validar address_id:', err);
+          console.error('Error al validar address_id:', err3);
           return res.status(500).json({ error: 'Error al validar address_id.' });
         }
         if (!rows || rows.length === 0) {
           connection.release();
           return res.status(400).json({ error: 'address_id no existe.' });
         }
-
-        const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, address_id, id];
-        connection.query(queryWithAddress, values, (err, result) => {
-          connection.release();
-          if (err) {
-            console.error('Error al actualizar la reserva:', err);
-            return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-          }
-          res.status(200).json({ message: 'Reserva actualizada con éxito' });
-        });
+        runUpdate();
       });
     } else {
-      const values = [booking_start_datetime, booking_end_datetime, service_duration, final_price, commission, description, id];
-      connection.query(queryBase, values, (err, result) => {
-        connection.release();
-        if (err) {
-          console.error('Error al actualizar la reserva:', err);
-          return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-        }
-        res.status(200).json({ message: 'Reserva actualizada con éxito' });
-      });
+      runUpdate();
     }
   });
 });
