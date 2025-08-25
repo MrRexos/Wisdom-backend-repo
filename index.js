@@ -3608,7 +3608,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     const commissionMatches = commissionCents === commissionCalcCents;
     const isBudget = String(booking.price_type || '').toLowerCase() === 'budget';
     if (isBudget) {
-      // Para budget: usar el final de DB y calcular comisión sobre ese final (10% mín 1€)
+      // Para budget exclusivamente: el final_price de DB es el precio base y calcular comisión sobre esa base (10% mín 1€)
       finalChosenCents = finalCents;
       const commissionFromFinalEuros = Math.max(1, round1((finalCents / 100) * 0.1));
       commissionChosenCents = toCents(commissionFromFinalEuros);
@@ -3619,12 +3619,14 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     }
 
     // Validar precondición con los elegidos
-    if (!(commissionChosenCents > 0 && finalChosenCents >= commissionChosenCents)) {
+    if (!(commissionChosenCents > 0)) {
       await connection.rollback();
-      return res.status(412).json({ error: 'Precondición: final >= commission > 0 no cumplida.' });
+      return res.status(412).json({ error: 'Precondición: commission > 0 no cumplida.' });
     }
 
-    amountToCharge = finalChosenCents - commissionChosenCents;
+    //!ESTO EN UN FUTURO SE DEBE CAMBIAR POR UNA COMISION EXTRA DE WISDOM O DEBULUCION DE PARTE DE LA COMISION (amountToCharge incluira diferencia entre new comision y old comision)
+    amountToCharge = isBudget ? finalChosenCents : (finalChosenCents - commissionChosenCents);
+    
     if (amountToCharge <= 0) {
       await connection.rollback();
       return res.status(400).json({ error: 'Importe inválido para el pago final.' });
