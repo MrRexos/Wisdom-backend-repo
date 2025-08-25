@@ -3626,7 +3626,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
 
     //!ESTO EN UN FUTURO SE DEBE CAMBIAR POR UNA COMISION EXTRA DE WISDOM O DEBULUCION DE PARTE DE LA COMISION (amountToCharge incluira diferencia entre new comision y old comision)
     amountToCharge = isBudget ? finalChosenCents : (finalChosenCents - commissionChosenCents);
-    
+
     if (amountToCharge <= 0) {
       await connection.rollback();
       return res.status(400).json({ error: 'Importe inválido para el pago final.' });
@@ -3655,20 +3655,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       return res.status(412).json({ error: 'La cuenta conectada no está lista para cobrar y transferir.' });
     }
 
-    // Determinar PM a usar: preferir el guardado del depósito si existe
-    const connPM = await pool.promise().getConnection();
-    let savedPmId = null;
-    try {
-      const [[pmRow]] = await connPM.query(
-        `SELECT payment_method_id FROM payments WHERE booking_id = ? AND type='deposit' AND status='succeeded' ORDER BY id DESC LIMIT 1`,
-        [id]
-      );
-      savedPmId = pmRow?.payment_method_id || null;
-    } finally {
-      connPM.release();
-    }
-
-    const pmToUse = savedPmId || payment_method_id || null;
+    // Determinar PM a usar: requiere pago explícito desde Booking Details (independiente del depósito)
+    const pmToUse = payment_method_id || null;
     if (!pmToUse) {
       return res.status(400).json({ error: 'No hay método de pago disponible. Proporcione payment_method_id.' });
     }
