@@ -3570,14 +3570,108 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       return res.status(412).json({ error: 'Depósito no confirmado (requerido).' });
     }
 
-    // Bloquear segundo cobro final si ya hay uno en curso o realizado (incluye requires_action)
+    // Comprobar si ya hay cobro final existente en curso o realizado y devolver la info útil en vez de 409
     const [existingFinal] = await connection.query(
-      `SELECT id, status FROM payments WHERE booking_id = ? AND type = 'final' AND status IN ('requires_action','processing','succeeded') LIMIT 1 FOR UPDATE`,
+      `SELECT id, status, payment_intent_id
+      FROM payments
+      WHERE booking_id = ? AND type = 'final'
+        AND status IN ('requires_payment_method','requires_action','processing','succeeded')
+      LIMIT 1 FOR UPDATE`,
       [id]
     );
     if (existingFinal.length > 0) {
-      await connection.rollback();
-      return res.status(409).json({ error: 'Ya existe un cobro final en curso o realizado.' });
+      const row = existingFinal[0];
+      // Ya no necesitamos seguir con la transacción de nuevo cobro
+      await connection.commit();
+
+      try {
+        let intent = null;
+        if (row.payment_intent_id) {
+          intent = await stripe.paymentIntents.retrieve(row.payment_intent_id, {
+            expand: ['payment_method', 'latest_charge.payment_method_details'],
+          });
+        }
+        const status = intent ? intent.status : row.status;
+
+        // Si falta método de pago y el cliente lo envía ahora, adjuntarlo y confirmar
+        if (intent && status === 'requires_payment_method' && req.body?.payment_method_id) {
+          const pmId = req.body.payment_method_id;
+          try {
+            // Adjuntar PM al customer si viene suelto
+            let pm2 = await stripe.paymentMethods.retrieve(pmId);
+            if (pm2.customer && pm2.customer !== customerId) {
+              return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
+            }
+            if (!pm2.customer) {
+              try {
+                pm2 = await stripe.paymentMethods.attach(pmId, { customer: customerId });
+              } catch (e1) {
+                console.error('No se pudo adjuntar el PM al customer:', e1);
+                return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
+              }
+            }
+
+            await stripe.paymentIntents.update(intent.id, { payment_method: pmId, customer: customerId });
+            intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
+
+            const last4 =
+              intent?.payment_method?.card?.last4 ||
+              intent?.latest_charge?.payment_method_details?.card?.last4 ||
+              null;
+
+            const conn3 = await pool.promise().getConnection();
+            try {
+              await conn3.beginTransaction();
+              await upsertPayment(conn3, {
+                bookingId: id,
+                type: 'final',
+                paymentIntentId: intent.id,
+                amountCents: intent.amount,
+                commissionSnapshotCents: null,
+                finalPriceSnapshotCents: null,
+                status: mapStatus(intent.status),
+                transferGroup: intent.transfer_group || null,
+                paymentMethodId: pmId,
+                paymentMethodLast4: last4 || null,
+              });
+              await conn3.commit();
+            } catch (e2) {
+              try { await conn3.rollback(); } catch { }
+              console.error('No se pudo actualizar payment_method en BD para intent existente:', e2);
+            } finally {
+              conn3.release();
+            }
+
+            if (intent.status === 'succeeded') {
+              return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
+            }
+            if (intent.status === 'requires_action') {
+              return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+            }
+            if (intent.status === 'processing') {
+              return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+            }
+          } catch (e1) {
+            console.error('Error al adjuntar/confirmar PM en intent existente:', e1);
+            // Continúa con el manejo estándar según estado actual
+          }
+        }
+
+        if (status === 'succeeded') {
+          return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent?.id || row.payment_intent_id });
+        }
+        if (status === 'requires_action' && intent) {
+          return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+        }
+        if (status === 'processing') {
+          return res.status(202).json({ processing: true, paymentIntentId: intent?.id || row.payment_intent_id });
+        }
+        // Fallback: si llega aquí, informar del estado actual
+        return res.status(409).json({ error: 'Ya existe un cobro final en curso o realizado.', status, paymentIntentId: row.payment_intent_id });
+      } catch (e) {
+        console.error('Error recuperando PaymentIntent existente:', e);
+        return res.status(409).json({ error: 'Cobro final existente no recuperable', status: row.status, paymentIntentId: row.payment_intent_id });
+      }
     }
 
     // Recalcular pricing como en BookingScreen
@@ -3655,16 +3749,26 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       return res.status(412).json({ error: 'La cuenta conectada no está lista para cobrar y transferir.' });
     }
 
-    // Determinar PM a usar: requiere pago explícito desde Booking Details (independiente del depósito)
+    // Determinar PM a usar
     const pmToUse = payment_method_id || null;
     if (!pmToUse) {
       return res.status(400).json({ error: 'No hay método de pago disponible. Proporcione payment_method_id.' });
     }
 
-    // Validar que el PM pertenece al customer
-    const pm = await stripe.paymentMethods.retrieve(pmToUse);
-    if (pm.customer !== customerId) {
-      return res.status(409).json({ error: 'payment_method_id no pertenece al customer de la reserva.' });
+    // Recuperar y adjuntar si es necesario
+    let pm = await stripe.paymentMethods.retrieve(pmToUse);
+
+    if (pm.customer && pm.customer !== customerId) {
+      return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
+    }
+
+    if (!pm.customer) {
+      try {
+        pm = await stripe.paymentMethods.attach(pmToUse, { customer: customerId });
+      } catch (e) {
+        console.error('No se pudo adjuntar el PM al customer:', e);
+        return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
+      }
     }
 
     // Stripe fuera de transacción: crear/confirmar Intent
