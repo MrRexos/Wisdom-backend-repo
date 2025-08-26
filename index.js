@@ -3592,6 +3592,105 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
             expand: ['payment_method', 'latest_charge.payment_method_details'],
           });
         }
+
+        // Si no hay intent recuperable, intenta crearlo de nuevo usando los snapshots ya guardados
+        if (!intent) {
+          // Obtener snapshots ya guardados para este pago final
+          const [paySnapRows] = await connection.query(
+            `SELECT id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, transfer_group
+             FROM payments
+             WHERE id = ? AND booking_id = ? AND type = 'final'
+             LIMIT 1`,
+            [row.id, id]
+          );
+          const paySnap = paySnapRows && paySnapRows[0];
+          const amountEnsure = paySnap?.amount_cents || 0;
+          const transferGroupEnsure = paySnap?.transfer_group || `booking-${id}`;
+
+          if (amountEnsure > 0) {
+            const pmIdBody = req.body?.payment_method_id || null;
+            const idemEnsureParts = ['payment', String(row.id), pmIdBody ? String(pmIdBody) : 'ensure'];
+            const idemEnsure = stableKey(idemEnsureParts);
+
+            if (pmIdBody) {
+              // Adjuntar PM si es necesario
+              let pm2 = await stripe.paymentMethods.retrieve(pmIdBody);
+              if (pm2.customer && pm2.customer !== customerId) {
+                return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
+              }
+              if (!pm2.customer) {
+                try {
+                  pm2 = await stripe.paymentMethods.attach(pmIdBody, { customer: customerId });
+                } catch (eAttach) {
+                  console.error('No se pudo adjuntar el PM al customer (ensure):', eAttach);
+                  return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
+                }
+              }
+
+              intent = await stripe.paymentIntents.create(
+                {
+                  amount: amountEnsure,
+                  currency: 'eur',
+                  customer: customerId,
+                  payment_method: pmIdBody,
+                  confirm: true,
+                  off_session: true,
+                  receipt_email: booking.customer_email || undefined,
+                  automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+                  transfer_data: { destination: booking.stripe_account_id },
+                  on_behalf_of: booking.stripe_account_id,
+                  transfer_group: transferGroupEnsure,
+                  metadata: { booking_id: String(id), type: 'final' },
+                },
+                { idempotencyKey: idemEnsure }
+              );
+            } else {
+              // Crear intent sin PM para devolver clientSecret y confirmar en el cliente
+              intent = await stripe.paymentIntents.create(
+                {
+                  amount: amountEnsure,
+                  currency: 'eur',
+                  customer: customerId,
+                  receipt_email: booking.customer_email || undefined,
+                  automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+                  transfer_data: { destination: booking.stripe_account_id },
+                  on_behalf_of: booking.stripe_account_id,
+                  transfer_group: transferGroupEnsure,
+                  metadata: { booking_id: String(id), type: 'final' },
+                },
+                { idempotencyKey: idemEnsure }
+              );
+            }
+
+            // Guardar el intent recién creado
+            const last4Ensure =
+              intent?.payment_method?.card?.last4 ||
+              intent?.latest_charge?.payment_method_details?.card?.last4 ||
+              null;
+            const connEnsure = await pool.promise().getConnection();
+            try {
+              await connEnsure.beginTransaction();
+              await upsertPayment(connEnsure, {
+                bookingId: id,
+                type: 'final',
+                paymentIntentId: intent.id,
+                amountCents: amountEnsure,
+                commissionSnapshotCents: paySnap?.commission_snapshot_cents ?? null,
+                finalPriceSnapshotCents: paySnap?.final_price_snapshot_cents ?? null,
+                status: mapStatus(intent.status),
+                transferGroup: transferGroupEnsure,
+                paymentMethodId: req.body?.payment_method_id || null,
+                paymentMethodLast4: last4Ensure || null,
+              });
+              await connEnsure.commit();
+            } catch (eEns) {
+              try { await connEnsure.rollback(); } catch { }
+              console.error('Error guardando PaymentIntent re-creado (ensure):', eEns);
+            } finally {
+              connEnsure.release();
+            }
+          }
+        }
         const status = intent ? intent.status : row.status;
 
         // Si falta método de pago y el cliente lo envía ahora, adjuntarlo y confirmar
@@ -3666,8 +3765,12 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         if (status === 'succeeded') {
           return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent?.id || row.payment_intent_id });
         }
-        if (status === 'requires_action' && intent) {
-          return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+        if (status === 'requires_action') {
+          if (intent) {
+            return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+          }
+          // Si no tenemos el intent pero el estado indica requires_action, devuelve 409 con instrucción mínima
+          return res.status(409).json({ error: 'Intent existente requiere acción pero no es recuperable. Reintenta y captura clientSecret.', status, paymentIntentId: row.payment_intent_id });
         }
         if (status === 'processing') {
           return res.status(202).json({ processing: true, paymentIntentId: intent?.id || row.payment_intent_id });
