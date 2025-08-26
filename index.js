@@ -3327,7 +3327,8 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
 
     // A partir de aquí, fuera de transacción
     const transferGroup = `booking-${id}`;
-    const idemKey = stableKey(['payment', payment.id]);
+    // Clave de idempotencia sensible al importe para evitar conflictos si varía la comisión/importe entre intentos
+    const idemKey = stableKey(['payment', String(payment.id), 'amt', String(commissionCents)]);
 
     let intent;
     try {
@@ -3773,7 +3774,10 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
 
     // Stripe fuera de transacción: crear/confirmar Intent
     const transferGroup = `booking-${id}`;
-    const idemKey = stableKey(['payment', payment.id]);
+    // Usar una clave de idempotencia que incluya el método de pago para permitir cambiar de tarjeta sin conflicto
+    const idemKeyParts = ['payment', String(payment.id)];
+    if (pmToUse) idemKeyParts.push(String(pmToUse));
+    const idemKey = stableKey(idemKeyParts);
 
     let intent;
     try {
@@ -3850,7 +3854,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           });
           await connErr.commit();
         } catch (e2) {
-          try { await connErr.rollback(); } catch {}
+          try { await connErr.rollback(); } catch { }
           console.error('No se pudo persistir el PaymentIntent tras error:', e2);
         } finally {
           connErr.release();
