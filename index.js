@@ -3658,6 +3658,11 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           }
         }
 
+        // Si ya existe un intent y está esperando método de pago, devuelve el clientSecret para confirmarlo en el cliente
+        if (intent && status === 'requires_payment_method') {
+          return res.status(202).json({ requiresPaymentMethod: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+        }
+
         if (status === 'succeeded') {
           return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent?.id || row.payment_intent_id });
         }
