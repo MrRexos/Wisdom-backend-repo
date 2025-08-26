@@ -201,6 +201,7 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
     INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, transfer_group, payment_method_id, payment_method_last4, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ON DUPLICATE KEY UPDATE
+      payment_intent_id = VALUES(payment_intent_id),
       amount_cents = VALUES(amount_cents),
       commission_snapshot_cents = COALESCE(VALUES(commission_snapshot_cents), commission_snapshot_cents),
       final_price_snapshot_cents = COALESCE(VALUES(final_price_snapshot_cents), final_price_snapshot_cents),
