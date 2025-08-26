@@ -3824,7 +3824,62 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           destination: booking.stripe_account_id,
         },
       });
-      throw stripeError;
+
+      // Si Stripe ya creó un PaymentIntent, persistirlo para reutilizarlo en el siguiente intento
+      const pi = stripeError?.payment_intent || stripeError?.raw?.payment_intent || null;
+      if (pi && pi.id) {
+        const last4Err =
+          pi?.payment_method?.card?.last4 ||
+          pi?.last_payment_error?.payment_method?.card?.last4 ||
+          null;
+
+        const connErr = await pool.promise().getConnection();
+        try {
+          await connErr.beginTransaction();
+          await upsertPayment(connErr, {
+            bookingId: id,
+            type: 'final',
+            paymentIntentId: pi.id,
+            amountCents: amountToCharge,
+            commissionSnapshotCents: commissionChosenCents,
+            finalPriceSnapshotCents: finalChosenCents,
+            status: mapStatus(pi.status),
+            transferGroup,
+            paymentMethodId: pmToUse,
+            paymentMethodLast4: last4Err || null,
+          });
+          await connErr.commit();
+        } catch (e2) {
+          try { await connErr.rollback(); } catch {}
+          console.error('No se pudo persistir el PaymentIntent tras error:', e2);
+        } finally {
+          connErr.release();
+        }
+
+        // Responder acorde al estado del intent para guiar al frontend
+        if (pi.status === 'requires_action') {
+          return res.status(202).json({
+            requiresAction: true,
+            clientSecret: pi.client_secret,
+            paymentIntentId: pi.id
+          });
+        }
+        if (pi.status === 'requires_payment_method') {
+          return res.status(402).json({
+            requiresPaymentMethod: true,
+            paymentIntentId: pi.id
+          });
+        }
+      }
+
+      // Si el conflicto es puramente de idempotencia, indícalo de forma explícita
+      if (stripeError?.type === 'idempotency_error') {
+        return res.status(409).json({
+          error: 'Conflicto de idempotencia: ya existe una operación con esa clave. Reintenta reutilizando el PaymentIntent guardado si está disponible.'
+        });
+      }
+
+      return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
     }
 
     const last4 =
