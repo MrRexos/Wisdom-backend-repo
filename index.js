@@ -196,10 +196,10 @@ async function upsertPaymentRow(conn, { bookingId, type, amountCents, commission
 }
 
 // UPSERT helper para la tabla payments
-async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, transferGroup, paymentMethodId, paymentMethodLast4 }) {
+async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, transferGroup, paymentMethodId, paymentMethodLast4, lastErrorCode, lastErrorMessage }) {
   await conn.query(`
-    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, transfer_group, payment_method_id, payment_method_last4, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, transfer_group, payment_method_id, payment_method_last4, last_error_code, last_error_message, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ON DUPLICATE KEY UPDATE
       payment_intent_id = VALUES(payment_intent_id),
       amount_cents = VALUES(amount_cents),
@@ -208,8 +208,10 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
       status       = VALUES(status),
       transfer_group = COALESCE(VALUES(transfer_group), transfer_group),
       payment_method_id = COALESCE(VALUES(payment_method_id), payment_method_id),
-      payment_method_last4 = COALESCE(VALUES(payment_method_last4), payment_method_last4)
-  `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null]);
+      payment_method_last4 = COALESCE(VALUES(payment_method_last4), payment_method_last4),
+      last_error_code = VALUES(last_error_code),
+      last_error_message = VALUES(last_error_message)
+  `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null, lastErrorCode ?? null, lastErrorMessage ?? null]);
 }
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
@@ -3211,12 +3213,14 @@ app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, re
 app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
+  const { payment_method_id } = req.body;
 
   console.log('Iniciando proceso de depósito:', {
     bookingId: id,
     userId: req.user?.id,
     userRole: req.user?.role,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    paymentMethodId: payment_method_id || null
   });
 
   let booking;
@@ -3329,29 +3333,78 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     // A partir de aquí, fuera de transacción
     const transferGroup = `booking-${id}`;
     // Clave de idempotencia sensible al importe para evitar conflictos si varía la comisión/importe entre intentos
-    const idemKey = stableKey(['payment', String(payment.id), 'amt', String(commissionCents)]);
+    const idemParts = ['payment', String(payment.id), 'amt', String(commissionCents)];
+    if (payment_method_id) idemParts.push('pm', String(payment_method_id)); 
+    const idemKey = stableKey(idemParts);
 
     let intent;
+
     try {
       if (payment.payment_intent_id) {
+        // Recuperar intent existente
         intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
           expand: ['payment_method', 'latest_charge.payment_method_details'],
         });
+
+        // Si falta método de pago y el cliente nos envía uno ahora, adjuntarlo y confirmar en servidor
+        if (intent.status === 'requires_payment_method' && payment_method_id) {
+          let pm = await stripe.paymentMethods.retrieve(payment_method_id);
+          if (pm.customer && pm.customer !== customerId) {
+            return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
+          }
+          if (!pm.customer) {
+            try {
+              pm = await stripe.paymentMethods.attach(payment_method_id, { customer: customerId });
+            } catch (eAttach) {
+              console.error('No se pudo adjuntar el PM al customer (depósito):', eAttach);
+              return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
+            }
+          }
+          await stripe.paymentIntents.update(intent.id, { payment_method: payment_method_id, customer: customerId });
+          intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
+        }
       } else {
-        intent = await stripe.paymentIntents.create(
-          {
-            amount: commissionCents,
-            currency: 'eur',
-            customer: customerId,
-            setup_future_usage: 'off_session',
-            receipt_email: booking.customer_email || undefined,
-            automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-            transfer_group: transferGroup,
-            metadata: { booking_id: String(id), type: 'deposit' },
-          },
-          { idempotencyKey: idemKey }
-        );
+        // Crear intent nuevo: si traen PM, confirmar server-side; si no, devolver client_secret para confirmar en el cliente
+        if (payment_method_id) {
+          intent = await stripe.paymentIntents.create(
+            {
+              amount: commissionCents,
+              currency: 'eur',
+              customer: customerId,
+              payment_method: payment_method_id,
+              confirm: true,
+              off_session: true,
+              receipt_email: booking.customer_email || undefined,
+              automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+              transfer_group: transferGroup,
+              setup_future_usage: 'off_session',
+              metadata: { booking_id: String(id), type: 'deposit' },
+            },
+            { idempotencyKey: idemKey }
+          );
+        } else {
+          intent = await stripe.paymentIntents.create(
+            {
+              amount: commissionCents,
+              currency: 'eur',
+              customer: customerId,
+              setup_future_usage: 'off_session',
+              receipt_email: booking.customer_email || undefined,
+              automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+              transfer_group: transferGroup,
+              metadata: { booking_id: String(id), type: 'deposit' },
+            },
+            { idempotencyKey: idemKey }
+          );
+        }
       }
+      // Asegura expansión para capturar last4 y errores
+      if (!intent.payment_method || !intent.latest_charge) {
+        intent = await stripe.paymentIntents.retrieve(intent.id, {
+          expand: ['payment_method', 'latest_charge.payment_method_details'],
+        });
+      }
+
     } catch (stripeError) {
       console.error('Error de Stripe al crear/recuperar PaymentIntent:', {
         bookingId: id,
@@ -3372,15 +3425,67 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         }
       });
 
-      throw stripeError; // Re-lanzar para que sea capturado por el catch principal
+      // Si Stripe devolvió un PaymentIntent parcial, persistirlo y guiar al frontend
+      const pi = stripeError?.payment_intent || stripeError?.raw?.payment_intent || null;
+      if (pi && pi.id) {
+        const last4Err =
+          pi?.payment_method?.card?.last4 ||
+          pi?.last_payment_error?.payment_method?.card?.last4 ||
+          null;
+        const lastErrorCode = pi?.last_payment_error?.code || pi?.last_payment_error?.decline_code || null;
+        const lastErrorMessage = pi?.last_payment_error?.message || null;
+
+        const connErr = await pool.promise().getConnection();
+        try {
+          await connErr.beginTransaction();
+          await upsertPayment(connErr, {
+            bookingId: id,
+            type: 'deposit',
+            paymentIntentId: pi.id,
+            amountCents: commissionCents,
+            commissionSnapshotCents: commissionCents,
+            finalPriceSnapshotCents: finalCentsSnapshot,
+            status: mapStatus(pi.status),
+            transferGroup,
+            paymentMethodId: payment_method_id || pi?.payment_method || null,
+            paymentMethodLast4: last4Err || null,
+            lastErrorCode,
+            lastErrorMessage,
+          });
+          await connErr.commit();
+        } catch (e2) {
+          try { await connErr.rollback(); } catch { }
+          console.error('No se pudo persistir el PaymentIntent (depósito) tras error:', e2);
+        } finally {
+          connErr.release();
+        }
+
+        if (pi.status === 'requires_action') {
+          return res.status(202).json({ requiresAction: true, clientSecret: pi.client_secret, paymentIntentId: pi.id });
+        }
+        if (pi.status === 'requires_payment_method') {
+          return res.status(202).json({ requiresPaymentMethod: true, clientSecret: pi.client_secret, paymentIntentId: pi.id });
+        }
+      }
+
+      // Si el conflicto es de idempotencia, devolver 409 específico
+      if (stripeError?.type === 'idempotency_error') {
+        return res.status(409).json({ error: 'Conflicto de idempotencia en depósito.' });
+      }
+
+      return res.status(400).json({ error: 'No se pudo crear el depósito.' });
     }
 
     // Persistir intent/estado + transfer_group + PM last4 si disponible
-    const pmId = intent.payment_method ?? intent?.latest_charge?.payment_method;
+    const pmId = intent.payment_method ?? intent?.latest_charge?.payment_method ?? payment_method_id ?? null;
+    
     const last4 =
       intent?.payment_method?.card?.last4 ||
       intent?.latest_charge?.payment_method_details?.card?.last4 ||
       null;
+    const lastErrObj = intent?.last_payment_error || intent?.latest_charge?.last_payment_error || null;
+    const lastErrorCode = lastErrObj?.code || lastErrObj?.decline_code || null;
+    const lastErrorMessage = lastErrObj?.message || null;
 
     const conn2 = await pool.promise().getConnection();
     try {
@@ -3396,6 +3501,8 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         transferGroup,
         paymentMethodId: pmId || null,
         paymentMethodLast4: last4 || null,
+        lastErrorCode: lastErrorCode,
+        lastErrorMessage: lastErrorMessage,
       });
       if (intent.status === 'succeeded') {
         await conn2.query(
@@ -3917,6 +4024,10 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           { idempotencyKey: idemKey }
         );
       }
+      // Asegura expansión para capturar last4 y errores
+      if (!intent.payment_method || !intent.latest_charge) {
+        intent = await stripe.paymentIntents.retrieve(intent.id, { expand: ['payment_method', 'latest_charge.payment_method_details'] });
+      }
     } catch (stripeError) {
       console.error('Error de Stripe al crear/recuperar PaymentIntent (pago final):', {
         bookingId: id,
@@ -3945,6 +4056,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           pi?.payment_method?.card?.last4 ||
           pi?.last_payment_error?.payment_method?.card?.last4 ||
           null;
+        const lastErrorCode = pi?.last_payment_error?.code || pi?.last_payment_error?.decline_code || null;
+        const lastErrorMessage = pi?.last_payment_error?.message || null;
 
         const connErr = await pool.promise().getConnection();
         try {
@@ -3960,6 +4073,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
             transferGroup,
             paymentMethodId: pmToUse,
             paymentMethodLast4: last4Err || null,
+            lastErrorCode: lastErrorCode,
+            lastErrorMessage: lastErrorMessage,
           });
           await connErr.commit();
         } catch (e2) {
@@ -3999,6 +4114,9 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       intent?.payment_method?.card?.last4 ||
       intent?.latest_charge?.payment_method_details?.card?.last4 ||
       null;
+    const lastErrObj = intent?.last_payment_error || intent?.latest_charge?.last_payment_error || null;
+    const lastErrorCode = lastErrObj?.code || lastErrObj?.decline_code || null;
+    const lastErrorMessage = lastErrObj?.message || null;
 
     // Persistir intent/estado + snapshots + transfer_group + PM last4
     const conn2 = await pool.promise().getConnection();
@@ -4015,6 +4133,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         transferGroup,
         paymentMethodId: pmToUse,
         paymentMethodLast4: last4 || null,
+        lastErrorCode: lastErrorCode,
+        lastErrorMessage: lastErrorMessage,
       });
       await conn2.commit();
     } catch (e) {
