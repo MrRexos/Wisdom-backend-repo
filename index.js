@@ -3606,7 +3606,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   }
 });
 
-// Cargo final (destination charge) - FALTA COMISION EXTRA DE WISDOM SI VARIA PRECIO FINAL
+// Cargo final (destination charge) - FALTA COMISION EXTRA DE WISDOM SI VARIA PRECIO FINAL 
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
