@@ -3887,11 +3887,20 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent?.id || row.payment_intent_id });
         }
         if (status === 'requires_action') {
-          if (intent) {
-            return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+          try {
+            const pi = await stripe.paymentIntents.retrieve(row.payment_intent_id);
+            return res.status(202).json({
+              requiresAction: true,
+              clientSecret: pi.client_secret,
+              paymentIntentId: pi.id
+            });
+          } catch (e) {
+            // Fallback: devuelve estado recuperable (el front podrá hacer un GET de rescate si quieres)
+            return res.status(202).json({
+              requiresAction: true,
+              paymentIntentId: row.payment_intent_id
+            });
           }
-          // Si no tenemos el intent pero el estado indica requires_action, devuelve 409 con instrucción mínima
-          return res.status(409).json({ error: 'Intent existente requiere acción pero no es recuperable. Reintenta y captura clientSecret.', status, paymentIntentId: row.payment_intent_id });
         }
         if (status === 'processing') {
           return res.status(202).json({ processing: true, paymentIntentId: intent?.id || row.payment_intent_id });
