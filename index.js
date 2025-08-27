@@ -180,7 +180,13 @@ async function ensureStripeCustomerId(conn, { userId, email }) {
 
 async function getPaymentRow(conn, bookingId, type) {
   const [rows] = await conn.query(
-    'SELECT id, booking_id, type, payment_intent_id, amount_cents, status FROM payments WHERE booking_id = ? AND type = ? FOR UPDATE',
+    `SELECT id, booking_id, type, payment_intent_id, amount_cents, status,
+            payment_method_id, payment_method_last4
+     FROM payments
+     WHERE booking_id = ? AND type = ?
+     ORDER BY id DESC
+     LIMIT 1
+     FOR UPDATE`,
     [bookingId, type]
   );
   return rows[0] || null;
@@ -3334,7 +3340,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     const transferGroup = `booking-${id}`;
     // Clave de idempotencia sensible al importe para evitar conflictos si varía la comisión/importe entre intentos
     const idemParts = ['payment', String(payment.id), 'amt', String(commissionCents)];
-    if (payment_method_id) idemParts.push('pm', String(payment_method_id)); 
+    if (payment_method_id) idemParts.push('pm', String(payment_method_id));
     const idemKey = stableKey(idemParts);
 
     let intent;
@@ -3477,12 +3483,19 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     }
 
     // Persistir intent/estado + transfer_group + PM last4 si disponible
-    const pmId = intent.payment_method ?? intent?.latest_charge?.payment_method ?? payment_method_id ?? null;
-    
-    const last4 =
+    const pmIdPersist =
+      (intent?.payment_method && typeof intent.payment_method === 'object' ? intent.payment_method.id : intent?.payment_method) ??
+      intent?.latest_charge?.payment_method ??
+      payment_method_id ??
+      null;
+
+    // last4 con fallback al  PM que hayas recuperado/adjuntado previamente (pm)
+    const last4Persist =
       intent?.payment_method?.card?.last4 ||
       intent?.latest_charge?.payment_method_details?.card?.last4 ||
+      (typeof pm !== 'undefined' ? pm?.card?.last4 : null) ||
       null;
+
     const lastErrObj = intent?.last_payment_error || intent?.latest_charge?.last_payment_error || null;
     const lastErrorCode = lastErrObj?.code || lastErrObj?.decline_code || null;
     const lastErrorMessage = lastErrObj?.message || null;
@@ -3499,8 +3512,8 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         finalPriceSnapshotCents: finalCentsSnapshot,
         status: mapStatus(intent.status),
         transferGroup,
-        paymentMethodId: pmId || null,
-        paymentMethodLast4: last4 || null,
+        paymentMethodId: pmIdPersist,
+        paymentMethodLast4: last4Persist,
         lastErrorCode: lastErrorCode,
         lastErrorMessage: lastErrorMessage,
       });
@@ -4110,9 +4123,10 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
     }
 
-    const last4 =
+    const last4Persist =
       intent?.payment_method?.card?.last4 ||
       intent?.latest_charge?.payment_method_details?.card?.last4 ||
+      pm?.card?.last4 ||
       null;
     const lastErrObj = intent?.last_payment_error || intent?.latest_charge?.last_payment_error || null;
     const lastErrorCode = lastErrObj?.code || lastErrObj?.decline_code || null;
@@ -4132,7 +4146,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         status: mapStatus(intent.status),
         transferGroup,
         paymentMethodId: pmToUse,
-        paymentMethodLast4: last4 || null,
+        paymentMethodLast4: last4Persist,
         lastErrorCode: lastErrorCode,
         lastErrorMessage: lastErrorMessage,
       });
