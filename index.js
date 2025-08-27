@@ -4115,7 +4115,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           });
         }
         if (pi.status === 'requires_payment_method') {
-          return res.status(402).json({
+          return res.status(202).json({
             requiresPaymentMethod: true,
             clientSecret: pi.client_secret,
             paymentIntentId: pi.id
