@@ -1903,8 +1903,9 @@ app.get('/api/suggested_professional', (req, res) => {
         ua.id AS user_id,
         ua.email, ua.phone, ua.username, ua.first_name, ua.surname,
         ua.profile_picture, ua.language,
-        COALESCE(rs.average_rating, 0)  AS average_rating,
-        COALESCE(bu.booking_count, 0)   AS booking_count,
+        COALESCE(rs.average_rating, 0) AS average_rating,
+        COALESCE(bu.booking_count, 0)  AS booking_count,
+        bs.best_service_id,
         bs.best_service_title
       FROM user_account ua
       LEFT JOIN (
@@ -1921,36 +1922,37 @@ app.get('/api/suggested_professional', (req, res) => {
         GROUP BY s.user_id
       ) bu ON ua.id = bu.user_id
       LEFT JOIN (
-        /* top 1 servicio por usuario según (avg_rating+1)*(bookings+1) */
-        SELECT user_id, service_title AS best_service_title
+        /* mejor servicio por usuario según (avg_rating_serv+1)*(bookings_serv+1) */
+        SELECT user_id, best_service_id, best_service_title
         FROM (
           SELECT
-            sm.user_id,
-            sm.service_title,
-            ( (COALESCE(sm.avg_rating_service,0) + 1)
-              * (COALESCE(sm.booking_count_service,0) + 1) ) AS service_weight,
+            s.user_id,
+            s.id AS best_service_id,
+            s.service_title AS best_service_title,
+            ( (COALESCE(r_by_s.avg_rating_service,0) + 1)
+              * (COALESCE(b_by_s.booking_count_service,0) + 1) ) AS service_weight,
             ROW_NUMBER() OVER (
-              PARTITION BY sm.user_id
+              PARTITION BY s.user_id
               ORDER BY
-                ( (COALESCE(sm.avg_rating_service,0) + 1)
-                  * (COALESCE(sm.booking_count_service,0) + 1) ) DESC,
-                sm.avg_rating_service DESC,
-                sm.booking_count_service DESC,
-                sm.service_id DESC
+                ( (COALESCE(r_by_s.avg_rating_service,0) + 1)
+                  * (COALESCE(b_by_s.booking_count_service,0) + 1) ) DESC,
+                COALESCE(r_by_s.avg_rating_service,0) DESC,
+                COALESCE(b_by_s.booking_count_service,0) DESC,
+                s.id DESC
             ) AS rn
-          FROM (
-            SELECT
-              s.id AS service_id,
-              s.user_id,
-              s.service_title,
-              AVG(r.rating)      AS avg_rating_service,
-              COUNT(b.id)        AS booking_count_service
-            FROM service s
-            LEFT JOIN review  r ON r.service_id = s.id
-            LEFT JOIN booking b ON b.service_id = s.id
-            /* opcional: WHERE s.status='published' AND s.is_active=1 */
-            GROUP BY s.id, s.user_id, s.service_title
-          ) sm
+          FROM service s
+          LEFT JOIN (
+            SELECT service_id, AVG(rating) AS avg_rating_service
+            FROM review
+            GROUP BY service_id
+          ) r_by_s ON r_by_s.service_id = s.id
+          LEFT JOIN (
+            SELECT service_id, COUNT(*) AS booking_count_service
+            FROM booking
+            /* opcional: WHERE status IN ('confirmed','completed') */
+            GROUP BY service_id
+          ) b_by_s ON b_by_s.service_id = s.id
+          /* opcional: WHERE s.status='published' AND s.is_active=1 */
         ) ranked
         WHERE rn = 1
       ) bs ON ua.id = bs.user_id
@@ -1983,7 +1985,7 @@ app.get('/api/suggested_professional', (req, res) => {
       const allZero = items.every(i => i.weight === 0);
       if (allZero) items.forEach(i => (i.weight = 1));
 
-      const k = Math.min(10, items.length);
+      const k = Math.min(20, items.length);
       const selected = weightedSampleWithoutReplacement(items, k).map(({ weight, ...rest }) => rest);
 
       return res.status(200).json(selected);
