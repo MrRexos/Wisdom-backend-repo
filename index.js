@@ -1607,7 +1607,7 @@ app.post('/api/service', (req, res) => {
               });
             }
             // 8. Marcar al usuario como profesional si aún no lo es
-            const professionalQuery = 'UPDATE user_account SET is_professional = 1 WHERE id = ? AND is_professional = 0';
+            const professionalQuery = 'UPDATE user_account SET is_professional = 1, professional_started_datetime = NOW() WHERE id = ? AND is_professional = 0';
             connection.query(professionalQuery, [user_id], err => {
               if (err) {
                 return connection.rollback(() => {
@@ -3248,7 +3248,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
               }
 
               const updateQuery =
-                'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1 WHERE id = ?';
+                'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1, professional_started_datetime = IF(is_professional = 1, professional_started_datetime, NOW()) WHERE id = ?';
               connection.query(updateQuery, [date_of_birth, nif, phone, account.id, id], (updErr) => {
                 connection.release();
                 if (updErr) {
