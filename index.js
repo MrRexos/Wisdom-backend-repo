@@ -1901,15 +1901,11 @@ app.get('/api/suggested_professional', (req, res) => {
     const query = `
       SELECT
         ua.id AS user_id,
-        ua.email,
-        ua.phone,
-        ua.username,
-        ua.first_name,
-        ua.surname,
-        ua.profile_picture,
-        ua.language,
-        COALESCE(rs.average_rating, 0) AS average_rating,
-        COALESCE(bs.booking_count, 0) AS booking_count
+        ua.email, ua.phone, ua.username, ua.first_name, ua.surname,
+        ua.profile_picture, ua.language,
+        COALESCE(rs.average_rating, 0)  AS average_rating,
+        COALESCE(bu.booking_count, 0)   AS booking_count,
+        bs.best_service_title
       FROM user_account ua
       LEFT JOIN (
         SELECT s.user_id, AVG(r.rating) AS average_rating
@@ -1921,11 +1917,44 @@ app.get('/api/suggested_professional', (req, res) => {
         SELECT s.user_id, COUNT(b.id) AS booking_count
         FROM booking b
         JOIN service s ON b.service_id = s.id
-        /* opcional: filtra por estados que te interesen
-           WHERE b.status IN ('confirmed','completed') */
+        /* opcional: WHERE b.status IN ('confirmed','completed') */
         GROUP BY s.user_id
+      ) bu ON ua.id = bu.user_id
+      LEFT JOIN (
+        /* top 1 servicio por usuario según (avg_rating+1)*(bookings+1) */
+        SELECT user_id, service_title AS best_service_title
+        FROM (
+          SELECT
+            sm.user_id,
+            sm.service_title,
+            ( (COALESCE(sm.avg_rating_service,0) + 1)
+              * (COALESCE(sm.booking_count_service,0) + 1) ) AS service_weight,
+            ROW_NUMBER() OVER (
+              PARTITION BY sm.user_id
+              ORDER BY
+                ( (COALESCE(sm.avg_rating_service,0) + 1)
+                  * (COALESCE(sm.booking_count_service,0) + 1) ) DESC,
+                sm.avg_rating_service DESC,
+                sm.booking_count_service DESC,
+                sm.service_id DESC
+            ) AS rn
+          FROM (
+            SELECT
+              s.id AS service_id,
+              s.user_id,
+              s.service_title,
+              AVG(r.rating)      AS avg_rating_service,
+              COUNT(b.id)        AS booking_count_service
+            FROM service s
+            LEFT JOIN review  r ON r.service_id = s.id
+            LEFT JOIN booking b ON b.service_id = s.id
+            /* opcional: WHERE s.status='published' AND s.is_active=1 */
+            GROUP BY s.id, s.user_id, s.service_title
+          ) sm
+        ) ranked
+        WHERE rn = 1
       ) bs ON ua.id = bs.user_id
-      WHERE ua.is_professional = 1
+      WHERE ua.is_professional = 1;
     `;
 
     connection.query(query, (err, pros) => {
