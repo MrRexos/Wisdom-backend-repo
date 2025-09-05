@@ -220,6 +220,27 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
   `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null, lastErrorCode ?? null, lastErrorMessage ?? null]);
 }
 
+// Muestreo ponderado SIN reemplazo (ruleta recalculando pesos)
+function weightedSampleWithoutReplacement(arr, k) {
+  const pool = arr.slice();
+  const out = [];
+  for (let i = 0; i < k && pool.length > 0; i++) {
+    const total = pool.reduce((s, x) => s + x.weight, 0);
+    let r = Math.random() * total;
+    let idx = 0;
+    while (idx < pool.length && r > pool[idx].weight) {
+      r -= pool[idx].weight;
+      idx++;
+    }
+    out.push(pool.splice(Math.min(idx, pool.length - 1), 1)[0]);
+  }
+  return out;
+}
+
+
+
+
+
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({
   host: process.env.DB_HOST, //process.env.HOST process.env.USER process.env.PASSWORD process.env.DATABASE
@@ -1874,15 +1895,11 @@ app.get('/api/suggested_professional', (req, res) => {
   pool.getConnection((err, connection) => {
     if (err) {
       console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    // Consulta para obtener el ID del servicio y toda la información del usuario, con un límite de 20 resultados
     const query = `
       SELECT
-        s.id AS service_id,
-        s.service_title,
         ua.id AS user_id,
         ua.email,
         ua.phone,
@@ -1890,23 +1907,57 @@ app.get('/api/suggested_professional', (req, res) => {
         ua.first_name,
         ua.surname,
         ua.profile_picture,
-        ua.is_professional,
-        ua.language
-      FROM service s
-      JOIN user_account ua ON s.user_id = ua.id
-      LIMIT 20;
+        ua.language,
+        COALESCE(rs.average_rating, 0) AS average_rating,
+        COALESCE(bs.booking_count, 0) AS booking_count
+      FROM user_account ua
+      LEFT JOIN (
+        SELECT s.user_id, AVG(r.rating) AS average_rating
+        FROM review r
+        JOIN service s ON r.service_id = s.id
+        GROUP BY s.user_id
+      ) rs ON ua.id = rs.user_id
+      LEFT JOIN (
+        SELECT s.user_id, COUNT(b.id) AS booking_count
+        FROM booking b
+        JOIN service s ON b.service_id = s.id
+        /* opcional: filtra por estados que te interesen
+           WHERE b.status IN ('confirmed','completed') */
+        GROUP BY s.user_id
+      ) bs ON ua.id = bs.user_id
+      WHERE ua.is_professional = 1
     `;
 
-    connection.query(query, (err, servicesData) => {
-      connection.release(); // Liberar la conexión después de usarla
-
+    connection.query(query, (err, pros) => {
+      connection.release();
       if (err) {
-        console.error('Error al obtener la información de los servicios:', err);
-        res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
-        return;
+        console.error('Error al obtener profesionales:', err);
+        return res.status(500).json({ error: 'Error al obtener los profesionales.' });
       }
 
-      res.status(200).json(servicesData); // Devolver la información de hasta 20 servicios
+      if (!pros || pros.length === 0) return res.status(200).json([]);
+
+      // Ponderación: multiplica la influencia de rating y de reservas.
+      // Puedes ajustar α y β según lo que quieras priorizar.
+      const alpha = 2; // peso del rating
+      const beta  = 1; // peso de reservas
+
+      const items = pros.map(p => {
+        const rating = Math.max(0, Math.min(5, Number(p.average_rating) || 0));
+        const bookings = Math.max(0, Number(p.booking_count) || 0);
+        // Suavizado para no dejar a cero a quien no tiene datos:
+        const weight = (0.5 + rating / 5) ** alpha * (1 + bookings) ** beta;
+        return { ...p, weight };
+      });
+
+      // Si todos tienen peso 0 (muy raro), usa peso uniforme
+      const allZero = items.every(i => i.weight === 0);
+      if (allZero) items.forEach(i => (i.weight = 1));
+
+      const k = Math.min(10, items.length);
+      const selected = weightedSampleWithoutReplacement(items, k).map(({ weight, ...rest }) => rest);
+
+      return res.status(200).json(selected);
     });
   });
 });
