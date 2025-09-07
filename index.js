@@ -4990,9 +4990,6 @@ app.get('/api/services/:id', (req, res) => {
   });
 });
 
-
-
-
 app.post('/api/services/:id/reviews', (req, res) => {
   const { id } = req.params;
   const { rating, comment } = req.body;
@@ -5023,6 +5020,132 @@ app.post('/api/services/:id/reviews', (req, res) => {
       res.status(201).json({ message: 'Review añadida con éxito', reviewId: result.insertId });
     });
   });
+});
+
+// Crear denuncia de servicio
+app.post('/api/service_reports', authenticateToken, async (req, res) => {
+  const { service_id, reason_code, reason_text, description, attachments } = req.body;
+  const validReasons = ['fraud','spam','incorrect_info','pricing_issue','external_contact','inappropriate','duplicate','other'];
+
+  if (!service_id || !reason_code) {
+    return res.status(400).json({ error: 'service_id and reason_code are required' });
+  }
+  if (!validReasons.includes(reason_code)) {
+    return res.status(400).json({ error: 'Invalid reason_code' });
+  }
+
+  const conn = await pool.promise().getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [result] = await conn.query(
+      `INSERT INTO service_report (service_id, reporter_user_id, reason_code, reason_text, description)
+       VALUES (?, ?, ?, ?, ?)`,
+      [service_id, req.user.id, reason_code, reason_text || null, description || null]
+    );
+    const reportId = result.insertId;
+
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      // Bulk insert seguro
+      const values = attachments.map(a => [reportId, a.file_url, a.file_type]);
+      const placeholders = values.map(() => '(?, ?, ?)').join(', ');
+      const flat = values.flat();
+      await conn.query(
+        `INSERT INTO service_report_attachment (report_id, file_url, file_type) VALUES ${placeholders}`,
+        flat
+      );
+    }
+
+    await conn.commit();
+    res.status(201).json({ id: reportId });
+  } catch (err) {
+    await conn.rollback();
+    console.error('Error al crear la denuncia:', err);
+    res.status(500).json({ error: 'Error al crear la denuncia.' });
+  } finally {
+    conn.release();
+  }
+});
+
+// Listar denuncias
+app.get('/api/service_reports', authenticateToken, async (req, res) => {
+  const { mine, status, service_id, reporter_user_id, limit = 50, offset = 0 } = req.query;
+  const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+
+  const filters = [];
+  const params = [];
+
+  if (mine === 'true' || !isStaff) {
+    filters.push('reporter_user_id = ?');
+    params.push(req.user.id);
+  } else {
+    if (status) { filters.push('status = ?'); params.push(status); }
+    if (service_id) { filters.push('service_id = ?'); params.push(service_id); }
+    if (reporter_user_id) { filters.push('reporter_user_id = ?'); params.push(reporter_user_id); }
+  }
+
+  const whereClause = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+
+  try {
+    const [reports] = await pool.promise().query(
+      `SELECT * FROM service_report ${whereClause} ORDER BY report_datetime DESC LIMIT ? OFFSET ?`,
+      [...params, Number(limit), Number(offset)]
+    );
+
+    if (reports.length) {
+      const ids = reports.map(r => r.id);
+      const [atts] = await pool.promise().query(
+        `SELECT id, report_id, file_url, file_type 
+           FROM service_report_attachment 
+          WHERE report_id IN (?)`,
+        [ids]
+      );
+      const grouped = atts.reduce((acc, a) => {
+        (acc[a.report_id] ||= []).push({ id: a.id, file_url: a.file_url, file_type: a.file_type });
+        return acc;
+      }, {});
+      reports.forEach(r => { r.attachments = grouped[r.id] || []; });
+    }
+
+    res.json(reports);
+  } catch (err) {
+    console.error('Error al listar denuncias:', err);
+    res.status(500).json({ error: 'Error al listar denuncias.' });
+  }
+});
+
+// Moderar denuncia
+app.patch('/api/service_reports/:id', authenticateToken, async (req, res) => {
+  const reportId = req.params.id;
+  const { status, resolution_notes } = req.body;
+
+  const isStaff = req.user && ['admin','support'].includes(req.user.role);
+  if (!isStaff) return res.status(403).json({ error: 'Forbidden' });
+
+  const validStatuses = ['pending','in_review','resolved','dismissed'];
+  if (status && !validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  const fields = [];
+  const params = [];
+  if (status) { fields.push('status = ?'); params.push(status); }
+  if (resolution_notes !== undefined) { fields.push('resolution_notes = ?'); params.push(resolution_notes); }
+  if (!fields.length) return res.status(400).json({ error: 'No fields to update' });
+
+  fields.push('handled_by_user_id = ?'); params.push(req.user.id);
+  fields.push('handled_datetime = NOW()');
+
+  try {
+    const [result] = await pool.promise().query(
+      `UPDATE service_report SET ${fields.join(', ')} WHERE id = ?`,
+      [...params, reportId]
+    );
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error al actualizar la denuncia:', err);
+    res.status(500).json({ error: 'Error al actualizar la denuncia.' });
+  }
 });
 
 app.post('/api/upload-dni', (req, res) => {
@@ -5059,6 +5182,12 @@ app.post('/api/upload-dni', (req, res) => {
     }
   });
 });
+
+
+
+
+
+
 
 // Webhook Stripe: añade payment_intent.canceled y charge.dispute.*, guarda last4 y corrige el send(...)
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
