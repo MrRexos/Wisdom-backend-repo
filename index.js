@@ -256,6 +256,76 @@ const pool = mysql.createPool({
 });
 
 const cron = require('node-cron');
+const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '15m';
+const REFRESH_TOKEN_TTL_DAYS = parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '30', 10);
+
+function signAccessToken(payload) {
+  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+}
+
+function generateRefreshToken() {
+  // Node 18+ soporta base64url
+  return crypto.randomBytes(48).toString('base64url');
+}
+
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+async function persistRefreshToken(userId, refreshToken, req) {
+  const refreshHash = hashToken(refreshToken);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+  const ua = req.headers['user-agent'] || null;
+  // req.ip funciona; si estás detrás de proxy, considera app.set('trust proxy', 1)
+  const ip = (req.headers['x-forwarded-for'] || req.ip || '').toString().substring(0, 45) || null;
+
+  await pool.promise().query(
+    `INSERT INTO auth_session (user_id, refresh_token_hash, user_agent, ip, expires_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [userId, refreshHash, ua, ip, expiresAt]
+  );
+}
+
+async function rotateRefreshToken(oldToken) {
+  const oldHash = hashToken(oldToken);
+  const [rows] = await pool.promise().query(
+    `SELECT id, user_id FROM auth_session
+     WHERE refresh_token_hash = ? AND revoked_at IS NULL AND expires_at > NOW()
+     LIMIT 1`,
+    [oldHash]
+  );
+  if (!rows.length) return null;
+
+  const session = rows[0];
+  const newRefresh = generateRefreshToken();
+  const newHash = hashToken(newRefresh);
+
+  await pool.promise().query(
+    `UPDATE auth_session
+     SET refresh_token_hash = ?, last_used_at = NOW()
+     WHERE id = ?`,
+    [newHash, session.id]
+  );
+
+  return { userId: session.user_id, refreshToken: newRefresh };
+}
+
+async function revokeRefreshToken(token) {
+  const hash = hashToken(token);
+  await pool.promise().query(
+    `UPDATE auth_session SET revoked_at = NOW() WHERE refresh_token_hash = ?`,
+    [hash]
+  );
+}
+
+async function revokeAllUserSessions(userId) {
+  await pool.promise().query(
+    `UPDATE auth_session SET revoked_at = NOW()
+     WHERE user_id = ? AND revoked_at IS NULL`,
+    [userId]
+  );
+}
+
 
 // cron diario a las 3:00 AM
 cron.schedule('0 3 * * *', async () => {
@@ -362,7 +432,9 @@ app.post('/api/signup', async (req, res) => {
             res.status(500).send('Error al crear la lista de servicios.');
             return;
           }
-          const token = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1h' });
+          const access_token = signAccessToken({ id: userId });
+          const refresh_token = generateRefreshToken();
+          await persistRefreshToken(userId, refresh_token, req);
 
           // Enviar correo de verificación
           try {
@@ -503,7 +575,13 @@ app.post('/api/signup', async (req, res) => {
             console.error('Error al enviar el correo de verificación:', mailErr);
           }
 
-          res.status(201).json({ message: 'Usuario y lista de servicios creados.', userId, token });
+          res.status(201).json({
+            message: 'Usuario y lista de servicios creados.',
+            userId,
+            token: access_token,        // compat
+            access_token,
+            refresh_token
+          });
         });
       });
     });
@@ -593,7 +671,7 @@ app.get('/api/verify-email', (req, res) => {
   });
 });
 
-// Ruta para hacer login
+// Ruta para hacer login  (Access 15m + Refresh 30d)
 app.post('/api/login', (req, res) => {
   const { usernameOrEmail, password } = req.body;
   const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
@@ -601,39 +679,92 @@ app.post('/api/login', (req, res) => {
   pool.getConnection((err, connection) => {
     if (err) {
       console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
     connection.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
-      connection.release(); // Libera la conexión después de usarla
+      connection.release();
 
       if (err) {
         console.error('Error al iniciar sesión:', err);
-        res.status(500).json({ error: 'Error al iniciar sesión.' });
-        return;
+        return res.status(500).json({ error: 'Error al iniciar sesión.' });
       }
-      if (results.length > 0) {
-        const user = results[0];
-        try {
-          const match = await bcrypt.compare(password, user.password);
-          if (match) {
-            delete user.password;
-            const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-            res.json({ success: true, message: 'Inicio de sesión exitoso.', user, token });
-          } else {
-            res.json({ success: false, message: 'Password incorrect.' });
-          }
-        } catch (error) {
-          console.error('Error al comparar la contraseña:', error);
-          res.status(500).json({ error: 'Error al procesar la solicitud.' });
+
+      if (!results.length) {
+        return res.json({ success: null, message: 'Wrong user or password.' });
+      }
+
+      const user = results[0];
+
+      try {
+        const match = await bcrypt.compare(password, user.password);
+        if (!match) {
+          return res.json({ success: false, message: 'Password incorrect.' });
         }
-      } else {
-        res.json({ success: null, message: "Wrong user or password." });
+
+        delete user.password;
+
+        const access_token = signAccessToken({ id: user.id });
+        const refresh_token = generateRefreshToken();
+        await persistRefreshToken(user.id, refresh_token, req);
+
+        // Para compatibilidad con el front actual, mantenemos "token" con el access token
+        return res.json({
+          success: true,
+          message: 'Inicio de sesión exitoso.',
+          user,
+          token: access_token,
+          access_token,
+          refresh_token
+        });
+      } catch (e) {
+        console.error('Error al comparar la contraseña:', e);
+        return res.status(500).json({ error: 'Error al procesar la solicitud.' });
       }
     });
   });
 });
+
+// Revoca una sesión concreta por refresh token
+app.post('/api/logout', async (req, res) => {
+  const { refresh_token } = req.body || {};
+  if (!refresh_token) {
+    return res.status(400).json({ error: 'refresh_token requerido' });
+  }
+  try {
+    await revokeRefreshToken(refresh_token);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Error en logout:', e);
+    return res.status(500).json({ error: 'Error al hacer logout' });
+  }
+});
+
+// Intercambia refresh_token por nuevos tokens (rota refresh)
+app.post('/api/token/refresh', async (req, res) => {
+  const { refresh_token } = req.body || {};
+  if (!refresh_token) {
+    return res.status(400).json({ error: 'refresh_token requerido' });
+  }
+
+  try {
+    const rotated = await rotateRefreshToken(refresh_token);
+    if (!rotated) {
+      return res.status(401).json({ error: 'refresh_token inválido o caducado' });
+    }
+
+    const access_token = signAccessToken({ id: rotated.userId });
+    return res.json({
+      access_token,
+      refresh_token: rotated.refreshToken,
+      token: access_token // compat
+    });
+  } catch (e) {
+    console.error('Error en refresh:', e);
+    return res.status(500).json({ error: 'Error al refrescar tokens' });
+  }
+});
+
 
 // Enviar enlace para restablecer contraseña
 app.post('/api/forgot-password', (req, res) => {
@@ -803,15 +934,24 @@ app.post('/api/reset-password', async (req, res) => {
                 return res.status(500).json({ error: 'Error interno' });
               }
 
-              connection.query('SELECT id, email, username, first_name, surname, phone, profile_picture, is_professional, language FROM user_account WHERE id = ?', [userId], (selErr, results) => {
+              connection.query('SELECT id, email, username, first_name, surname, phone, profile_picture, is_professional, language FROM user_account WHERE id = ?', [userId], async (selErr, results) => {
                 connection.release();
                 if (selErr || results.length === 0) {
                   return res.status(500).json({ error: 'Error al obtener el usuario.' });
                 }
 
                 const user = results[0];
-                const loginToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1h' });
-                res.json({ message: 'Password reset successfully', user, token: loginToken });
+                const access_token = signAccessToken({ id: userId });
+                const refresh_token = generateRefreshToken();
+                await persistRefreshToken(userId, refresh_token, req);
+
+                res.json({
+                  message: 'Password reset successfully',
+                  user,
+                  token: access_token,     // compat
+                  access_token,
+                  refresh_token
+                });
               });
             });
           });
@@ -830,6 +970,17 @@ app.post('/api/reset-password', async (req, res) => {
 
 // Proteger las rutas siguientes con JWT
 app.use(authenticateToken);
+
+// Revoca todas las sesiones del usuario actual (requiere access token)
+app.post('/api/logout-all', async (req, res) => {
+  try {
+    await revokeAllUserSessions(req.user.id);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Error en logout-all:', e);
+    return res.status(500).json({ error: 'Error al revocar sesiones' });
+  }
+});
 
 // Nueva ruta para subir imágenes a Google Cloud Storage
 app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) => {
@@ -1971,7 +2122,7 @@ app.get('/api/suggested_professional', (req, res) => {
       // Ponderación: multiplica la influencia de rating y de reservas.
       // Puedes ajustar α y β según lo que quieras priorizar.
       const alpha = 2; // peso del rating
-      const beta  = 1; // peso de reservas
+      const beta = 1; // peso de reservas
 
       const items = pros.map(p => {
         const rating = Math.max(0, Math.min(5, Number(p.average_rating) || 0));
@@ -5025,7 +5176,7 @@ app.post('/api/services/:id/reviews', (req, res) => {
 // Crear denuncia de servicio
 app.post('/api/service_reports', authenticateToken, async (req, res) => {
   const { service_id, reason_code, reason_text, description, attachments } = req.body;
-  const validReasons = ['fraud','spam','incorrect_info','pricing_issue','external_contact','inappropriate','duplicate','other'];
+  const validReasons = ['fraud', 'spam', 'incorrect_info', 'pricing_issue', 'external_contact', 'inappropriate', 'duplicate', 'other'];
 
   if (!service_id || !reason_code) {
     return res.status(400).json({ error: 'service_id and reason_code are required' });
@@ -5119,10 +5270,10 @@ app.patch('/api/service_reports/:id', authenticateToken, async (req, res) => {
   const reportId = req.params.id;
   const { status, resolution_notes } = req.body;
 
-  const isStaff = req.user && ['admin','support'].includes(req.user.role);
+  const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
   if (!isStaff) return res.status(403).json({ error: 'Forbidden' });
 
-  const validStatuses = ['pending','in_review','resolved','dismissed'];
+  const validStatuses = ['pending', 'in_review', 'resolved', 'dismissed'];
   if (status && !validStatuses.includes(status)) {
     return res.status(400).json({ error: 'Invalid status' });
   }
