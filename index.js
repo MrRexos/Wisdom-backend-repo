@@ -972,7 +972,36 @@ app.post('/api/reset-password', async (req, res) => {
 
 
 // Proteger las rutas siguientes con JWT
-app.use(authenticateToken);
+function authenticateToken(req, res, next) {
+  const hdr = req.headers['authorization'] || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+
+  if (!token) {
+    return res
+      .status(401)
+      .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="missing token"')
+      .json({ error: 'missing_token' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
+    if (err) {
+      if (err.name === 'TokenExpiredError') {
+        return res
+          .status(401)
+          .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="token expired"')
+          .json({ error: 'token_expired' });
+      }
+      return res
+        .status(401)
+        .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="invalid token"')
+        .json({ error: 'invalid_token' });
+    }
+
+    // OK → token válido
+    req.user = { id: payload.id || payload.sub, ...payload };
+    return next();
+  });
+}
 
 // Revoca todas las sesiones del usuario actual (requiere access token)
 app.post('/api/logout-all', async (req, res) => {
