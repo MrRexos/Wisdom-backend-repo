@@ -300,11 +300,14 @@ async function rotateRefreshToken(oldToken) {
   const newRefresh = generateRefreshToken();
   const newHash = hashToken(newRefresh);
 
+  // Ventana deslizante: empuja la caducidad otros REFRESH_TOKEN_TTL_DAYS
+  const newExpiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+
   await pool.promise().query(
     `UPDATE auth_session
-     SET refresh_token_hash = ?, last_used_at = NOW()
+     SET refresh_token_hash = ?, last_used_at = NOW(), expires_at = ?
      WHERE id = ?`,
-    [newHash, session.id]
+    [newHash, newExpiresAt, session.id]
   );
 
   return { userId: session.user_id, refreshToken: newRefresh };
