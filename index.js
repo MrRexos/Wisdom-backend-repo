@@ -288,27 +288,41 @@ async function persistRefreshToken(userId, refreshToken, req) {
 
 async function rotateRefreshToken(oldToken) {
   const oldHash = hashToken(oldToken);
+
+  // Busca la sesión vigente por hash
   const [rows] = await pool.promise().query(
-    `SELECT id, user_id FROM auth_session
-     WHERE refresh_token_hash = ? AND revoked_at IS NULL AND expires_at > NOW()
-     LIMIT 1`,
+    `SELECT id, user_id
+       FROM auth_session
+      WHERE refresh_token_hash = ?
+        AND revoked_at IS NULL
+        AND expires_at > NOW()
+      LIMIT 1`,
     [oldHash]
   );
-  if (!rows.length) return null;
+  if (!rows.length) return null; // token inválido/revocado/expirado
 
   const session = rows[0];
   const newRefresh = generateRefreshToken();
   const newHash = hashToken(newRefresh);
 
-  // Ventana deslizante: empuja la caducidad otros REFRESH_TOKEN_TTL_DAYS
-  const newExpiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+  // 🧠 Ventana deslizante: empuja SIEMPRE 30 días desde ahora
+  // (interpolamos el número para evitar problemas con INTERVAL ? DAY)
+  const days = Number(process.env.REFRESH_TOKEN_TTL_DAYS || 30);
 
-  await pool.promise().query(
+  const [result] = await pool.promise().query(
     `UPDATE auth_session
-     SET refresh_token_hash = ?, last_used_at = NOW(), expires_at = ?
-     WHERE id = ?`,
-    [newHash, newExpiresAt, session.id]
+        SET refresh_token_hash = ?,
+            last_used_at = NOW(),
+            expires_at = NOW() + INTERVAL ${days} DAY
+      WHERE id = ?`,
+    [newHash, session.id]
   );
+
+  if (result.affectedRows !== 1) {
+    // Log defensivo para detectar carreras u otros problemas
+    console.error('rotateRefreshToken: no row updated', { sessionId: session.id });
+    return null;
+  }
 
   return { userId: session.user_id, refreshToken: newRefresh };
 }
