@@ -305,8 +305,7 @@ async function rotateRefreshToken(oldToken) {
   const newRefresh = generateRefreshToken();
   const newHash = hashToken(newRefresh);
 
-  // 🧠 Ventana deslizante: empuja SIEMPRE 30 días desde ahora
-  // (interpolamos el número para evitar problemas con INTERVAL ? DAY)
+  // Ventana deslizante: empuja SIEMPRE 30 días desde ahora
   const days = Number(process.env.REFRESH_TOKEN_TTL_DAYS || 30);
 
   const [result] = await pool.promise().query(
