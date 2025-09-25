@@ -33,8 +33,23 @@ async function handleStripeRollbackIfNeeded(error) {
 const app = express();
 const port = process.env.PORT || 3000;
 
+app.set('etag', false);
+
 // Asegura que los webhooks de Stripe se procesen con el cuerpo sin parsear
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }));
+
+// Cabeceras de NO-CACHE en todo /api
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Vary', 'Authorization');
+  delete req.headers['if-none-match'];
+  delete req.headers['if-modified-since'];
+  res.removeHeader('ETag');
+  res.removeHeader('Last-Modified');
+  next();
+});
 
 // Middleware para parsear JSON.
 app.use(bodyParser.json());
@@ -407,6 +422,140 @@ app.get('/api/users', (req, res) => {
   });
 });
 
+// Ruta para verificar si un email ya existe
+app.get('/api/check-email', (req, res) => {
+  const { email } = req.query;
+  const query = 'SELECT COUNT(*) AS count FROM user_account WHERE email = ?';
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    connection.query(query, [email], (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al verificar el email:', err);
+        res.status(500).json({ error: 'Error al verificar el email.' });
+        return;
+      }
+      const count = results[0].count;
+      res.json({ exists: count > 0 });
+    });
+  });
+});
+
+// Ruta para verificar si un usuario ya existe
+app.get('/api/check-username', (req, res) => {
+  const { username } = req.query;
+  const query = 'SELECT COUNT(*) AS count FROM user_account WHERE username = ?';
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    connection.query(query, [username], (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al verificar el nombre de usuario:', err);
+        res.status(500).json({ error: 'Error al verificar el nombre de usuario.' });
+        return;
+      }
+      const count = results[0].count;
+      res.json({ exists: count > 0 });
+    });
+  });
+});
+
+// Ruta para verificar el correo electrónico
+app.get('/api/verify-email', (req, res) => {
+  const { token } = req.query;
+  if (!token) {
+    return res.status(400).send('Token requerido');
+  }
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(400).send('Token inválido');
+    }
+    const userId = decoded.id;
+    pool.getConnection((connErr, connection) => {
+      if (connErr) {
+        console.error('Error al obtener la conexión:', connErr);
+        return res.status(500).send('Error de conexión');
+      }
+      connection.query('UPDATE user_account SET is_verified = 1 WHERE id = ?', [userId], (updErr) => {
+        connection.release();
+        if (updErr) {
+          console.error('Error al verificar el usuario:', updErr);
+          return res.status(500).send('Error al verificar el usuario');
+        }
+        res.sendFile(path.join(__dirname, 'public', 'verify-success.html'));
+      });
+    });
+  });
+});
+
+// Ruta para hacer login  (Access 15m + Refresh 30d)
+app.post('/api/login', (req, res) => {
+  const { usernameOrEmail, password } = req.body;
+  const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    connection.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
+      connection.release();
+
+      if (err) {
+        console.error('Error al iniciar sesión:', err);
+        return res.status(500).json({ error: 'Error al iniciar sesión.' });
+      }
+
+      if (!results.length) {
+        return res.json({ success: null, message: 'Wrong user or password.' });
+      }
+
+      const user = results[0];
+
+      try {
+        const match = await bcrypt.compare(password, user.password);
+        if (!match) {
+          return res.json({ success: false, message: 'Password incorrect.' });
+        }
+
+        delete user.password;
+
+        const access_token = signAccessToken({ id: user.id });
+        const refresh_token = generateRefreshToken();
+        await persistRefreshToken(user.id, refresh_token, req);
+
+        // Para compatibilidad con el front actual, mantenemos "token" con el access token
+        return res.json({
+          success: true,
+          message: 'Inicio de sesión exitoso.',
+          user,
+          token: access_token,
+          access_token,
+          refresh_token
+        });
+      } catch (e) {
+        console.error('Error al comparar la contraseña:', e);
+        return res.status(500).json({ error: 'Error al procesar la solicitud.' });
+      }
+    });
+  });
+});
+
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
   const { email, username, password, first_name, surname, language, allow_notis, profile_picture, phone } = req.body;
@@ -607,140 +756,6 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// Ruta para verificar si un email ya existe
-app.get('/api/check-email', (req, res) => {
-  const { email } = req.query;
-  const query = 'SELECT COUNT(*) AS count FROM user_account WHERE email = ?';
-
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
-
-    connection.query(query, [email], (err, results) => {
-      connection.release(); // Libera la conexión después de usarla
-
-      if (err) {
-        console.error('Error al verificar el email:', err);
-        res.status(500).json({ error: 'Error al verificar el email.' });
-        return;
-      }
-      const count = results[0].count;
-      res.json({ exists: count > 0 });
-    });
-  });
-});
-
-// Ruta para verificar si un usuario ya existe
-app.get('/api/check-username', (req, res) => {
-  const { username } = req.query;
-  const query = 'SELECT COUNT(*) AS count FROM user_account WHERE username = ?';
-
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
-
-    connection.query(query, [username], (err, results) => {
-      connection.release(); // Libera la conexión después de usarla
-
-      if (err) {
-        console.error('Error al verificar el nombre de usuario:', err);
-        res.status(500).json({ error: 'Error al verificar el nombre de usuario.' });
-        return;
-      }
-      const count = results[0].count;
-      res.json({ exists: count > 0 });
-    });
-  });
-});
-
-// Ruta para verificar el correo electrónico
-app.get('/api/verify-email', (req, res) => {
-  const { token } = req.query;
-  if (!token) {
-    return res.status(400).send('Token requerido');
-  }
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(400).send('Token inválido');
-    }
-    const userId = decoded.id;
-    pool.getConnection((connErr, connection) => {
-      if (connErr) {
-        console.error('Error al obtener la conexión:', connErr);
-        return res.status(500).send('Error de conexión');
-      }
-      connection.query('UPDATE user_account SET is_verified = 1 WHERE id = ?', [userId], (updErr) => {
-        connection.release();
-        if (updErr) {
-          console.error('Error al verificar el usuario:', updErr);
-          return res.status(500).send('Error al verificar el usuario');
-        }
-        res.sendFile(path.join(__dirname, 'public', 'verify-success.html'));
-      });
-    });
-  });
-});
-
-// Ruta para hacer login  (Access 15m + Refresh 30d)
-app.post('/api/login', (req, res) => {
-  const { usernameOrEmail, password } = req.body;
-  const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
-
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    connection.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
-      connection.release();
-
-      if (err) {
-        console.error('Error al iniciar sesión:', err);
-        return res.status(500).json({ error: 'Error al iniciar sesión.' });
-      }
-
-      if (!results.length) {
-        return res.json({ success: null, message: 'Wrong user or password.' });
-      }
-
-      const user = results[0];
-
-      try {
-        const match = await bcrypt.compare(password, user.password);
-        if (!match) {
-          return res.json({ success: false, message: 'Password incorrect.' });
-        }
-
-        delete user.password;
-
-        const access_token = signAccessToken({ id: user.id });
-        const refresh_token = generateRefreshToken();
-        await persistRefreshToken(user.id, refresh_token, req);
-
-        // Para compatibilidad con el front actual, mantenemos "token" con el access token
-        return res.json({
-          success: true,
-          message: 'Inicio de sesión exitoso.',
-          user,
-          token: access_token,
-          access_token,
-          refresh_token
-        });
-      } catch (e) {
-        console.error('Error al comparar la contraseña:', e);
-        return res.status(500).json({ error: 'Error al procesar la solicitud.' });
-      }
-    });
-  });
-});
-
 // Revoca una sesión concreta por refresh token
 app.post('/api/logout', async (req, res) => {
   const { refresh_token } = req.body || {};
@@ -755,32 +770,6 @@ app.post('/api/logout', async (req, res) => {
     return res.status(500).json({ error: 'Error al hacer logout' });
   }
 });
-
-// Intercambia refresh_token por nuevos tokens (rota refresh)
-app.post('/api/token/refresh', async (req, res) => {
-  const { refresh_token } = req.body || {};
-  if (!refresh_token) {
-    return res.status(400).json({ error: 'refresh_token requerido' });
-  }
-
-  try {
-    const rotated = await rotateRefreshToken(refresh_token);
-    if (!rotated) {
-      return res.status(401).json({ error: 'refresh_token inválido o caducado' });
-    }
-
-    const access_token = signAccessToken({ id: rotated.userId });
-    return res.json({
-      access_token,
-      refresh_token: rotated.refreshToken,
-      token: access_token // compat
-    });
-  } catch (e) {
-    console.error('Error en refresh:', e);
-    return res.status(500).json({ error: 'Error al refrescar tokens' });
-  }
-});
-
 
 // Enviar enlace para restablecer contraseña
 app.post('/api/forgot-password', (req, res) => {
@@ -981,38 +970,58 @@ app.post('/api/reset-password', async (req, res) => {
   });
 });
 
+// Intercambia refresh_token por nuevos tokens (rota refresh)
+app.post('/api/token/refresh', async (req, res) => {
+  const { refresh_token } = req.body || {};
+  if (!refresh_token) {
+    return res.status(400).json({ error: 'refresh_token requerido' });
+  }
+
+  try {
+    const rotated = await rotateRefreshToken(refresh_token);
+    if (!rotated) {
+      return res.status(401).json({ error: 'refresh_token inválido o caducado' });
+    }
+
+    const access_token = signAccessToken({ id: rotated.userId });
+    return res.json({
+      access_token,
+      refresh_token: rotated.refreshToken,
+      token: access_token // compat
+    });
+  } catch (e) {
+    console.error('Error en refresh:', e);
+    return res.status(500).json({ error: 'Error al refrescar tokens' });
+  }
+});
 
 
+//--------------------------------
 
-// Proteger las rutas siguientes con JWT
+// Proteger las rutas siguientes
 function authenticateToken(req, res, next) {
-  const hdr = req.headers['authorization'] || '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  const h = req.headers['authorization'] || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
 
   if (!token) {
-    return res
-      .status(401)
-      .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="missing token"')
+    return res.status(401)
+      .set('WWW-Authenticate','Bearer error="invalid_token", error_description="missing token"')
       .json({ error: 'missing_token' });
   }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
     if (err) {
       if (err.name === 'TokenExpiredError') {
-        return res
-          .status(401)
-          .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="token expired"')
+        return res.status(401)
+          .set('WWW-Authenticate','Bearer error="invalid_token", error_description="token expired"')
           .json({ error: 'token_expired' });
       }
-      return res
-        .status(401)
-        .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="invalid token"')
+      return res.status(401)
+        .set('WWW-Authenticate','Bearer error="invalid_token", error_description="invalid token"')
         .json({ error: 'invalid_token' });
     }
-
-    // OK → token válido
     req.user = { id: payload.id || payload.sub, ...payload };
-    return next();
+    next();
   });
 }
 
