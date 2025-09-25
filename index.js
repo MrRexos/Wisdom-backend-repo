@@ -91,23 +91,27 @@ transporter.verify().catch(err => {
 
 // Middleware para verificar tokens JWT
 function authenticateToken(req, res, next) {
-  // Los webhooks de Stripe no envían JWT, por lo que deben quedar excluidos
-  if (req.path.startsWith('/webhooks/stripe')) {
-    return next();
-  }
-
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const h = req.headers['authorization'] || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
 
   if (!token) {
-    return res.status(401).json({ error: 'Token requerido' });
+    return res.status(401)
+      .set('WWW-Authenticate','Bearer error="invalid_token", error_description="missing token"')
+      .json({ error: 'missing_token' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
     if (err) {
-      return res.status(403).json({ error: 'Token inválido' });
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401)
+          .set('WWW-Authenticate','Bearer error="invalid_token", error_description="token expired"')
+          .json({ error: 'token_expired' });
+      }
+      return res.status(401)
+        .set('WWW-Authenticate','Bearer error="invalid_token", error_description="invalid token"')
+        .json({ error: 'invalid_token' });
     }
-    req.user = user;
+    req.user = { id: payload.id || payload.sub, ...payload };
     next();
   });
 }
@@ -999,31 +1003,30 @@ app.post('/api/token/refresh', async (req, res) => {
 //--------------------------------
 
 // Proteger las rutas siguientes
-function authenticateToken(req, res, next) {
-  const h = req.headers['authorization'] || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+app.use('/api', authenticateToken);
 
-  if (!token) {
-    return res.status(401)
-      .set('WWW-Authenticate','Bearer error="invalid_token", error_description="missing token"')
-      .json({ error: 'missing_token' });
-  }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
+// Ruta para obtener usuarios
+app.get('/api/users', (req, res) => {
+  pool.getConnection((err, connection) => {
     if (err) {
-      if (err.name === 'TokenExpiredError') {
-        return res.status(401)
-          .set('WWW-Authenticate','Bearer error="invalid_token", error_description="token expired"')
-          .json({ error: 'token_expired' });
-      }
-      return res.status(401)
-        .set('WWW-Authenticate','Bearer error="invalid_token", error_description="invalid token"')
-        .json({ error: 'invalid_token' });
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
     }
-    req.user = { id: payload.id || payload.sub, ...payload };
-    next();
+
+    connection.query('SELECT * FROM user_account', (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener usuarios:', err);
+        res.status(500).json({ error: 'Error al obtener usuarios.' });
+        return;
+      }
+      res.json(results);
+    });
   });
-}
+});
 
 // Revoca todas las sesiones del usuario actual (requiere access token)
 app.post('/api/logout-all', async (req, res) => {
