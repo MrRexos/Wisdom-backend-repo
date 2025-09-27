@@ -1003,7 +1003,7 @@ app.post('/api/token/refresh', async (req, res) => {
 //--------------------------------
 
 // Proteger las rutas siguientes
-app.use('/api', authenticateToken);
+//app.use('/api', authenticateToken);
 
 
 // Ruta para obtener usuarios
