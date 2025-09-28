@@ -309,7 +309,7 @@ The ${productName} Team`;
           <!-- Header con logo a la izquierda -->
           <tr>
             <td align="left" style="padding:24px 8px 8px 8px;">
-              <img src="${iconUrl}" width="36" height="36" alt="${productName}"
+              <img src="${iconUrl}" width="40" height="40" alt="${productName}"
                    style="display:block; border:0; outline:none; text-decoration:none; width:36px; height:36px;">
             </td>
           </tr>
@@ -816,19 +816,19 @@ app.post('/api/signup', async (req, res) => {
                       <tr>
                         <td style="padding:0 10px;">
                           <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web">
-                            <img src="${IMG_WISDOM}" width="28" height="28" alt="Wisdom"
+                            <img src="${IMG_WISDOM}" width="42" height="42" alt="Wisdom"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram">
-                            <img src="${IMG_INSTA}" width="28" height="28" alt="Instagram"
+                            <img src="${IMG_INSTA}" width="42" height="42" alt="Instagram"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://x.com/wisdom_entity" aria-label="X">
-                            <img src="${IMG_X}" width="28" height="28" alt="X"
+                            <img src="${IMG_X}" width="42" height="42" alt="X"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
@@ -961,19 +961,19 @@ app.post('/api/forgot-password', (req, res) => {
                       <tr>
                         <td style="padding:0 10px;">
                           <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web">
-                            <img src="${IMG_WISDOM}" width="28" height="28" alt="Wisdom"
+                            <img src="${IMG_WISDOM}" width="42" height="42" alt="Wisdom"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram">
-                            <img src="${IMG_INSTA}" width="28" height="28" alt="Instagram"
+                            <img src="${IMG_INSTA}" width="42" height="42" alt="Instagram"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://x.com/wisdom_entity" aria-label="X">
-                            <img src="${IMG_X}" width="28" height="28" alt="X"
+                            <img src="${IMG_X}" width="42" height="42" alt="X"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
