@@ -14,6 +14,9 @@ const crypto = require("crypto");
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const os = require('os');
+const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
+const IMG_INSTA  = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
+const IMG_X      = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
 
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -28,6 +31,7 @@ async function handleStripeRollbackIfNeeded(error) {
     console.error("Error cancelling payment intent:", cancelErr);
   }
 }
+
 
 
 const app = express();
@@ -261,54 +265,82 @@ function renderEmail({
   termsUrl = 'https://example.com/terms',
   privacyUrl = 'https://example.com/privacy',
   effectiveDate = 'September 7, 2025',
-  productName = 'Wisdom'
+  productName = 'Wisdom',
+  iconUrl = 'https://storage.googleapis.com/wisdom-images/app_icon.png',
+  preheader = `These updates will take effect on ${effectiveDate}.`
 } = {}) {
   const subject = `${productName} is updating our Terms & Privacy Policy`;
+
   const text = `Hi there,
 
-We're writing to let you know that we're updating the ${productName} Terms of Service and Privacy Policy. These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced, and bring more clarity to how ${productName} works.
+We're writing to let you know that we're updating our ${productName} Terms of Service and Privacy Policy. These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced, and bring more clarity to how ${productName} works.
 
 These updates will take effect on ${effectiveDate}. By continuing to use ${productName} after that date, you'll be agreeing to the new terms and privacy policy.
 
 With gratitude,
 The ${productName} Team`;
 
-  const html = `
-  <!doctype html>
-  <html lang="en" style="background:#ffffff;">
-    <head>
-      <meta charset="utf-8">
-      <meta name="color-scheme" content="light only">
-      <meta name="viewport" content="width=device-width,initial-scale=1">
-      <title>${productName} is updating our Terms & Privacy Policy</title>
-    </head>
-    <body style="margin:0;background:#ffffff;">
-      <div style="max-width:640px;margin:0 auto;padding:24px 20px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111827; line-height:1.6;">
-        <p style="margin:0 0 16px;">Hi there,</p>
+  const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <!-- Permitimos light/dark del cliente -->
+    <meta name="color-scheme" content="light dark">
+    <meta name="supported-color-schemes" content="light dark">
+    <title>${subject}</title>
+    <style>
+      /* Nada de fondos: dejamos que el cliente pinte */
+      .content { font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; font-size:16px; line-height:1.65; }
+      @media (max-width:480px) { .content { font-size:17px !important; line-height:1.7 !important; } }
+      /* No forzamos color de texto ni de enlaces → se adaptan al tema */
+    </style>
+  </head>
+  <body style="margin:0; padding:0; background:none !important;">
+    <!-- preheader oculto -->
+    <div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden;">
+      ${preheader}
+    </div>
 
-        <p style="margin:0 0 16px;">
-          We're writing to let you know that we're updating our
-          <a href="${termsUrl}" style="color:#1a73e8;text-decoration:underline;">Terms of Service</a>
-          and
-          <a href="${privacyUrl}" style="color:#1a73e8;text-decoration:underline;">Privacy Policy</a>.
-          These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced,
-          and bring more clarity to how ${productName} works.
-        </p>
+    <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+      <tr>
+        <td align="center" style="padding:0 16px;">
+          <table role="presentation" width="640" border="0" cellspacing="0" cellpadding="0" style="width:100%; max-width:640px; border-collapse:collapse;">
+            <tr>
+              <td align="center" style="padding:24px 0 8px 0;">
+                <img src="${iconUrl}" width="28" height="28" alt="${productName}" style="display:block; border:0; outline:none; text-decoration:none; width:28px; height:28px;">
+              </td>
+            </tr>
+            <tr>
+              <td class="content" style="padding:8px 8px 24px 8px;">
+                <p style="margin:0 0 16px;">Hi there,</p>
 
-        <p style="margin:0 0 16px;">
-          These updates will take effect on <strong>${effectiveDate}</strong>. By continuing to use ${productName} after that date,
-          you'll be agreeing to the new terms and privacy policy.
-        </p>
+                <p style="margin:0 0 16px;">
+                  We're writing to let you know that we're updating our
+                  <a href="${termsUrl}" style="text-decoration:underline; color:inherit;">Terms of Service</a>
+                  and
+                  <a href="${privacyUrl}" style="text-decoration:underline; color:inherit;">Privacy Policy</a>.
+                  These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced,
+                  and bring more clarity to how ${productName} works.
+                </p>
 
-        <p style="margin:0;">
-          With gratitude,<br>
-          The ${productName} Team
-        </p>
-      </div>
-    </body>
-  </html>
-  `;
+                <p style="margin:0 0 16px;">
+                  These updates will take effect on <strong>${effectiveDate}</strong>. By continuing to use ${productName} after that date,
+                  you'll be agreeing to the new terms and privacy policy.
+                </p>
 
+                <p style="margin:0;">
+                  With gratitude,<br>
+                  The ${productName} Team
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
   return { subject, text, html };
 }
 
@@ -742,123 +774,74 @@ app.post('/api/signup', async (req, res) => {
             const verifyToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1d' });
             const url = `${process.env.BASE_URL}/api/verify-email?token=${verifyToken}`;
             await transporter.sendMail({
-              from: '"Wisdom" <wisdom.helpcontact@gmail.com>', // process.env.EMAIL_USER,
+              from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
               to: email,
               subject: 'Confirm your Wisdom',
-              attachments: [
-                { filename: 'wisdom.png', path: path.join(__dirname, 'assets', 'wisdom.png'), cid: wisdomLogoCid },
-                { filename: 'instagram.png', path: path.join(__dirname, 'assets', 'instagram.png'), cid: instagramLogoCid },
-                { filename: 'twitter.png', path: path.join(__dirname, 'assets', 'twitter.png'), cid: twitterLogoCid }
-              ],
               html: `
-              <table
-                width="100%"
-                cellpadding="0"
-                cellspacing="0"
-                style="background:#ffffff;font-family:Inter,sans-serif;color:#111827;"
-              >
-                <tr>
-                  <td align="center" style="padding:48px 24px;">
+              <!doctype html>
+              <html lang="en" style="background:#ffffff;">
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="color-scheme" content="light only">
+                  <meta name="viewport" content="width=device-width,initial-scale=1">
+                  <title>Confirm your Wisdom</title>
+                </head>
+                <body style="margin:0;background:#ffffff;">
+                  <!-- Contenedor centrado y limitado a 640px -->
+                  <div style="max-width:640px;margin:0 auto;padding:48px 24px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111827;">
+                    
                     <!-- LOGO -->
-                    <div style="font-size:24px;font-weight:600;letter-spacing:.6px;margin-bottom:32px;">
+                    <div style="font-size:24px;font-weight:600;letter-spacing:.6px;margin-bottom:32px;text-align:center;">
                       WISDOM<sup style="font-size:12px;vertical-align:top;">®</sup>
                     </div>
-
+            
                     <!-- TÍTULO -->
-                    <h1 style="font-size:30px;font-weight:500;margin-bottom:16px;">
+                    <h1 style="font-size:30px;font-weight:500;margin:0 0 16px;text-align:center;">
                       Welcome to Wisdom
                     </h1>
-
+            
                     <!-- TEXTO -->
-                    <p style="font-size:16px;line-height:1.55;max-width:420px;margin:0 auto 50px;">
+                    <p style="font-size:16px;line-height:1.55;max-width:420px;margin:0 auto 32px;text-align:center;">
                       You've successfully sign up on Wisdom. Please confirm your email.
                     </p>
-
-                    <!-- BOTÓN (enlace) -->
-                    <a
-                      href="${url}"
-                      style="
-                        display:inline-block;
-                        padding:22px 100px;
-                        background:#f3f3f3;
-                        border-radius:14px;
-                        text-decoration:none;
-                        font-size:14px;
-                        font-weight:600;
-                        color:#111827;
-                      "
-                    >
-                      Verify email
-                    </a>
-
-                    <!-- LÍNEA DIVISORIA -->
-                    <hr
-                      style="
-                        border:none;
-                        height:1px;
-                        background-color:#f3f4f6;
-                        margin:70px 0;
-                        width:100%;
-                      "
-                    />
-
-                    <!-- SOCIAL ICONS -->
+            
+                    <!-- BOTÓN -->
+                    <div style="text-align:center;margin-bottom:50px;">
+                      <a href="${url}"
+                         style="display:inline-block;padding:22px 100px;background:#f3f3f3;border-radius:14px;text-decoration:none;font-size:14px;font-weight:600;color:#111827;">
+                        Verify email
+                      </a>
+                    </div>
+            
+                    <!-- LÍNEA DIVISORIA (limitada al contenedor de 640px) -->
+                    <hr style="border:none;height:1px;background-color:#f3f4f6;margin:70px 0;width:100%;" />
+            
+                    <!-- SOCIAL ICONS (sin adjuntos, con imágenes públicas) -->
                     <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
                       <tr>
                         <td style="padding:0 5px;">
                           <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web"
-                            style="
-                              display: flex;
-                              width: 32px;
-                              height: 32px;
-                              background: #f3f4f6;
-                              border-radius: 50%;
-                              text-decoration: none;
-                              justify-content: center;
-                              align-items: center;
-                            ">
-                            
-                            <img src="cid:${wisdomLogoCid}" width="18" height="18"
-                              alt="Wisdom"
-                              style="display:block; margin:auto; max-width:18px; max-height:18px; object-fit:contain;" />
-
+                             style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
+                            <img src="${IMG_WISDOM}" width="18" height="18" alt="Wisdom" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
                           </a>
                         </td>
                         <td style="padding:0 5px;">
                           <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram"
-                            style="
-                              display: flex;
-                              width: 32px;
-                              height: 32px;
-                              background: #f3f4f6;
-                              border-radius: 50%;
-                              text-decoration: none;
-                              justify-content: center;
-                              align-items: center;
-                            ">
-                            <img src="cid:${instagramLogoCid}" alt="Instagram" width="18" height="18" style="display:block;margin:auto;" />
+                             style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
+                            <img src="${IMG_INSTA}" width="18" height="18" alt="Instagram" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
                           </a>
                         </td>
                         <td style="padding:0 0px;">
-                          <a href="https://x.com/wisdom_entity" aria-label="Twitter"
-                            style="
-                              display: flex;
-                              width: 32px;
-                              height: 32px;
-                              background: #f3f4f6;
-                              border-radius: 50%;
-                              text-decoration: none;
-                              justify-content: center;
-                              align-items: center;
-                            ">
-                            <img src="cid:${twitterLogoCid}" alt="Twitter" width="18" height="18" style="display:block;margin:auto;" />
+                          <a href="https://x.com/wisdom_entity" aria-label="X"
+                             style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
+                            <img src="${IMG_X}" width="18" height="18" alt="X" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
                           </a>
                         </td>
                       </tr>
                     </table>
-
-                    <!-- PIE DE PÁGINA -->
-                    <div style="font-size:12px;color:#6b7280;line-height:1.4;text-decoration:none;">
+            
+                    <!-- PIE -->
+                    <div style="font-size:12px;color:#6b7280;line-height:1.4;text-align:center;">
                       <a href="#" style="color:#6b7280;text-decoration:none;">Privacy Policy</a>
                       &nbsp;·&nbsp;
                       <a href="#" style="color:#6b7280;text-decoration:none;">Terms of Service</a>
@@ -867,10 +850,9 @@ app.post('/api/signup', async (req, res) => {
                       <br /><br />
                       This email was sent to ${email}
                     </div>
-                  </td>
-                </tr>
-              </table>
-              `
+                  </div>
+                </body>
+              </html>`
             });
           } catch (mailErr) {
             console.error('Error al enviar el correo de verificación:', mailErr);
@@ -953,55 +935,76 @@ app.post('/api/forgot-password', (req, res) => {
               from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
               to: email,
               subject: 'Reset your password for Wisdom',
-              attachments: [
-                { filename: 'wisdom.png', path: path.join(__dirname, 'assets', 'wisdom.png'), cid: wisdomLogoCid },
-                { filename: 'instagram.png', path: path.join(__dirname, 'assets', 'instagram.png'), cid: instagramLogoCid },
-                { filename: 'twitter.png', path: path.join(__dirname, 'assets', 'twitter.png'), cid: twitterLogoCid }
-              ],
               html: `
-                <table width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;font-family:Inter,sans-serif;color:#111827;">
-                  <tr>
-                    <td align="center" style="padding:48px 24px;">
-                      <div style="font-size:24px;font-weight:600;letter-spacing:.6px;margin-bottom:32px;">
-                        WISDOM<sup style="font-size:12px;vertical-align:top;">®</sup>
-                      </div>
-                      <p style="font-size:16px;line-height:1.55;max-width:420px;margin:0 auto 50px;">
-                        It looks like you lost your password. Use the code below to reset it.
-                      </p>
-                      <div style="font-size:30px;font-weight:600;margin-bottom:32px;">${resetCode}</div>
-                      <hr style="border:none;height:1px;background-color:#f3f4f6;margin:70px 0;width:100%;" />
-                      <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
-                        <tr>
-                          <td style="padding:0 5px;">
-                            <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web" style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
-                              <img src="cid:${wisdomLogoCid}" width="18" height="18" alt="Wisdom" style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
-                            </a>
-                          </td>
-                          <td style="padding:0 5px;">
-                            <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram" style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
-                              <img src="cid:${instagramLogoCid}" alt="Instagram" width="18" height="18" style="display:block;margin:auto;" />
-                            </a>
-                          </td>
-                          <td style="padding:0 0px;">
-                            <a href="https://x.com/wisdom_entity" aria-label="Twitter" style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
-                              <img src="cid:${twitterLogoCid}" alt="Twitter" width="18" height="18" style="display:block;margin:auto;" />
-                            </a>
-                          </td>
-                        </tr>
-                      </table>
-                      <div style="font-size:12px;color:#6b7280;line-height:1.4;text-decoration:none;">
-                        <a href="#" style="color:#6b7280;text-decoration:none;">Privacy Policy</a>
-                        &nbsp;·&nbsp;
-                        <a href="#" style="color:#6b7280;text-decoration:none;">Terms of Service</a>
-                        <br /><br />
-                        Mataró, BCN, 08304
-                        <br /><br />
-                        This email was sent to ${email}
-                      </div>
-                    </td>
-                  </tr>
-                </table>
-                `
+              <!doctype html>
+              <html lang="en" style="background:#ffffff;">
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="color-scheme" content="light only">
+                  <meta name="viewport" content="width=device-width,initial-scale=1">
+                  <title>Reset your password for Wisdom</title>
+                </head>
+                <body style="margin:0;background:#ffffff;">
+                  <div style="max-width:640px;margin:0 auto;padding:48px 24px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111827;">
+            
+                    <!-- LOGO -->
+                    <div style="font-size:24px;font-weight:600;letter-spacing:.6px;margin-bottom:32px;text-align:center;">
+                      WISDOM<sup style="font-size:12px;vertical-align:top;">®</sup>
+                    </div>
+            
+                    <!-- TEXTO -->
+                    <p style="font-size:16px;line-height:1.55;max-width:420px;margin:0 auto 32px;text-align:center;">
+                      It looks like you lost your password. Use the code below to reset it.
+                    </p>
+            
+                    <!-- CÓDIGO -->
+                    <div style="font-size:30px;font-weight:600;margin-bottom:50px;text-align:center;">
+                      ${resetCode}
+                    </div>
+            
+                    <!-- LÍNEA DIVISORIA -->
+                    <hr style="border:none;height:1px;background-color:#f3f4f6;margin:70px 0;width:100%;" />
+            
+                    <!-- SOCIAL ICONS -->
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
+                      <tr>
+                        <td style="padding:0 5px;">
+                          <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web"
+                             style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
+                            <img src="${IMG_WISDOM}" width="18" height="18" alt="Wisdom"
+                                 style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
+                          </a>
+                        </td>
+                        <td style="padding:0 5px;">
+                          <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram"
+                             style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
+                            <img src="${IMG_INSTA}" width="18" height="18" alt="Instagram"
+                                 style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
+                          </a>
+                        </td>
+                        <td style="padding:0 0px;">
+                          <a href="https://x.com/wisdom_entity" aria-label="X"
+                             style="display:flex;width:32px;height:32px;background:#f3f4f6;border-radius:50%;text-decoration:none;justify-content:center;align-items:center;">
+                            <img src="${IMG_X}" width="18" height="18" alt="X"
+                                 style="display:block;margin:auto;max-width:18px;max-height:18px;object-fit:contain;" />
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+            
+                    <!-- PIE -->
+                    <div style="font-size:12px;color:#6b7280;line-height:1.4;text-align:center;">
+                      <a href="#" style="color:#6b7280;text-decoration:none;">Privacy Policy</a>
+                      &nbsp;·&nbsp;
+                      <a href="#" style="color:#6b7280;text-decoration:none;">Terms of Service</a>
+                      <br /><br />
+                      Mataró, BCN, 08304
+                      <br /><br />
+                      This email was sent to ${email}
+                    </div>
+                  </div>
+                </body>
+              </html>`
             });
           } catch (mailErr) {
             console.error('Error al enviar el correo de restablecimiento:', mailErr);
