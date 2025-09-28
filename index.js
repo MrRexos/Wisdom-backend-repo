@@ -267,9 +267,9 @@ function renderEmail({
   effectiveDate = 'September 7, 2025',
   productName = 'Wisdom',
   iconUrl = 'https://storage.googleapis.com/wisdom-images/app_icon.png',
-  preheader = `These updates will take effect on ${effectiveDate}.`
+  preheader = `A smoother experience from search to booking—come take a look.`
 } = {}) {
-  const subject = `${productName} is updating our Terms & Privacy Policy`;
+  const subject = `We've released a new Wisdom beta`;
 
   const text = `Hi there,
 
@@ -281,69 +281,74 @@ With gratitude,
 The ${productName} Team`;
 
   const html = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="light dark">
-  <meta name="supported-color-schemes" content="light dark">
-  <title>${subject}</title>
-  <style>
-    /* Tamaño: un poco más pequeño que el anterior */
-    .content { font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; font-size:15px; line-height:1.65; }
-    @media (max-width:480px) { .content { font-size:16px !important; line-height:1.7 !important; } }
-    a { text-decoration: underline; color: inherit; }
-    body, table, td, p { margin:0; }
-  </style>
-</head>
-<body style="margin:0; padding:0; background:none !important;">
-  <!-- preheader oculto -->
-  <div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden;">
-    ${preheader}
-  </div>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="color-scheme" content="light dark">
+      <meta name="supported-color-schemes" content="light dark">
+      <title>We’ve released a new Wisdom beta</title>
+      <style>
+        .content { font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; font-size:15px; line-height:1.65; }
+        @media (max-width:480px) { .content { font-size:16px !important; line-height:1.7 !important; } }
+        a { text-decoration: underline; color: inherit; }
+        body, table, td, p { margin:0; }
+      </style>
+    </head>
+    <body style="margin:0; padding:0; background:none !important;">
+      <!-- preheader -->
+      <div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden;">
+        A smoother experience from search to booking—come take a look.
+      </div>
 
-  <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
-    <tr>
-      <td align="center" style="padding:0 16px;">
-        <table role="presentation" width="640" border="0" cellspacing="0" cellpadding="0" style="width:100%; max-width:640px; border-collapse:collapse;">
-          <!-- Header con logo a la izquierda -->
-          <tr>
-            <td align="left" style="padding:24px 8px 8px 8px;">
-              <img src="${iconUrl}" width="40" height="40" alt="${productName}"
-                   style="display:block; border:0; outline:none; text-decoration:none; width:36px; height:36px;">
-            </td>
-          </tr>
+      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+        <tr>
+          <td align="center" style="padding:0 16px;">
+            <table role="presentation" width="640" border="0" cellspacing="0" cellpadding="0" style="width:100%; max-width:640px; border-collapse:collapse;">
 
-          <!-- Contenido -->
-          <tr>
-            <td class="content" style="padding:8px 8px 24px 8px;">
-              <p style="margin:0 0 16px;">Hi there,</p>
+              <!-- Logo left -->
+              <tr>
+                <td align="left" style="padding:24px 8px 8px 8px;">
+                  <img src="https://storage.googleapis.com/wisdom-images/app_icon.png" width="36" height="36" alt="Wisdom"
+                      style="display:block; border:0; outline:none; text-decoration:none; width:36px; height:36px;">
+                </td>
+              </tr>
 
-              <p style="margin:0 0 16px;">
-                We're writing to let you know that we're updating our
-                <a href="${termsUrl}">Terms of Service</a> and
-                <a href="${privacyUrl}">Privacy Policy</a>.
-                These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced,
-                and bring more clarity to how ${productName} works.
-              </p>
+              <!-- Body -->
+              <tr>
+                <td class="content" style="padding:8px 8px 24px 8px;">
+                  <p style="margin:0 0 16px;">Hi there,</p>
 
-              <p style="margin:0 0 16px;">
-                These updates will take effect on <strong>${effectiveDate}</strong>. By continuing to use ${productName} after that date,
-                you'll be agreeing to the new terms and privacy policy.
-              </p>
+                  <p style="margin:0 0 16px;">
+                    We're excited to let you know we've released a new update of the Wisdom beta.
+                  </p>
 
-              <p style="margin:0;">
-                With gratitude,<br>
-                The ${productName} Team
-              </p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>`;
+                  <p style="margin:0 0 16px;">
+                    Open Wisdom to explore a smoother, cleaner experience from search to booking—everything feels more profesional,
+                    clearer, and more delightful throughout.
+                  </p>
+
+                  <p style="margin:0 0 16px;">
+                    If anything feels off, just reply to this email — we're listening.
+                  </p>
+
+                  <p style="margin:0 0 16px;">
+                    Jump in: book a service you need or offer your own to the community.
+                  </p>
+
+                  <p style="margin:0;">
+                    With gratitude,<br>
+                    <em>The Wisdom Team</em>
+                  </p>
+                </td>
+              </tr>
+
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>`;
 
   return { subject, text, html };
 }
@@ -816,19 +821,19 @@ app.post('/api/signup', async (req, res) => {
                       <tr>
                         <td style="padding:0 10px;">
                           <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web">
-                            <img src="${IMG_WISDOM}" width="42" height="42" alt="Wisdom"
+                            <img src="${IMG_WISDOM}" width="37" height="37" alt="Wisdom"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram">
-                            <img src="${IMG_INSTA}" width="42" height="42" alt="Instagram"
+                            <img src="${IMG_INSTA}" width="37" height="37" alt="Instagram"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://x.com/wisdom_entity" aria-label="X">
-                            <img src="${IMG_X}" width="42" height="42" alt="X"
+                            <img src="${IMG_X}" width="37" height="37" alt="X"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
@@ -961,19 +966,19 @@ app.post('/api/forgot-password', (req, res) => {
                       <tr>
                         <td style="padding:0 10px;">
                           <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web">
-                            <img src="${IMG_WISDOM}" width="42" height="42" alt="Wisdom"
+                            <img src="${IMG_WISDOM}" width="37" height="37" alt="Wisdom"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram">
-                            <img src="${IMG_INSTA}" width="42" height="42" alt="Instagram"
+                            <img src="${IMG_INSTA}" width="37" height="37" alt="Instagram"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
                         <td style="padding:0 10px;">
                           <a href="https://x.com/wisdom_entity" aria-label="X">
-                            <img src="${IMG_X}" width="42" height="42" alt="X"
+                            <img src="${IMG_X}" width="37" height="37" alt="X"
                                  style="display:block;border:0;outline:none;text-decoration:none;" />
                           </a>
                         </td>
