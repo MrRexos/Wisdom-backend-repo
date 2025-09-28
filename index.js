@@ -128,6 +128,46 @@ function formatDateTime(date) {
   });
 }
 
+function formatDateTimeEs(date) {
+  if (!date) return 'No especificada';
+  const dt = new Date(date);
+  if (Number.isNaN(dt.getTime())) return 'No especificada';
+  return dt.toLocaleString('es-ES', {
+    dateStyle: 'full',
+    timeStyle: 'short'
+  });
+}
+
+function formatCurrencyEUR(amount) {
+  if (!Number.isFinite(amount)) return 'No disponible';
+  return new Intl.NumberFormat('es-ES', {
+    style: 'currency',
+    currency: 'EUR'
+  }).format(amount);
+}
+
+function composeDisplayName({ firstName, surname, username, email }) {
+  const fullName = [firstName, surname].filter(Boolean).join(' ').trim();
+  if (fullName) return fullName;
+  if (username) return username;
+  if (email) return email;
+  return 'No disponible';
+}
+
+function escapeHtml(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case '&': return '&amp;';
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '"': return '&quot;';
+      case "'": return '&#39;';
+      default: return char;
+    }
+  });
+}
+
 //Conversión segura a céntimos
 const toCents = (n) => {
   const x = Number(n);
@@ -343,6 +383,116 @@ The ${productName} Team`;
                 </td>
               </tr>
 
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>`;
+
+  return { subject, text, html };
+}
+
+function renderDepositReservationEmail({ booking, depositAmountCents }) {
+  if (!booking) {
+    return {
+      subject: 'Se ha confirmado una reserva',
+      text: 'Hola equipo, se ha confirmado una reserva.',
+      html: '<p>Hola equipo, se ha confirmado una reserva.</p>'
+    };
+  }
+
+  const depositEuros = (typeof depositAmountCents === 'number' ? depositAmountCents : 0) / 100;
+  const depositFormatted = formatCurrencyEUR(depositEuros);
+  const finalPriceNumber = booking.finalPrice != null ? Number(booking.finalPrice) : null;
+  const finalPriceFormatted = finalPriceNumber != null && Number.isFinite(finalPriceNumber)
+    ? formatCurrencyEUR(finalPriceNumber)
+    : 'No disponible';
+
+  const professionalName = composeDisplayName(booking.professional || {});
+  const clientName = composeDisplayName(booking.client || {});
+  const serviceTitle = booking.serviceTitle || 'Servicio sin título';
+  const bookingIdText = `#${booking.id}`;
+  const startText = formatDateTimeEs(booking.start);
+  const endText = booking.end ? formatDateTimeEs(booking.end) : null;
+  const rangeText = endText && endText !== 'No especificada'
+    ? `${startText} · ${endText}`
+    : startText;
+
+  const detailsRows = [
+    ['Reserva', bookingIdText],
+    ['Servicio', serviceTitle],
+    ['Profesional', professionalName],
+    ['Cliente', clientName],
+    ['Fecha', rangeText],
+    ['Depósito', depositFormatted],
+    ['Precio total', finalPriceFormatted],
+  ];
+
+  const preheader = `Se ha cobrado el depósito de ${depositFormatted} para la reserva ${bookingIdText}.`;
+  const subject = `Se ha confirmado una reserva ${bookingIdText}`;
+  const textLines = [
+    'Hola equipo,',
+    '',
+    `Se ha cobrado correctamente el depósito de ${depositFormatted} para la reserva ${bookingIdText}.`,
+    '',
+    `Servicio: ${serviceTitle}`,
+    `Profesional: ${professionalName}`,
+    `Cliente: ${clientName}`,
+    `Fecha: ${rangeText}`,
+    `Precio total: ${finalPriceFormatted}`,
+    '',
+    '— Equipo Wisdom'
+  ];
+  const text = textLines.join('\n');
+
+  const rowsHtml = detailsRows.map(([label, value]) => `
+      <tr>
+        <td style="padding:6px 0; font-weight:600; color:#111827;">${escapeHtml(label)}</td>
+        <td style="padding:6px 0; color:#374151;">${escapeHtml(value)}</td>
+      </tr>
+    `).join('');
+
+  const html = `<!doctype html>
+    <html lang="es">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="color-scheme" content="light dark">
+      <meta name="supported-color-schemes" content="light dark">
+      <title>${escapeHtml(subject)}</title>
+      <style>
+        .content { font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; font-size:15px; line-height:1.65; }
+        @media (max-width:480px) { .content { font-size:16px !important; line-height:1.7 !important; } }
+        a { text-decoration: underline; color: inherit; }
+        body, table, td, p { margin:0; }
+      </style>
+    </head>
+    <body style="margin:0; padding:0; background:none !important;">
+      <div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden;">
+        ${escapeHtml(preheader)}
+      </div>
+
+      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+        <tr>
+          <td align="center" style="padding:0 16px;">
+            <table role="presentation" width="640" border="0" cellspacing="0" cellpadding="0" style="width:100%; max-width:640px; border-collapse:collapse;">
+              <tr>
+                <td align="left" style="padding:24px 8px 8px 8px;">
+                  <img src="https://storage.googleapis.com/wisdom-images/app_icon.png" width="36" height="36" alt="Wisdom"
+                       style="display:block; border:0; outline:none; text-decoration:none; width:36px; height:36px;">
+                </td>
+              </tr>
+              <tr>
+                <td class="content" style="padding:8px 8px 24px 8px;">
+                  <p style="margin:0 0 16px;">Hola equipo,</p>
+                  <p style="margin:0 0 16px;">Se ha cobrado correctamente el depósito de ${escapeHtml(depositFormatted)} para la reserva ${escapeHtml(bookingIdText)}.</p>
+                  <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%; max-width:480px; border-collapse:collapse; margin:24px 0;">
+                    ${rowsHtml}
+                  </table>
+                  <p style="margin:0;">— Equipo Wisdom</p>
+                </td>
+              </tr>
             </table>
           </td>
         </tr>
@@ -5586,12 +5736,17 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           null;
         const pmId = pi?.payment_method || pi?.latest_charge?.payment_method || null;
 
+        const amountCents = typeof pi.amount_received === 'number'
+          ? pi.amount_received
+          : (typeof pi.amount === 'number' ? pi.amount : 0);
+        let depositNotification = null;
+
         await connection.beginTransaction();
         await upsertPayment(connection, {
           bookingId,
           type,
           paymentIntentId: pi.id,
-          amountCents: pi.amount_received ?? pi.amount ?? 0,
+          amountCents,
           status: mapStatus(pi.status),
           transferGroup: pi.transfer_group || null,
           paymentMethodId: pmId || null,
@@ -5599,7 +5754,57 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         });
 
         if (event.type === 'payment_intent.succeeded' && type === 'deposit') {
-          await connection.query('UPDATE booking SET booking_status = "requested" WHERE id = ?', [bookingId]);
+          const [[bookingRow]] = await connection.query(
+            `SELECT
+               b.id,
+               b.booking_start_datetime,
+               b.booking_end_datetime,
+               b.final_price,
+               s.service_title,
+               client.first_name AS client_first_name,
+               client.surname AS client_surname,
+               client.username AS client_username,
+               client.email AS client_email,
+               prof.first_name AS professional_first_name,
+               prof.surname AS professional_surname,
+               prof.username AS professional_username,
+               prof.email AS professional_email
+             FROM booking b
+             LEFT JOIN user_account client ON client.id = b.user_id
+             LEFT JOIN service s ON s.id = b.service_id
+             LEFT JOIN user_account prof ON prof.id = s.user_id
+             WHERE b.id = ?
+             LIMIT 1`,
+            [bookingId]
+          );
+          const [updateResult] = await connection.query(
+            'UPDATE booking SET booking_status = "requested" WHERE id = ? AND booking_status <> "requested"',
+            [bookingId]
+          );
+          if (bookingRow && updateResult.affectedRows > 0) {
+            depositNotification = {
+              booking: {
+                id: bookingRow.id,
+                serviceTitle: bookingRow.service_title,
+                start: bookingRow.booking_start_datetime,
+                end: bookingRow.booking_end_datetime,
+                finalPrice: bookingRow.final_price,
+                professional: {
+                  firstName: bookingRow.professional_first_name,
+                  surname: bookingRow.professional_surname,
+                  username: bookingRow.professional_username,
+                  email: bookingRow.professional_email,
+                },
+                client: {
+                  firstName: bookingRow.client_first_name,
+                  surname: bookingRow.client_surname,
+                  username: bookingRow.client_username,
+                  email: bookingRow.client_email,
+                },
+              },
+              depositAmountCents: amountCents,
+            };
+          }
         }
         if (event.type === 'payment_intent.succeeded' && type === 'final') {
           await connection.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [bookingId]);
@@ -5615,6 +5820,21 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         }
 
         await connection.commit();
+
+        if (depositNotification) {
+          try {
+            const { subject, text, html } = renderDepositReservationEmail(depositNotification);
+            await transporter.sendMail({
+              from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
+              to: 'hernanz.reio@gmail.com',
+              subject,
+              text,
+              html,
+            });
+          } catch (mailErr) {
+            console.error('Error sending deposit notification email:', mailErr);
+          }
+        }
         break;
       }
 
