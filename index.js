@@ -256,18 +256,22 @@ function weightedSampleWithoutReplacement(arr, k) {
   return out;
 }
 
-// helper para renderizar el correo 
-function renderEmail({ termsUrl, privacyUrl }) {
-  const subject = "We're updating our Terms & Privacy Policy";
-  const preheader = "These updates will take effect on September 7, 2025.";
+// helper para renderizar el correo
+function renderEmail({
+  termsUrl = 'https://example.com/terms',
+  privacyUrl = 'https://example.com/privacy',
+  effectiveDate = 'September 7, 2025',
+  productName = 'Wisdom'
+} = {}) {
+  const subject = `${productName} is updating our Terms & Privacy Policy`;
   const text = `Hi there,
 
-  We're writing to let you know that we're updating our Terms of Service and Privacy Policy. These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced, and bring more clarity to how Cosmos works.
+We're writing to let you know that we're updating the ${productName} Terms of Service and Privacy Policy. These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced, and bring more clarity to how ${productName} works.
 
-  These updates will take effect on September 7, 2025. By continuing to use Cosmos after that date, you'll be agreeing to the new terms and privacy policy.
+These updates will take effect on ${effectiveDate}. By continuing to use ${productName} after that date, you'll be agreeing to the new terms and privacy policy.
 
-  With gratitude,
-  The Cosmos Team`;
+With gratitude,
+The ${productName} Team`;
 
   const html = `
   <!doctype html>
@@ -276,29 +280,29 @@ function renderEmail({ termsUrl, privacyUrl }) {
       <meta charset="utf-8">
       <meta name="color-scheme" content="light only">
       <meta name="viewport" content="width=device-width,initial-scale=1">
-      <title>We're updating our Terms & Privacy Policy</title>
+      <title>${productName} is updating our Terms & Privacy Policy</title>
     </head>
     <body style="margin:0;background:#ffffff;">
-      <div style="max-width:640px;margin:0 auto;padding:24px 20px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#111827; line-height:1.6;">
+      <div style="max-width:640px;margin:0 auto;padding:24px 20px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111827; line-height:1.6;">
         <p style="margin:0 0 16px;">Hi there,</p>
 
         <p style="margin:0 0 16px;">
           We're writing to let you know that we're updating our
-          <a href="https://example.com/terms" style="color:#1a73e8;text-decoration:underline;">Terms of Service</a>
+          <a href="${termsUrl}" style="color:#1a73e8;text-decoration:underline;">Terms of Service</a>
           and
-          <a href="https://example.com/privacy" style="color:#1a73e8;text-decoration:underline;">Privacy Policy</a>.
+          <a href="${privacyUrl}" style="color:#1a73e8;text-decoration:underline;">Privacy Policy</a>.
           These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced,
-          and bring more clarity to how Cosmos works.
+          and bring more clarity to how ${productName} works.
         </p>
 
         <p style="margin:0 0 16px;">
-          These updates will take effect on <strong>September 7, 2025</strong>. By continuing to use Cosmos after that date,
+          These updates will take effect on <strong>${effectiveDate}</strong>. By continuing to use ${productName} after that date,
           you'll be agreeing to the new terms and privacy policy.
         </p>
 
         <p style="margin:0;">
           With gratitude,<br>
-          The Cosmos Team
+          The ${productName} Team
         </p>
       </div>
     </body>
@@ -308,40 +312,84 @@ function renderEmail({ termsUrl, privacyUrl }) {
   return { subject, text, html };
 }
 
-// Ejemplo: enviar a 500 contactos (uno a uno, mejor para reputación y métricas)
-async function sendEmailToAll(pool, transporter) {
-  const termsUrl = "https://example.com/terms";
-  const privacyUrl = "https://example.com/privacy";
-  const { subject, text, html } = renderEmail({ termsUrl, privacyUrl });
+// Envía el correo de actualización de términos a todos los usuarios
+async function sendEmailToAll(pool, transporter, options = {}) {
+  const {
+    termsUrl,
+    privacyUrl,
+    effectiveDate,
+    productName,
+    dryRun = false,
+    testEmail = null,
+    limit = null
+  } = options;
 
-  const [rows] = await pool.promise().query(
-    "SELECT email FROM user_account WHERE email IS NOT NULL"
-  );
+  const { subject, text, html } = renderEmail({ termsUrl, privacyUrl, effectiveDate, productName });
 
-  //for (const { email } of rows) {
+  let sql = 'SELECT email FROM user_account WHERE email IS NOT NULL';
+  const params = [];
+  const numericLimit = Number(limit);
+  if (Number.isFinite(numericLimit) && numericLimit > 0) {
+    sql += ' LIMIT ?';
+    params.push(Math.floor(numericLimit));
+  }
+
+  const [rows] = await pool.promise().query(sql, params);
+
+  const seen = new Set();
+  const recipients = [];
+  for (const row of rows) {
+    const raw = typeof row.email === 'string' ? row.email.trim() : '';
+    if (!raw) continue;
+    const key = raw.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    recipients.push(raw);
+  }
+
+  const targetRecipients = testEmail ? [testEmail] : recipients;
+  const summary = {
+    totalRecipients: recipients.length,
+    targetedRecipients: targetRecipients.length,
+    dryRun: Boolean(dryRun),
+    sent: 0,
+    failed: 0,
+    errors: []
+  };
+
+  if (dryRun) {
+    summary.previewRecipients = targetRecipients.slice(0, 10);
+    if (summary.errors.length === 0) {
+      delete summary.errors;
+    }
+    return summary;
+  }
+
+  for (const email of targetRecipients) {
     try {
       await transporter.sendMail({
         from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
-        to: 'hernanz.reio@gmail.com', //email,                 
+        to: email,
         subject,
         text,
         html,
-        headers: { "X-Entity-Ref-ID": "policy-update-2025-09-07" }
+        headers: { 'X-Entity-Ref-ID': 'policy-update-2025-09-07' }
       });
-      // Opcional: espera corta para evitar picos (p.ej. 100–200ms):
+      summary.sent += 1;
       await new Promise(r => setTimeout(r, 150));
     } catch (e) {
-      console.error("Error enviando a", email, e);
+      summary.failed += 1;
+      summary.errors.push({ email, message: e.message });
+      console.error('Error enviando a', email, e);
     }
-  //}
+  }
+
+  if (summary.errors.length === 0) {
+    delete summary.errors;
+  }
+
+  return summary;
 }
-
-
-
-
-
-
-
 //--------------------------------------------
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
@@ -5437,6 +5485,37 @@ app.patch('/api/service_reports/:id', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('Error al actualizar la denuncia:', err);
     res.status(500).json({ error: 'Error al actualizar la denuncia.' });
+  }
+});
+
+app.post('/api/admin/terms-update-email', async (req, res) => {
+  const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+  if (!isStaff) return res.status(403).json({ error: 'Forbidden' });
+
+  const {
+    termsUrl,
+    privacyUrl,
+    effectiveDate,
+    productName,
+    dryRun = false,
+    testEmail = null,
+    limit = null
+  } = req.body || {};
+
+  try {
+    const summary = await sendEmailToAll(pool, transporter, {
+      termsUrl,
+      privacyUrl,
+      effectiveDate,
+      productName,
+      dryRun,
+      testEmail,
+      limit
+    });
+    res.json(summary);
+  } catch (err) {
+    console.error('Error al mandar la actualización de términos:', err);
+    res.status(500).json({ error: 'Error al mandar la actualización de términos.' });
   }
 });
 
