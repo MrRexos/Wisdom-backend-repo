@@ -256,9 +256,93 @@ function weightedSampleWithoutReplacement(arr, k) {
   return out;
 }
 
+// helper para renderizar el correo 
+function renderEmail({ termsUrl, privacyUrl }) {
+  const subject = "We're updating our Terms & Privacy Policy";
+  const preheader = "These updates will take effect on September 7, 2025.";
+  const text = `Hi there,
+
+  We're writing to let you know that we're updating our Terms of Service and Privacy Policy. These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced, and bring more clarity to how Cosmos works.
+
+  These updates will take effect on September 7, 2025. By continuing to use Cosmos after that date, you'll be agreeing to the new terms and privacy policy.
+
+  With gratitude,
+  The Cosmos Team`;
+
+  const html = `
+  <!doctype html>
+  <html lang="en" style="background:#ffffff;">
+    <head>
+      <meta charset="utf-8">
+      <meta name="color-scheme" content="light only">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <title>We're updating our Terms & Privacy Policy</title>
+    </head>
+    <body style="margin:0;background:#ffffff;">
+      <div style="max-width:640px;margin:0 auto;padding:24px 20px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:#111827; line-height:1.6;">
+        <p style="margin:0 0 16px;">Hi there,</p>
+
+        <p style="margin:0 0 16px;">
+          We're writing to let you know that we're updating our
+          <a href="https://example.com/terms" style="color:#1a73e8;text-decoration:underline;">Terms of Service</a>
+          and
+          <a href="https://example.com/privacy" style="color:#1a73e8;text-decoration:underline;">Privacy Policy</a>.
+          These changes do three things: keep us aligned with current laws and regulations, support new features we've introduced,
+          and bring more clarity to how Cosmos works.
+        </p>
+
+        <p style="margin:0 0 16px;">
+          These updates will take effect on <strong>September 7, 2025</strong>. By continuing to use Cosmos after that date,
+          you'll be agreeing to the new terms and privacy policy.
+        </p>
+
+        <p style="margin:0;">
+          With gratitude,<br>
+          The Cosmos Team
+        </p>
+      </div>
+    </body>
+  </html>
+  `;
+
+  return { subject, text, html };
+}
+
+// Ejemplo: enviar a 500 contactos (uno a uno, mejor para reputación y métricas)
+async function sendEmailToAll(pool, transporter) {
+  const termsUrl = "https://example.com/terms";
+  const privacyUrl = "https://example.com/privacy";
+  const { subject, text, html } = renderEmail({ termsUrl, privacyUrl });
+
+  const [rows] = await pool.promise().query(
+    "SELECT email FROM user_account WHERE email IS NOT NULL"
+  );
+
+  //for (const { email } of rows) {
+    try {
+      await transporter.sendMail({
+        from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
+        to: 'hernanz.reio@gmail.com', //email,                 
+        subject,
+        text,
+        html,
+        headers: { "X-Entity-Ref-ID": "policy-update-2025-09-07" }
+      });
+      // Opcional: espera corta para evitar picos (p.ej. 100–200ms):
+      await new Promise(r => setTimeout(r, 150));
+    } catch (e) {
+      console.error("Error enviando a", email, e);
+    }
+  //}
+}
 
 
 
+
+
+
+
+//--------------------------------------------
 
 // Configuración del pool de conexiones a la base de datos a // JSON.parse(process.env.GOOGLE_CREDENTIALS)..
 const pool = mysql.createPool({
