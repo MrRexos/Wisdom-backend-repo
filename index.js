@@ -14,6 +14,7 @@ const crypto = require("crypto");
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const os = require('os');
+const { computeServiceResponseTime } = require('./src/serviceMetrics');
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
 const IMG_INSTA  = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
 const IMG_X      = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
@@ -2390,7 +2391,7 @@ app.get('/api/service/:id', (req, res) => {
       WHERE s.id = ?;
     `;
 
-    connection.query(query, [id], (err, serviceData) => {
+    connection.query(query, [id], async (err, serviceData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -2400,7 +2401,21 @@ app.get('/api/service/:id', (req, res) => {
       }
 
       if (serviceData.length > 0) {
-        res.status(200).json(serviceData[0]); // Devolver la información del servicio
+        const service = serviceData[0];
+
+        try {
+          const responseTime = await computeServiceResponseTime({
+            serviceId: service.service_id,
+            professionalId: service.user_id,
+            pool,
+          });
+          service.response_time_minutes = responseTime ?? null;
+        } catch (metricError) {
+          console.error('Error calculating service response time metric:', metricError);
+          service.response_time_minutes = null;
+        }
+
+        res.status(200).json(service); // Devolver la información del servicio
       } else {
         res.status(404).json({ notFound: true, message: 'Servicio no encontrado.' });
       }
