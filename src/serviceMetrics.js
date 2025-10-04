@@ -3,7 +3,10 @@ const { getFirestore } = require('./firestore');
 const RESPONSE_WINDOW_DAYS = 180;
 const HALF_LIFE_DAYS = 90;
 const TRIM_PERCENT = 0.05;
-const MIN_PAIRS = 10;
+const MIN_PAIRS = Math.max(
+  Number.parseInt(process.env.SERVICE_RESPONSE_TIME_MIN_PAIRS || '3', 10) || 3,
+  1,
+);
 const C_MAX_MINUTES = 7 * 24 * 60;
 
 const DEFAULT_CONVERSATION_COLLECTIONS = (process.env.FIRESTORE_CONVERSATION_COLLECTIONS || 'conversations,chats,serviceChats')
@@ -667,6 +670,25 @@ function buildResponsePairs(messages, calendar, windowStart, now) {
   return pairs;
 }
 
+function computeWeightedResponseTime(pairs) {
+  let numerator = 0;
+  let denominator = 0;
+
+  for (const item of pairs) {
+    const weight = Math.pow(0.5, item.ageDays / HALF_LIFE_DAYS);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+    numerator += weight * item.delta;
+    denominator += weight;
+  }
+
+  if (!denominator) {
+    return null;
+  }
+
+  const responseTime = numerator / denominator;
+  return Number.isFinite(responseTime) ? responseTime : null;
+}
+
 async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   const firestore = getFirestore();
   if (!firestore) {
@@ -690,11 +712,18 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   const windowStart = new Date(now.getTime() - RESPONSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const pairs = buildResponsePairs(messages, calendar, windowStart, now);
 
+  const rawValues = pairs.map((pair) => pair.deltaRaw).sort((a, b) => a - b);
+
   if (pairs.length < MIN_PAIRS) {
+    const fallback = computeWeightedResponseTime(
+      pairs.map((pair) => ({ delta: pair.deltaRaw, ageDays: pair.ageDays })),
+    );
+    if (fallback !== null) {
+      return fallback;
+    }
     return null;
   }
 
-  const rawValues = pairs.map((pair) => pair.deltaRaw).sort((a, b) => a - b);
   const p5 = computePercentile(rawValues, 0.05);
   const p95 = computePercentile(rawValues, 0.95);
 
@@ -711,21 +740,7 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
     return null;
   }
 
-  let numerator = 0;
-  let denominator = 0;
-  for (const item of trimmed) {
-    const weight = Math.pow(0.5, item.ageDays / HALF_LIFE_DAYS);
-    if (!Number.isFinite(weight) || weight <= 0) continue;
-    numerator += weight * item.delta;
-    denominator += weight;
-  }
-
-  if (!denominator) {
-    return null;
-  }
-
-  const responseTime = numerator / denominator;
-  return Number.isFinite(responseTime) ? responseTime : null;
+  return computeWeightedResponseTime(trimmed);
 }
 
 module.exports = {
