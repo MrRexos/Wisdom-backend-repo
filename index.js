@@ -16,8 +16,8 @@ const fs = require('fs');
 const os = require('os');
 const { computeServiceResponseTime } = require('./src/serviceMetrics');
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
-const IMG_INSTA  = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
-const IMG_X      = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
+const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
+const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
 
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -101,7 +101,7 @@ function authenticateToken(req, res, next) {
 
   if (!token) {
     return res.status(401)
-      .set('WWW-Authenticate','Bearer error="invalid_token", error_description="missing token"')
+      .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="missing token"')
       .json({ error: 'missing_token' });
   }
 
@@ -109,11 +109,11 @@ function authenticateToken(req, res, next) {
     if (err) {
       if (err.name === 'TokenExpiredError') {
         return res.status(401)
-          .set('WWW-Authenticate','Bearer error="invalid_token", error_description="token expired"')
+          .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="token expired"')
           .json({ error: 'token_expired' });
       }
       return res.status(401)
-        .set('WWW-Authenticate','Bearer error="invalid_token", error_description="invalid token"')
+        .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="invalid token"')
         .json({ error: 'invalid_token' });
     }
     req.user = { id: payload.id || payload.sub, ...payload };
@@ -1004,7 +1004,7 @@ app.post('/api/signup', async (req, res) => {
                 </body>
               </html>`
             });
-            
+
           } catch (mailErr) {
             console.error('Error al enviar el correo de verificación:', mailErr);
           }
@@ -1149,7 +1149,7 @@ app.post('/api/forgot-password', (req, res) => {
                 </body>
               </html>`
             });
-            
+
           } catch (mailErr) {
             console.error('Error al enviar el correo de restablecimiento:', mailErr);
           }
@@ -2404,11 +2404,19 @@ app.get('/api/service/:id', (req, res) => {
         const service = serviceData[0];
 
         try {
+          const __dbg = (() => { const v = String(process.env.METRICS_DEBUG || '').toLowerCase(); return v === '1' || v === 'true' || v === 'yes' || v === 'debug'; })();
+          const __t0 = Date.now();
+          if (__dbg) {
+            console.log('[METRICS] /api/service/:id compute start', { serviceId: service.service_id, professionalId: service.user_id });
+          }
           const responseTime = await computeServiceResponseTime({
             serviceId: service.service_id,
             professionalId: service.user_id,
             pool,
           });
+          if (__dbg) {
+            console.log('[METRICS] /api/service/:id compute done', { responseTime, ms: Date.now() - __t0 });
+          }
           service.response_time_minutes = responseTime ?? null;
         } catch (metricError) {
           console.error('Error calculating service response time metric:', metricError);
