@@ -2344,14 +2344,46 @@ app.get('/api/service/:id', (req, res) => {
          FROM consult_via cv 
          WHERE cv.id = s.consult_via_id) AS consult_via,
         -- Información de la categoría del servicio
-        (SELECT JSON_OBJECT('id', sc.id, 
-          'name', sct.service_category_name, 
-          'description', sct.description, 
+        (SELECT JSON_OBJECT('id', sc.id,
+          'name', sct.service_category_name,
+          'description', sct.description,
           'family', JSON_OBJECT('id', sf.id, 'name', sf.service_family, 'description', sf.description))
          FROM service_category sc
          JOIN service_family sf ON sc.service_family_id = sf.id
          JOIN service_category_type sct ON sc.service_category_type_id = sct.id
-         WHERE sc.id = s.service_category_id) AS category
+         WHERE sc.id = s.service_category_id) AS category,
+        -- Métricas solicitadas
+        (SELECT COUNT(*)
+         FROM booking b
+         WHERE b.service_id = s.id
+           AND LOWER(b.booking_status) IN ('accepted', 'confirmed', 'completed')) AS confirmed_booking_count,
+        (SELECT COALESCE(SUM(completed_count) - COUNT(*), 0)
+         FROM (
+           SELECT COUNT(*) AS completed_count
+           FROM booking b
+           WHERE b.service_id = s.id
+             AND LOWER(b.booking_status) = 'completed'
+           GROUP BY b.user_id
+         ) AS completed_by_user) AS repeated_bookings_count,
+        (SELECT COALESCE(SUM(COALESCE(b.final_price, 0) - COALESCE(b.commission, 0)), 0)
+         FROM booking b
+         WHERE b.service_id = s.id
+           AND LOWER(b.booking_status) = 'completed') AS total_earned_amount,
+        (SELECT COUNT(DISTINCT sl.user_id)
+         FROM item_list il
+         JOIN service_list sl ON il.list_id = sl.id
+         WHERE il.service_id = s.id) AS likes_count,
+        (SELECT ROUND(COALESCE(SUM(
+             CASE
+               WHEN b.service_duration IS NOT NULL THEN b.service_duration
+               WHEN b.booking_start_datetime IS NOT NULL AND b.booking_end_datetime IS NOT NULL
+                 THEN GREATEST(TIMESTAMPDIFF(MINUTE, b.booking_start_datetime, b.booking_end_datetime), 0)
+               ELSE 0
+             END
+           ), 0) / 60, 2)
+         FROM booking b
+         WHERE b.service_id = s.id
+           AND LOWER(b.booking_status) = 'completed') AS total_hours_completed
       FROM service s
       JOIN price p ON s.price_id = p.id
       JOIN user_account ua ON s.user_id = ua.id
