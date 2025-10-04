@@ -1622,7 +1622,9 @@ app.get('/api/lists/:id/items', (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.is_hidden,
         service.service_created_datetime,
+        service.last_edit_datetime,
         price.price,
         price.price_type,
         user_account.id AS user_id,
@@ -1831,7 +1833,9 @@ app.get('/api/category/:id/services', (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.is_hidden,
         service.service_created_datetime,
+        service.last_edit_datetime,
         price.price,
         price.price_type,
         user_account.id AS user_id,
@@ -2000,13 +2004,12 @@ app.post('/api/service', (req, res) => {
           // 3. Insertar en la tabla 'service'
           const serviceQuery = `
             INSERT INTO service (
-              service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime, is_hidden, last_edit_datetime
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
           `;
           const serviceValues = [
             service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-            action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies
+            action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, 0, null
           ];
 
           connection.query(serviceQuery, serviceValues, (err, result) => {
@@ -2264,7 +2267,9 @@ app.get('/api/service/:id', (req, res) => {
         s.price_consult,
         s.consult_via_id,
         s.is_individual,
+        s.is_hidden,
         s.service_created_datetime,
+        s.last_edit_datetime,
         s.allow_discounts,
         s.discount_rate,
         s.hobbies,
@@ -2563,7 +2568,9 @@ app.get('/api/user/:userId/bookings', (req, res) => {
           service.price_consult,
           service.consult_via_id,
           service.is_individual,
+          service.is_hidden,
           service.service_created_datetime,
+          service.last_edit_datetime,
           price.price,
           price.price_type,
           user_account.id AS service_user_id,
@@ -2648,7 +2655,9 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.is_hidden,
         service.service_created_datetime,
+        service.last_edit_datetime,
         price.price,
         price.price_type,
         -- Información del usuario que presta el servicio
@@ -2735,7 +2744,9 @@ app.get('/api/user/:id/services', (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.is_hidden,
         service.service_created_datetime,
+        service.last_edit_datetime,
         price.price,
         price.price_type,
         user_account.id AS user_id,
@@ -5366,7 +5377,9 @@ app.get('/api/services', (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.is_hidden,
         service.service_created_datetime,
+        service.last_edit_datetime,
         price.price,
         price.price_type,
         user_account.id AS user_id,
@@ -5467,7 +5480,9 @@ app.get('/api/services/:id', (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.is_hidden,
         service.service_created_datetime,
+        service.last_edit_datetime,
         price.price,
         price.price_type,
         user_account.id AS user_id,
