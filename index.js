@@ -2404,19 +2404,11 @@ app.get('/api/service/:id', (req, res) => {
         const service = serviceData[0];
 
         try {
-          const __dbg = (() => { const v = String(process.env.METRICS_DEBUG || '').toLowerCase(); return v === '1' || v === 'true' || v === 'yes' || v === 'debug'; })();
-          const __t0 = Date.now();
-          if (__dbg) {
-            console.log('[METRICS] /api/service/:id compute start', { serviceId: service.service_id, professionalId: service.user_id });
-          }
           const responseTime = await computeServiceResponseTime({
             serviceId: service.service_id,
             professionalId: service.user_id,
             pool,
           });
-          if (__dbg) {
-            console.log('[METRICS] /api/service/:id compute done', { responseTime, ms: Date.now() - __t0 });
-          }
           service.response_time_minutes = responseTime ?? null;
         } catch (metricError) {
           console.error('Error calculating service response time metric:', metricError);

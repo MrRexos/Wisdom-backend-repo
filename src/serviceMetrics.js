@@ -1,18 +1,5 @@
 const { getFirestore } = require('./firestore');
 
-const METRICS_DEBUG = (() => {
-  const v = String(process.env.METRICS_DEBUG || '').toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes' || v === 'debug';
-})();
-
-function dbg() {
-  if (!METRICS_DEBUG) return;
-  try {
-    // eslint-disable-next-line prefer-rest-params
-    console.log.apply(console, ['[METRICS]'].concat(Array.prototype.slice.call(arguments)));
-  } catch (_) { }
-}
-
 const RESPONSE_WINDOW_DAYS = 180;
 const HALF_LIFE_DAYS = 90;
 const TRIM_PERCENT = 0.05;
@@ -197,15 +184,6 @@ async function loadProfessionalCalendar(pool, professionalId) {
       }
     }
   }
-
-  try {
-    const availabilityBlocks = finalAvailability.reduce((sum, day) => sum + (Array.isArray(day) ? day.length : 0), 0);
-    dbg('Calendar loaded', {
-      professionalId: String(professionalId),
-      availabilityDays: availabilityBlocks,
-      unavailableCount: unavailable.length,
-    });
-  } catch (_) { }
 
   return {
     availability: finalAvailability,
@@ -531,16 +509,7 @@ async function fetchConversations(db, collectionNames, fieldNames, serviceValues
       }
     }
   }
-  const out = Array.from(conversations.values());
-  try {
-    dbg('fetchConversations', {
-      collections: collectionNames.length,
-      fieldNames: fieldNames.length,
-      values: serviceValues.length,
-      found: out.length,
-    });
-  } catch (_) { }
-  return out;
+  return Array.from(conversations.values());
 }
 
 async function fetchMessagesFromCollectionGroup(db, fieldNames, serviceValues, proIdentifiers) {
@@ -582,7 +551,6 @@ async function fetchMessagesFromCollectionGroup(db, fieldNames, serviceValues, p
       console.warn('collectionGroup processing failed:', error.message);
     }
   }
-  try { dbg('fetchMessagesFromCollectionGroup', { found: messages.length }); } catch (_) { }
   return messages;
 }
 
@@ -620,7 +588,6 @@ async function fetchMessagesFromCollections(db, collectionNames, fieldNames, ser
       }
     }
   }
-  try { dbg('fetchMessagesFromCollections', { collections: collectionNames.length, found: messages.length }); } catch (_) { }
   return messages;
 }
 
@@ -640,18 +607,14 @@ async function collectServiceMessages(db, serviceId, proIdentifiers) {
     messages.push(...conversationMessages);
   }
 
-  try { dbg('collectServiceMessages: conversations processed', { conversations: conversations.length, inlineMessages: messages.length }); } catch (_) { }
-
   if (!messages.length) {
     const fromCollectionGroup = await fetchMessagesFromCollectionGroup(db, DEFAULT_SERVICE_FIELD_NAMES, serviceValues, proIdentifiers);
     messages.push(...fromCollectionGroup);
-    try { dbg('collectServiceMessages: collectionGroup fallback', { added: fromCollectionGroup.length, total: messages.length }); } catch (_) { }
   }
 
   if (!messages.length) {
     const fromMessageCollections = await fetchMessagesFromCollections(db, DEFAULT_MESSAGE_COLLECTIONS, DEFAULT_SERVICE_FIELD_NAMES, serviceValues, proIdentifiers);
     messages.push(...fromMessageCollections);
-    try { dbg('collectServiceMessages: direct message collections fallback', { added: fromMessageCollections.length, total: messages.length }); } catch (_) { }
   }
 
   return messages;
@@ -704,7 +667,6 @@ function buildResponsePairs(messages, calendar, windowStart, now) {
     }
   }
 
-  try { dbg('buildResponsePairs', { messages: messages.length, pairs: pairs.length }); } catch (_) { }
   return pairs;
 }
 
@@ -724,17 +686,12 @@ function computeWeightedResponseTime(pairs) {
   }
 
   const responseTime = numerator / denominator;
-  const value = Number.isFinite(responseTime) ? responseTime : null;
-  try { dbg('computeWeightedResponseTime', { items: pairs.length, value }); } catch (_) { }
-  return value;
+  return Number.isFinite(responseTime) ? responseTime : null;
 }
 
 async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
-  try { dbg('computeServiceResponseTime:start', { serviceId: String(serviceId), professionalId: String(professionalId) }); } catch (_) { }
-  const t0 = Date.now();
   const firestore = getFirestore();
   if (!firestore) {
-    try { dbg('computeServiceResponseTime: no Firestore instance available'); } catch (_) { }
     return null;
   }
 
@@ -745,9 +702,7 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   }
 
   const messages = await collectServiceMessages(firestore, serviceId, proIdentifiers);
-  try { dbg('computeServiceResponseTime: messages collected', { count: messages.length }); } catch (_) { }
   if (!messages.length) {
-    try { dbg('computeServiceResponseTime: no messages found -> return null'); } catch (_) { }
     return null;
   }
 
@@ -756,7 +711,6 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   const now = new Date();
   const windowStart = new Date(now.getTime() - RESPONSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const pairs = buildResponsePairs(messages, calendar, windowStart, now);
-  try { dbg('computeServiceResponseTime: pairs built', { count: pairs.length, minPairsRequired: MIN_PAIRS }); } catch (_) { }
 
   const rawValues = pairs.map((pair) => pair.deltaRaw).sort((a, b) => a - b);
 
@@ -765,10 +719,8 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
       pairs.map((pair) => ({ delta: pair.deltaRaw, ageDays: pair.ageDays })),
     );
     if (fallback !== null) {
-      try { dbg('computeServiceResponseTime: using fallback weighted average', { fallback }); } catch (_) { }
       return fallback;
     }
-    try { dbg('computeServiceResponseTime: insufficient pairs and no fallback -> null'); } catch (_) { }
     return null;
   }
 
@@ -785,13 +737,10 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   const trimmed = sortedByDelta.slice(trimCount, sortedByDelta.length - trimCount || sortedByDelta.length);
 
   if (!trimmed.length) {
-    try { dbg('computeServiceResponseTime: trimmed set empty -> null'); } catch (_) { }
     return null;
   }
 
-  const result = computeWeightedResponseTime(trimmed);
-  try { dbg('computeServiceResponseTime:done', { result, ms: Date.now() - t0, pairs: pairs.length, p5, p95, trimmed: trimmed.length }); } catch (_) { }
-  return result;
+  return computeWeightedResponseTime(trimmed);
 }
 
 module.exports = {
