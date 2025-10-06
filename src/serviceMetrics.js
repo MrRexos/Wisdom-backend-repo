@@ -670,7 +670,12 @@ function buildResponsePairs(messages, calendar, windowStart, now) {
   return pairs;
 }
 
-function computeWeightedResponseTime(pairs) {
+function recordDebugStep(debug, stage, data) {
+  if (!debug) return;
+  debug.steps.push({ stage, data, timestamp: new Date().toISOString() });
+}
+
+function computeWeightedResponseTime(pairs, debug) {
   let numerator = 0;
   let denominator = 0;
 
@@ -682,17 +687,29 @@ function computeWeightedResponseTime(pairs) {
   }
 
   if (!denominator) {
+    recordDebugStep(debug, 'weighted_response_time_denominator_zero', {
+      numerator,
+      denominator,
+    });
     return null;
   }
 
   const responseTime = numerator / denominator;
-  return Number.isFinite(responseTime) ? responseTime : null;
+  const result = Number.isFinite(responseTime) ? responseTime : null;
+  recordDebugStep(debug, 'weighted_response_time_computed', {
+    numerator,
+    denominator,
+    responseTime: result,
+  });
+  return result;
 }
 
 async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
+  const debug = { steps: [] };
   const firestore = getFirestore();
   if (!firestore) {
-    return null;
+    recordDebugStep(debug, 'firestore_unavailable', {});
+    return { value: null, debug };
   }
 
   const proIdentifiers = new Set();
@@ -702,30 +719,57 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   }
 
   const messages = await collectServiceMessages(firestore, serviceId, proIdentifiers);
+  recordDebugStep(debug, 'messages_collected', {
+    serviceId,
+    professionalId,
+    normalizedProfessionalId,
+    proIdentifierCount: proIdentifiers.size,
+    messageCount: messages.length,
+  });
   if (!messages.length) {
-    return null;
+    recordDebugStep(debug, 'no_messages_found', {});
+    return { value: null, debug };
   }
 
   const calendar = await loadProfessionalCalendar(pool, professionalId);
+  recordDebugStep(debug, 'calendar_loaded', {
+    hasCalendar: Boolean(calendar),
+  });
 
   const now = new Date();
   const windowStart = new Date(now.getTime() - RESPONSE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const pairs = buildResponsePairs(messages, calendar, windowStart, now);
+  recordDebugStep(debug, 'response_pairs_built', {
+    pairCount: pairs.length,
+  });
 
   const rawValues = pairs.map((pair) => pair.deltaRaw).sort((a, b) => a - b);
 
   if (pairs.length < MIN_PAIRS) {
+    recordDebugStep(debug, 'insufficient_pairs_for_trimmed_mean', {
+      pairCount: pairs.length,
+      minimumRequired: MIN_PAIRS,
+    });
     const fallback = computeWeightedResponseTime(
       pairs.map((pair) => ({ delta: pair.deltaRaw, ageDays: pair.ageDays })),
+      debug,
     );
     if (fallback !== null) {
-      return fallback;
+      recordDebugStep(debug, 'fallback_weighted_response_time', {
+        value: fallback,
+      });
+      return { value: fallback, debug };
     }
-    return null;
+    recordDebugStep(debug, 'fallback_weighted_response_time_null', {});
+    return { value: null, debug };
   }
 
   const p5 = computePercentile(rawValues, 0.05);
   const p95 = computePercentile(rawValues, 0.95);
+  recordDebugStep(debug, 'winsorization_bounds', {
+    p5,
+    p95,
+  });
 
   const winsorized = pairs.map((pair) => ({
     delta: clamp(pair.deltaRaw, p5, p95),
@@ -735,12 +779,20 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   const sortedByDelta = winsorized.slice().sort((a, b) => a.delta - b.delta);
   const trimCount = Math.floor(sortedByDelta.length * TRIM_PERCENT);
   const trimmed = sortedByDelta.slice(trimCount, sortedByDelta.length - trimCount || sortedByDelta.length);
+  recordDebugStep(debug, 'trimmed_pairs', {
+    originalCount: winsorized.length,
+    trimCount,
+    resultingCount: trimmed.length,
+  });
 
   if (!trimmed.length) {
-    return null;
+    recordDebugStep(debug, 'trimmed_pairs_empty', {});
+    return { value: null, debug };
   }
 
-  return computeWeightedResponseTime(trimmed);
+  const finalValue = computeWeightedResponseTime(trimmed, debug);
+  recordDebugStep(debug, 'final_response_time', { value: finalValue });
+  return { value: finalValue, debug };
 }
 
 module.exports = {
