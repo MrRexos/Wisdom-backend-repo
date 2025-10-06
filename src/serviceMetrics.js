@@ -321,7 +321,7 @@ function collectIdentifiersByKey(data, keywords) {
 function augmentProIdentifiersFromConversation(data, proIdentifiers) {
   if (!data || typeof data !== 'object') return;
 
-  // Usa participantsMeta para añadir únicamente los que son pro
+  // Usa participantsMeta para añadir únicamente los que son pro 
   const meta = data.participantsMeta || data.participants_meta || data.participantsInfo;
   if (meta && typeof meta === 'object') {
     for (const [key, val] of Object.entries(meta)) {
