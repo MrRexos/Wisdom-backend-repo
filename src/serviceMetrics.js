@@ -24,6 +24,36 @@ const DEFAULT_SERVICE_FIELD_NAMES = (process.env.FIRESTORE_SERVICE_FIELD_NAMES |
   .map((name) => name.trim())
   .filter(Boolean);
 
+const DEFAULT_PARTICIPANT_FIELD_NAMES =
+  (process.env.FIRESTORE_PARTICIPANT_FIELD_NAMES || 'participants')
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+async function fetchConversationsByProfessional(db, collectionNames, participantFields, proValues, debug) {
+  const out = new Map();
+  for (const col of collectionNames) {
+    for (const field of participantFields) {
+      for (const val of proValues) {
+        // prueba número y string porque tu array guarda números
+        const needles = [val, Number(val), String(val)].filter(v => v !== null && v !== undefined);
+        for (const needle of needles) {
+          try {
+            const snap = await db.collection(col).where(field, 'array-contains', needle).get();
+            snap.forEach(doc => {
+              const key = doc.ref.path;
+              if (!out.has(key)) out.set(key, { id: doc.id, ref: doc.ref, data: doc.data() || {} });
+            });
+          } catch (error) {
+            recordDebugStep(debug, 'fetch_conversations_by_professional_failed', { col, field, needle, error: error.message });
+          }
+        }
+      }
+    }
+  }
+  const arr = Array.from(out.values());
+  recordDebugStep(debug, 'fetch_conversations_by_professional_done', { count: arr.length });
+  return arr;
+}
+
 function normalizeIdentifier(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'string') {
@@ -291,24 +321,30 @@ function collectIdentifiersByKey(data, keywords) {
 function augmentProIdentifiersFromConversation(data, proIdentifiers) {
   if (!data || typeof data !== 'object') return;
 
+  // Caso 1: participants = [62, 70]
   if (Array.isArray(data.participants)) {
-    for (const participant of data.participants) {
-      const id = normalizeIdentifier(
-        participant?.id ?? participant?.userId ?? participant?.user_id ?? participant?.uid
-      );
-      const roleValue = participant?.role || participant?.type || participant?.kind;
-      const role = typeof roleValue === 'string' ? roleValue.toLowerCase() : '';
-      const isProfessional = participant?.isProfessional === true || participant?.professional === true;
-      if (isProfessional || role.includes('pro') || role.includes('provider') || role.includes('professional')) {
-        if (id) proIdentifiers.add(id);
+    // Añade todos como candidatos (luego marcamos quién es pro con participantsMeta)
+    for (const pid of data.participants) {
+      const norm = normalizeIdentifier(pid);
+      if (norm) proIdentifiers.add(norm); // candidatos
+    }
+  }
+
+  // Caso 2: participantsMeta = {62:{is_professional:true}}
+  const meta = data.participantsMeta || data.participants_meta || data.participantsInfo;
+  if (meta && typeof meta === 'object') {
+    for (const [key, val] of Object.entries(meta)) {
+      const isPro = val?.is_professional === true || val?.isProfessional === true || val?.professional === true;
+      if (isPro) {
+        const norm = normalizeIdentifier(key);
+        if (norm) proIdentifiers.add(norm); // marca quién es pro DE VERDAD
       }
     }
   }
 
+  // Extra: si existe alguna bandera global
   const additional = collectIdentifiersByKey(data, ['professional', 'provider', 'pro']);
-  for (const id of additional) {
-    proIdentifiers.add(id);
-  }
+  for (const id of additional) proIdentifiers.add(id);
 }
 
 function augmentProIdentifiersFromMessage(messageData, proIdentifiers) {
@@ -321,6 +357,8 @@ function augmentProIdentifiersFromMessage(messageData, proIdentifiers) {
 
 function determineIsFromProfessional(rawMessage, normalizedSenderId, proIdentifiers) {
   if (rawMessage === null || rawMessage === undefined) return null;
+
+  // Preferencias explícitas si existen
   if (typeof rawMessage.isFromProfessional === 'boolean') return rawMessage.isFromProfessional;
   if (typeof rawMessage.fromProfessional === 'boolean') return rawMessage.fromProfessional;
   if (typeof rawMessage.fromPro === 'boolean') return rawMessage.fromPro;
@@ -346,8 +384,10 @@ function determineIsFromProfessional(rawMessage, normalizedSenderId, proIdentifi
     if (role.includes('client') || role.includes('customer') || role.includes('user')) return false;
   }
 
-  if (normalizedSenderId && proIdentifiers.has(normalizedSenderId)) {
-    return true;
+  // Fallback robusto: si tengo el set de profesionales, clasifica por senderId
+  if (normalizedSenderId) {
+    if (proIdentifiers.has(normalizedSenderId)) return true;
+    if (proIdentifiers.size > 0) return false; // si no es pro, es cliente
   }
 
   return null;
@@ -615,6 +655,20 @@ async function collectServiceMessages(db, serviceId, proIdentifiers) {
   if (!messages.length) {
     const fromMessageCollections = await fetchMessagesFromCollections(db, DEFAULT_MESSAGE_COLLECTIONS, DEFAULT_SERVICE_FIELD_NAMES, serviceValues, proIdentifiers);
     messages.push(...fromMessageCollections);
+  }
+
+  if (!messages.length && proIdentifiers.size) {
+    const dbConvs = await fetchConversationsByProfessional(
+      db,
+      DEFAULT_CONVERSATION_COLLECTIONS,
+      DEFAULT_PARTICIPANT_FIELD_NAMES,
+      Array.from(proIdentifiers),
+      /*debug*/ null
+    );
+    for (const c of dbConvs) {
+      augmentProIdentifiersFromConversation(c.data, proIdentifiers);
+      messages.push(...await extractMessagesFromConversation(c, proIdentifiers));
+    }
   }
 
   return messages;
