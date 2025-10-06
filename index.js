@@ -2409,15 +2409,19 @@ app.get('/api/service/:id', (req, res) => {
         const service = serviceData[0];
 
         try {
-          const responseTime = await computeServiceResponseTime({
+          const responseTimeResult = await computeServiceResponseTime({
             serviceId: service.service_id,
             professionalId: service.user_id,
             pool,
           });
-          service.response_time_minutes = responseTime ?? null;
+          service.response_time_minutes = responseTimeResult?.value ?? null;
+          service.response_time_debug = responseTimeResult?.debug ?? null;
         } catch (metricError) {
           console.error('Error calculating service response time metric:', metricError);
           service.response_time_minutes = null;
+          service.response_time_debug = {
+            error: metricError?.message || String(metricError),
+          };
         }
 
         res.status(200).json(service); // Devolver la información del servicio
