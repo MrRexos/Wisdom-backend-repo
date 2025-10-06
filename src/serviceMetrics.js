@@ -500,7 +500,7 @@ async function extractMessagesFromConversation(entry, globalProIdentifiers, targ
 
   if (Array.isArray(entry.data?.messages)) {
     entry.data.messages.forEach((rawMessage, index) => {
-      augmentProIdentifiersFromMessage(rawMessage, proIdentifiers);
+      augmentProIdentifiersFromMessage(rawMessage, context.proIdentifiers);
       const normalized = normalizeMessage(rawMessage, {
         ...context,
         fallbackConversationId: context.conversationId,
@@ -518,7 +518,7 @@ async function extractMessagesFromConversation(entry, globalProIdentifiers, targ
       const snapshot = await entry.ref.collection('messages').get();
       snapshot.forEach((doc) => {
         const data = doc.data() || {};
-        augmentProIdentifiersFromMessage(data, proIdentifiers);
+        augmentProIdentifiersFromMessage(data, context.proIdentifiers);
         const normalized = normalizeMessage({ id: doc.id, ...data }, context);
         if (normalized && !seenIds.has(normalized.conversationId + '::' + normalized.id)) {
           seenIds.add(normalized.conversationId + '::' + normalized.id);
@@ -682,7 +682,7 @@ async function collectServiceMessages(db, serviceId, proIdentifiers, targetProfe
     );
     for (const c of dbConvs) {
       augmentProIdentifiersFromConversation(c.data, proIdentifiers);
-      messages.push(...await extractMessagesFromConversation(c, proIdentifiers));
+      messages.push(...await extractMessagesFromConversation(c, proIdentifiers, normalizedProfessionalId));
     }
   }
 
