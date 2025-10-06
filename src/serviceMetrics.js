@@ -469,14 +469,33 @@ function normalizeMessage(rawMessage, context) {
   };
 }
 
-async function extractMessagesFromConversation(entry, proIdentifiers) {
+async function extractMessagesFromConversation(entry, globalProIdentifiers, targetProfessionalId) {
   const messages = [];
   const seenIds = new Set();
+
+  // 1) Set de pros por conversación 
+  const convPro = new Set(); 
+  const meta = entry.data?.participantsMeta || entry.data?.participants_meta || entry.data?.participantsInfo; 
+  if (meta && typeof meta === 'object') { 
+    for (const [key, val] of Object.entries(meta)) { 
+      const isPro = val?.is_professional === true || val?.isProfessional === true || val?.professional === true; 
+      if (isPro) { 
+        const norm = normalizeIdentifier(key); 
+        if (norm) convPro.add(norm); 
+      } 
+    } 
+  } 
+  
+  // 2) Si hay pros declarados y el pro objetivo NO está, saltar conversación 
+  if (convPro.size && targetProfessionalId && !convPro.has(targetProfessionalId)) { 
+    return []; 
+  } 
+  
   const context = {
     id: entry.id,
     conversationId: normalizeIdentifier(entry.data?.conversationId) || entry.id,
     fallbackConversationId: entry.id,
-    proIdentifiers,
+    proIdentifiers: convPro.size ? convPro : globalProIdentifiers,
   };
 
   if (Array.isArray(entry.data?.messages)) {
@@ -624,7 +643,7 @@ async function fetchMessagesFromCollections(db, collectionNames, fieldNames, ser
   return messages;
 }
 
-async function collectServiceMessages(db, serviceId, proIdentifiers) {
+async function collectServiceMessages(db, serviceId, proIdentifiers, targetProfessionalId) {
   const serviceValues = Array.from(new Set([
     serviceId,
     normalizeIdentifier(serviceId),
@@ -634,9 +653,12 @@ async function collectServiceMessages(db, serviceId, proIdentifiers) {
   const conversations = await fetchConversations(db, DEFAULT_CONVERSATION_COLLECTIONS, DEFAULT_SERVICE_FIELD_NAMES, serviceValues);
   const messages = [];
 
-  for (const conversation of conversations) {
-    augmentProIdentifiersFromConversation(conversation.data, proIdentifiers);
-    const conversationMessages = await extractMessagesFromConversation(conversation, proIdentifiers);
+  for (const conversation of conversations) { 
+    const conversationMessages = await extractMessagesFromConversation( 
+      conversation, 
+      proIdentifiers, 
+      targetProfessionalId
+    );
     messages.push(...conversationMessages);
   }
 
@@ -765,7 +787,13 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
     proIdentifiers.add(normalizedProfessionalId);
   }
 
-  const messages = await collectServiceMessages(firestore, serviceId, proIdentifiers);
+  const messages = await collectServiceMessages( 
+    firestore, 
+    serviceId, 
+    proIdentifiers, 
+    normalizedProfessionalId
+  );
+
   recordDebugStep(debug, 'messages_collected', {
     serviceId,
     professionalId,
