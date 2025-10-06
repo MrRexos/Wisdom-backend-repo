@@ -321,28 +321,21 @@ function collectIdentifiersByKey(data, keywords) {
 function augmentProIdentifiersFromConversation(data, proIdentifiers) {
   if (!data || typeof data !== 'object') return;
 
-  // Caso 1: participants = [62, 70]
-  if (Array.isArray(data.participants)) {
-    // Añade todos como candidatos (luego marcamos quién es pro con participantsMeta)
-    for (const pid of data.participants) {
-      const norm = normalizeIdentifier(pid);
-      if (norm) proIdentifiers.add(norm); // candidatos
-    }
-  }
+  // NO añadir todos los participants al set de pros
 
-  // Caso 2: participantsMeta = {62:{is_professional:true}}
+  // Usa participantsMeta para añadir únicamente los que son pro
   const meta = data.participantsMeta || data.participants_meta || data.participantsInfo;
   if (meta && typeof meta === 'object') {
     for (const [key, val] of Object.entries(meta)) {
       const isPro = val?.is_professional === true || val?.isProfessional === true || val?.professional === true;
       if (isPro) {
         const norm = normalizeIdentifier(key);
-        if (norm) proIdentifiers.add(norm); // marca quién es pro DE VERDAD
+        if (norm) proIdentifiers.add(norm);
       }
     }
   }
 
-  // Extra: si existe alguna bandera global
+  // Extra (opcional): si hay otras claves con "professional"
   const additional = collectIdentifiersByKey(data, ['professional', 'provider', 'pro']);
   for (const id of additional) proIdentifiers.add(id);
 }
