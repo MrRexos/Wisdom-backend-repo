@@ -2415,13 +2415,9 @@ app.get('/api/service/:id', (req, res) => {
             pool,
           });
           service.response_time_minutes = responseTimeResult?.value ?? null;
-          service.response_time_debug = responseTimeResult?.debug ?? null;
         } catch (metricError) {
           console.error('Error calculating service response time metric:', metricError);
           service.response_time_minutes = null;
-          service.response_time_debug = {
-            error: metricError?.message || String(metricError),
-          };
         }
 
         res.status(200).json(service); // Devolver la información del servicio
