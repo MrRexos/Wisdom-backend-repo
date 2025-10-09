@@ -2,6 +2,13 @@ const { getFirestore } = require('./firestore');
 
 const RESPONSE_WINDOW_DAYS = 180;
 const HALF_LIFE_DAYS = 90;
+const SUCCESS_WINDOW_DAYS = 180;
+const SUCCESS_HALF_LIFE_DAYS = 90;
+const RETENTION_WINDOW_DAYS = 365;
+const SUCCESS_WILSON_Z = 1.64;
+const BAYES_PRIOR_M = 10;
+const MIN_COMPLETED_THRESHOLD = 5;
+const MIN_REVIEW_THRESHOLD = 3;
 const TRIM_PERCENT = 0.05;
 const MIN_PAIRS = Math.max(
   Number.parseInt(process.env.SERVICE_RESPONSE_TIME_MIN_PAIRS || '3', 10) || 3,
@@ -27,6 +34,8 @@ const DEFAULT_SERVICE_FIELD_NAMES = (process.env.FIRESTORE_SERVICE_FIELD_NAMES |
 const DEFAULT_PARTICIPANT_FIELD_NAMES =
   (process.env.FIRESTORE_PARTICIPANT_FIELD_NAMES || 'participants')
     .split(',').map(s => s.trim()).filter(Boolean);
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 async function fetchConversationsByProfessional(db, collectionNames, participantFields, proValues, debug) {
   const out = new Map();
@@ -113,6 +122,39 @@ function computePercentile(sortedValues, percentile) {
   if (lower === upper) return sortedValues[lower];
   const weight = index - lower;
   return sortedValues[lower] + (sortedValues[upper] - sortedValues[lower]) * weight;
+}
+
+function computeExponentialWeight(ageDays, halfLifeDays = SUCCESS_HALF_LIFE_DAYS) {
+  if (!Number.isFinite(ageDays) || ageDays < 0) return 1;
+  if (!Number.isFinite(halfLifeDays) || halfLifeDays <= 0) return 1;
+  return Math.pow(0.5, ageDays / halfLifeDays);
+}
+
+function wilsonLowerBound(p, n, z = SUCCESS_WILSON_Z) {
+  if (!Number.isFinite(p) || !Number.isFinite(n) || !Number.isFinite(z)) return 0;
+  if (n <= 0) return 0;
+  const clampedP = Math.min(Math.max(p, 0), 1);
+  if (clampedP === 0) return 0;
+  if (clampedP === 1) return 1;
+  const zSquared = z * z;
+  const denominator = 1 + zSquared / n;
+  const centre = clampedP + zSquared / (2 * n);
+  const margin = z * Math.sqrt((clampedP * (1 - clampedP) + zSquared / (4 * n)) / n);
+  const lowerBound = (centre - margin) / denominator;
+  if (!Number.isFinite(lowerBound)) return 0;
+  return Math.min(Math.max(lowerBound, 0), 1);
+}
+
+function toNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function ensureDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date?.getTime())) return null;
+  return date;
 }
 
 function parseTimeToMinutes(value) {
@@ -840,6 +882,395 @@ async function computeServiceResponseTime({ serviceId, professionalId, pool }) {
   return { value: finalValue, debug };
 }
 
+async function computeServiceSuccessRate({
+  serviceId,
+  categoryId,
+  responseTimeMinutes = null,
+  pool,
+}) {
+  if (!serviceId || !pool?.promise) {
+    return { value: null };
+  }
+
+  const conn = pool.promise();
+  let resolvedCategoryId = Number(categoryId);
+  if (!Number.isFinite(resolvedCategoryId) || resolvedCategoryId <= 0) {
+    const [[serviceRow]] = await conn.query(
+      'SELECT service_category_id FROM service WHERE id = ? LIMIT 1',
+      [serviceId],
+    );
+    resolvedCategoryId = Number(serviceRow?.service_category_id) || null;
+  }
+
+  if (!resolvedCategoryId) {
+    return { value: null };
+  }
+
+  const [bookingRows] = await conn.query(
+    `
+      SELECT
+        b.service_id,
+        b.user_id,
+        LOWER(b.booking_status) AS booking_status,
+        b.booking_start_datetime,
+        b.booking_end_datetime,
+        b.order_datetime,
+        b.final_price,
+        b.commission,
+        COALESCE(pay.last_status, '') AS final_payment_status
+      FROM booking b
+      JOIN service s ON s.id = b.service_id
+      LEFT JOIN (
+        SELECT
+          booking_id,
+          SUBSTRING_INDEX(GROUP_CONCAT(status ORDER BY id DESC SEPARATOR ','), ',', 1) AS last_status
+        FROM payments
+        WHERE type = 'final'
+        GROUP BY booking_id
+      ) pay ON pay.booking_id = b.id
+      WHERE s.service_category_id = ?
+        AND (
+          (b.booking_end_datetime IS NOT NULL AND b.booking_end_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
+          (b.booking_start_datetime IS NOT NULL AND b.booking_start_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
+          (b.order_datetime IS NOT NULL AND b.order_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY))
+        )
+    `,
+    [resolvedCategoryId, RETENTION_WINDOW_DAYS, RETENTION_WINDOW_DAYS, RETENTION_WINDOW_DAYS],
+  );
+
+  const [reviewRows] = await conn.query(
+    `
+      SELECT
+        r.service_id,
+        r.rating,
+        r.review_datetime
+      FROM review r
+      JOIN service s ON s.id = r.service_id
+      WHERE s.service_category_id = ?
+        AND r.review_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)
+        AND r.rating IS NOT NULL
+    `,
+    [resolvedCategoryId, SUCCESS_WINDOW_DAYS],
+  );
+
+  const [responseRows] = await conn.query(
+    `
+      SELECT id, action_rate
+      FROM service
+      WHERE service_category_id = ?
+        AND action_rate IS NOT NULL
+    `,
+    [resolvedCategoryId],
+  );
+
+  const bookingMetrics = new Map();
+  const reviewMetrics = new Map();
+  const responseTimeByService = new Map();
+
+  const ensureMetrics = (id) => {
+    const key = Number(id);
+    if (!Number.isFinite(key)) return null;
+    if (!bookingMetrics.has(key)) {
+      bookingMetrics.set(key, {
+        confirmedWeighted: 0,
+        cancelledWeighted: 0,
+        completedWeighted: 0,
+        completedNoDisputeWeighted: 0,
+        disputeWeighted: 0,
+        revenueWeighted: 0,
+        confirmedRaw180: 0,
+        completedRaw180: 0,
+        completedNoDisputeRaw180: 0,
+        disputedRaw180: 0,
+        revenueRaw180: 0,
+        clients: new Map(),
+      });
+    }
+    return bookingMetrics.get(key);
+  };
+
+  const now = new Date();
+  const confirmedStatuses = new Set(['accepted', 'confirmed', 'completed']);
+
+  for (const row of bookingRows || []) {
+    const serviceKey = Number(row.service_id);
+    if (!Number.isFinite(serviceKey)) continue;
+    const metrics = ensureMetrics(serviceKey);
+    if (!metrics) continue;
+
+    const endDate = ensureDate(row.booking_end_datetime);
+    const startDate = ensureDate(row.booking_start_datetime);
+    const orderDate = ensureDate(row.order_datetime);
+    const eventDate = endDate || startDate || orderDate;
+    if (!eventDate) continue;
+
+    const ageDays = Math.max(0, (now.getTime() - eventDate.getTime()) / MS_PER_DAY);
+    if (!Number.isFinite(ageDays)) continue;
+    if (ageDays > RETENTION_WINDOW_DAYS && ageDays > SUCCESS_WINDOW_DAYS) continue;
+
+    const withinSuccessWindow = ageDays <= SUCCESS_WINDOW_DAYS;
+    const weight = withinSuccessWindow ? computeExponentialWeight(ageDays, SUCCESS_HALF_LIFE_DAYS) : 0;
+
+    const status = String(row.booking_status || '').toLowerCase();
+    const finalStatus = String(row.final_payment_status || '').toLowerCase();
+    const netRevenue = Math.max(0, toNumber(row.final_price) - toNumber(row.commission));
+    const isDisputed = finalStatus.includes('dispute') || finalStatus.includes('refund');
+
+    if (withinSuccessWindow && confirmedStatuses.has(status)) {
+      metrics.confirmedWeighted += weight;
+      metrics.confirmedRaw180 += 1;
+    }
+
+    if (withinSuccessWindow && status === 'cancelled') {
+      metrics.cancelledWeighted += weight;
+    }
+
+    if (status === 'completed') {
+      if (ageDays <= RETENTION_WINDOW_DAYS) {
+        const clientKey = Number(row.user_id);
+        if (Number.isFinite(clientKey)) {
+          const clients = metrics.clients;
+          clients.set(clientKey, (clients.get(clientKey) || 0) + 1);
+        }
+      }
+
+      if (withinSuccessWindow) {
+        metrics.completedWeighted += weight;
+        metrics.completedRaw180 += 1;
+        metrics.revenueRaw180 += netRevenue;
+        metrics.revenueWeighted += weight * netRevenue;
+
+        if (isDisputed) {
+          metrics.disputeWeighted += weight;
+          metrics.disputedRaw180 += 1;
+        } else {
+          metrics.completedNoDisputeWeighted += weight;
+          metrics.completedNoDisputeRaw180 += 1;
+        }
+      }
+    }
+  }
+
+  let categoryRatingWeightedSum = 0;
+  let categoryRatingWeightedCount = 0;
+
+  for (const row of reviewRows || []) {
+    const serviceKey = Number(row.service_id);
+    if (!Number.isFinite(serviceKey)) continue;
+    const metrics = reviewMetrics.get(serviceKey) || { weightedSum: 0, weightedCount: 0, rawCount: 0 };
+
+    const reviewDate = ensureDate(row.review_datetime);
+    if (!reviewDate) continue;
+    const ageDays = Math.max(0, (now.getTime() - reviewDate.getTime()) / MS_PER_DAY);
+    if (ageDays > SUCCESS_WINDOW_DAYS) continue;
+    const weight = computeExponentialWeight(ageDays, SUCCESS_HALF_LIFE_DAYS);
+    const rating = Math.min(Math.max(toNumber(row.rating), 1), 5);
+
+    metrics.weightedSum += rating * weight;
+    metrics.weightedCount += weight;
+    metrics.rawCount += 1;
+    reviewMetrics.set(serviceKey, metrics);
+
+    categoryRatingWeightedSum += rating * weight;
+    categoryRatingWeightedCount += weight;
+  }
+
+  const cancelRatios = [];
+  const revenueValues = [];
+  const disputeRatios = [];
+
+  for (const [, metrics] of bookingMetrics) {
+    if (metrics.confirmedWeighted > 0 && Number.isFinite(metrics.cancelledWeighted)) {
+      cancelRatios.push(metrics.cancelledWeighted / metrics.confirmedWeighted);
+    }
+    if (metrics.revenueRaw180 > 0) {
+      revenueValues.push(metrics.revenueRaw180);
+    }
+    if (metrics.completedWeighted > 0 && Number.isFinite(metrics.disputeWeighted)) {
+      disputeRatios.push(metrics.disputeWeighted / metrics.completedWeighted);
+    }
+  }
+
+  const sortedCancelRatios = cancelRatios.filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  const sortedRevenue = revenueValues.filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  const sortedDispute = disputeRatios.filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+
+  let P90_cancel_cat = sortedCancelRatios.length ? computePercentile(sortedCancelRatios, 0.9) : 0;
+  if (!Number.isFinite(P90_cancel_cat) || P90_cancel_cat <= 0) P90_cancel_cat = 0.1;
+
+  let P90_euros_cat = sortedRevenue.length ? computePercentile(sortedRevenue, 0.9) : 0;
+  if (!Number.isFinite(P90_euros_cat) || P90_euros_cat <= 0) P90_euros_cat = 100;
+
+  let P90_d_cat = sortedDispute.length ? computePercentile(sortedDispute, 0.9) : 0;
+  if (!Number.isFinite(P90_d_cat) || P90_d_cat <= 0) P90_d_cat = 0.05;
+
+  const responseTimeValues = [];
+  for (const row of responseRows || []) {
+    const id = Number(row.id);
+    const value = toNumber(row.action_rate, NaN);
+    if (Number.isFinite(id) && Number.isFinite(value)) {
+      responseTimeByService.set(id, value);
+      if (value >= 0) responseTimeValues.push(value);
+    }
+    if (Number.isFinite(id)) ensureMetrics(id);
+  }
+
+  const sortedRtValues = responseTimeValues.filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  let P75_RT_cat = sortedRtValues.length ? computePercentile(sortedRtValues, 0.75) : 0;
+  if (!Number.isFinite(P75_RT_cat) || P75_RT_cat <= 0) P75_RT_cat = 60;
+
+  const mu_cat = (() => {
+    if (categoryRatingWeightedCount > 0 && Number.isFinite(categoryRatingWeightedSum)) {
+      const avg = categoryRatingWeightedSum / categoryRatingWeightedCount;
+      return Math.min(Math.max(avg, 1), 5);
+    }
+    return 3.5;
+  })();
+
+  const allServiceIds = new Set([
+    ...Array.from(bookingMetrics.keys()),
+    ...Array.from(reviewMetrics.keys()),
+    ...Array.from(responseTimeByService.keys()),
+    Number(serviceId),
+  ]);
+
+  const categoryBaseScores = [];
+
+  const buildBaseScore = (id, options = {}) => {
+    const metrics = ensureMetrics(id);
+    if (!metrics) return null;
+    const reviews = reviewMetrics.get(id) || { weightedSum: 0, weightedCount: 0, rawCount: 0 };
+    const completedRaw = metrics.completedRaw180;
+    const reviewsRaw = reviews.rawCount || 0;
+    const meetsThreshold = completedRaw >= MIN_COMPLETED_THRESHOLD && reviewsRaw >= MIN_REVIEW_THRESHOLD;
+
+    const weightedReviewsCount = reviews.weightedCount || 0;
+    const weightedReviewSum = reviews.weightedSum || 0;
+    const bayesDenominator = BAYES_PRIOR_M + weightedReviewsCount;
+    const R_bayes = bayesDenominator > 0
+      ? (mu_cat * BAYES_PRIOR_M + weightedReviewSum) / bayesDenominator
+      : mu_cat;
+    const R_score = 25 * (Math.min(Math.max(R_bayes, 1), 5) - 1);
+
+    const clients = metrics.clients || new Map();
+    const clientCounts = Array.from(clients.values());
+    const repeatDen = clientCounts.length;
+    const repeatNum = clientCounts.reduce((acc, count) => acc + (count >= 2 ? 1 : 0), 0);
+    const repeatRatio = repeatDen > 0 ? repeatNum / repeatDen : 0;
+    const Repeat_score = 100 * wilsonLowerBound(repeatRatio, repeatDen, SUCCESS_WILSON_Z);
+
+    const cancelRatio = metrics.confirmedWeighted > 0
+      ? metrics.cancelledWeighted / metrics.confirmedWeighted
+      : 0;
+    const Cancel_score = 100 * (1 - Math.min(1, cancelRatio / Math.max(P90_cancel_cat, 0.01)));
+
+    const confirmedRaw = metrics.confirmedRaw180;
+    const completeSuccesses = Math.min(metrics.completedNoDisputeRaw180, confirmedRaw);
+    const completeRatio = confirmedRaw > 0 ? completeSuccesses / confirmedRaw : 0;
+    const Complete_score = 100 * wilsonLowerBound(completeRatio, confirmedRaw, SUCCESS_WILSON_Z);
+
+    let rtMinutes = options.overrideResponseTimeMinutes;
+    if (!Number.isFinite(rtMinutes)) {
+      const storedRt = responseTimeByService.get(Number(id));
+      rtMinutes = Number.isFinite(storedRt) ? storedRt : null;
+    }
+    const RT_score = rtMinutes !== null && Number.isFinite(rtMinutes) && P75_RT_cat > 0
+      ? 100 * (1 - Math.min(1, rtMinutes / P75_RT_cat))
+      : 0;
+
+    const revenue = Math.max(0, metrics.revenueRaw180);
+    const logDenominator = Math.log1p(Math.max(P90_euros_cat, 1));
+    const Rev_score = logDenominator > 0
+      ? 100 * Math.min(1, Math.log1p(revenue) / logDenominator)
+      : 0;
+
+    const completedRawCount = metrics.completedRaw180;
+    const disputeRaw = Math.min(metrics.disputedRaw180, completedRawCount);
+    const disputeRatio = completedRawCount > 0 ? disputeRaw / completedRawCount : 0;
+    const Dispute_score = 100 * (1 - Math.min(1, disputeRatio / Math.max(P90_d_cat, 0.01)));
+
+    const S_base = 0.35 * R_score
+      + 0.20 * Repeat_score
+      + 0.15 * Cancel_score
+      + 0.10 * Complete_score
+      + 0.10 * RT_score
+      + 0.05 * Rev_score
+      + 0.05 * Dispute_score;
+
+    return {
+      S_base,
+      meetsThreshold,
+      counts: {
+        completedRaw180: completedRaw,
+        reviewsRaw180: reviewsRaw,
+      },
+      components: {
+        R_score,
+        Repeat_score,
+        Cancel_score,
+        Complete_score,
+        RT_score,
+        Rev_score,
+        Dispute_score,
+      },
+    };
+  };
+
+  for (const id of allServiceIds) {
+    const base = buildBaseScore(id);
+    if (base && Number.isFinite(base.S_base)) {
+      categoryBaseScores.push(base.S_base);
+    }
+  }
+
+  const Prior_cat = categoryBaseScores.length
+    ? categoryBaseScores.reduce((sum, value) => sum + value, 0) / categoryBaseScores.length
+    : 50;
+
+  const targetBase = buildBaseScore(Number(serviceId), { overrideResponseTimeMinutes: responseTimeMinutes });
+  if (!targetBase || !Number.isFinite(targetBase.S_base)) {
+    return {
+      value: null,
+      components: {
+        category: {
+          mu_cat,
+          P90_cancel_cat,
+          P75_RT_cat,
+          P90_euros_cat,
+          P90_d_cat,
+          Prior_cat,
+        },
+      },
+    };
+  }
+
+  const metrics = ensureMetrics(serviceId);
+  const completedRaw = metrics?.completedRaw180 || 0;
+  const reliability = 1 - Math.exp(-completedRaw / 20);
+  const successRate = reliability * targetBase.S_base + (1 - reliability) * Prior_cat;
+
+  return {
+    value: Number.isFinite(successRate) ? successRate : null,
+    components: {
+      S_base: targetBase.S_base,
+      reliability,
+      prior: Prior_cat,
+      meetsPublicationThreshold: targetBase.meetsThreshold,
+      counts: targetBase.counts,
+      scores: targetBase.components,
+      category: {
+        mu_cat,
+        P90_cancel_cat,
+        P75_RT_cat,
+        P90_euros_cat,
+        P90_d_cat,
+        Prior_cat,
+      },
+    },
+  };
+}
+
 module.exports = {
   computeServiceResponseTime,
+  computeServiceSuccessRate,
 };
