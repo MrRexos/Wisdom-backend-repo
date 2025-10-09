@@ -2428,11 +2428,9 @@ app.get('/api/service/:id', (req, res) => {
             pool,
           });
           service.success_rate = successResult?.value ?? null;
-          service.success_rate_details = successResult?.components ?? null;
         } catch (successError) {
           console.error('Error calculating service success rate metric:', successError);
           service.success_rate = null;
-          service.success_rate_details = null;
         }
 
         res.status(200).json(service); // Devolver la información del servicio

@@ -1,5 +1,9 @@
 const { getFirestore } = require('./firestore');
 
+//
+// MEJORAR (en succes rate ahora cuenta todas las cancelaciones, deberia ser cancelaciones y no completados a causa del profesional)
+//
+
 const RESPONSE_WINDOW_DAYS = 180;
 const HALF_LIFE_DAYS = 90;
 const SUCCESS_WINDOW_DAYS = 180;
