@@ -14,7 +14,7 @@ const crypto = require("crypto");
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const os = require('os');
-const { computeServiceResponseTime } = require('./src/serviceMetrics');
+const { computeServiceResponseTime, computeServiceSuccessRate } = require('./src/serviceMetrics');
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
 const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
 const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
@@ -2418,6 +2418,21 @@ app.get('/api/service/:id', (req, res) => {
         } catch (metricError) {
           console.error('Error calculating service response time metric:', metricError);
           service.response_time_minutes = null;
+        }
+
+        try {
+          const successResult = await computeServiceSuccessRate({
+            serviceId: service.service_id,
+            categoryId: service.service_category_id,
+            responseTimeMinutes: service.response_time_minutes,
+            pool,
+          });
+          service.success_rate = successResult?.value ?? null;
+          service.success_rate_details = successResult?.components ?? null;
+        } catch (successError) {
+          console.error('Error calculating service success rate metric:', successError);
+          service.success_rate = null;
+          service.success_rate_details = null;
         }
 
         res.status(200).json(service); // Devolver la información del servicio
