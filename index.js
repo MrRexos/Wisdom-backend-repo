@@ -5566,19 +5566,12 @@ app.get('/api/services/:id', (req, res) => {
       }
 
       if (serviceData.length > 0) {
-        const service = serviceData[0];
+        const rawService = serviceData[0];
 
-        const viewerIdParam = req.query.viewerId ?? req.query.viewer_id ?? req.query.userId ?? req.query.user_id;
-        const viewerId = viewerIdParam !== undefined
-          ? Number(viewerIdParam)
-          : req.user?.id !== undefined
-            ? Number(req.user.id)
-            : undefined;
-        const isOwner = viewerId !== undefined && !Number.isNaN(viewerId) && viewerId === service.user_id;
-
-        if (service.is_hidden && !isOwner) {
-          return res.status(404).json({ notFound: true, message: 'Servicio no disponible.' });
-        }
+        const service = {
+          ...rawService,
+          is_hidden: Boolean(rawService.is_hidden),
+        };
 
         res.status(200).json(service); // Devolver la información del servicio
       } else {
