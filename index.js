@@ -3086,8 +3086,7 @@ app.get('/api/user/:userId/bookings', (req, res) => {
       LEFT JOIN service ON booking.service_id = service.id
       LEFT JOIN price ON service.price_id = price.id
       LEFT JOIN user_account ON service.user_id = user_account.id
-      WHERE booking.user_id = ?
-      AND booking.booking_status NOT IN ('pending_deposit', 'payment_failed')`;
+      WHERE booking.user_id = ?`;
 
     const params = [userId];
     if (status) {
