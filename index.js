@@ -597,6 +597,106 @@ const pool = mysql.createPool({
   connectTimeout: 20000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada.
 });
 
+const promisePool = pool.promise();
+
+function invalidInputError(code) {
+  const err = new Error(code);
+  err.status = 400;
+  return err;
+}
+
+function parseBooleanInput(value, defaultValue, fieldName) {
+  if (value === undefined) return defaultValue;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (value === 1 || value === 0) return Boolean(value);
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1') return true;
+    if (normalized === 'false' || normalized === '0') return false;
+  }
+  throw invalidInputError(`invalid_boolean_${fieldName}`);
+}
+
+function parseNumberInput(value, defaultValue, fieldName, { allowNull = true, integer = false } = {}) {
+  if (value === undefined) return defaultValue;
+  if (value === null || value === '') {
+    if (!allowNull) {
+      throw invalidInputError(`invalid_number_${fieldName}`);
+    }
+    return null;
+  }
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    throw invalidInputError(`invalid_number_${fieldName}`);
+  }
+  if (integer && !Number.isInteger(num)) {
+    throw invalidInputError(`invalid_integer_${fieldName}`);
+  }
+  return num;
+}
+
+function parseIntegerInput(value, defaultValue, fieldName) {
+  return parseNumberInput(value, defaultValue, fieldName, { allowNull: false, integer: true });
+}
+
+function toMySQLDatetime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+function mapOwnershipError(code) {
+  switch (code) {
+    case 'not_found':
+      return { status: 404, body: { error: 'service_not_found' } };
+    case 'not_owner':
+      return { status: 403, body: { error: 'service_not_owned' } };
+    case 'not_professional':
+      return { status: 403, body: { error: 'service_owner_not_professional' } };
+    default:
+      return { status: 500, body: { error: 'service_ownership_error' } };
+  }
+}
+
+async function fetchOwnedService(connection, serviceId, userId, { lock = false, includePrice = false, includeConsult = false } = {}) {
+  const selectParts = ['s.*', 'ua.is_professional'];
+  const joins = ['JOIN user_account ua ON s.user_id = ua.id'];
+
+  if (includePrice) {
+    selectParts.push('p.price AS current_price', 'p.price_type AS current_price_type');
+    joins.push('JOIN price p ON s.price_id = p.id');
+  }
+
+  if (includeConsult) {
+    selectParts.push('cv.provider AS consult_provider', 'cv.username AS consult_username', 'cv.url AS consult_url');
+    joins.push('LEFT JOIN consult_via cv ON s.consult_via_id = cv.id');
+  }
+
+  const lockClause = lock ? 'FOR UPDATE' : '';
+  const [rows] = await connection.query(
+    `SELECT ${selectParts.join(', ')} FROM service s ${joins.join(' ')} WHERE s.id = ? ${lockClause}`,
+    [serviceId]
+  );
+
+  if (rows.length === 0) {
+    return { error: 'not_found' };
+  }
+
+  const service = rows[0];
+  if (Number(service.user_id) !== Number(userId)) {
+    return { error: 'not_owner' };
+  }
+
+  if (!service.is_professional) {
+    return { error: 'not_professional' };
+  }
+
+  return { service };
+}
+
 const cron = require('node-cron');
 const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '15m';
 const REFRESH_TOKEN_TTL_DAYS = parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '30', 10);
@@ -2147,6 +2247,352 @@ app.post('/api/service', (req, res) => {
       });
     });
   });
+});
+
+app.delete('/api/services/:id', async (req, res) => {
+  const serviceId = Number(req.params.id);
+  if (!Number.isInteger(serviceId) || serviceId <= 0) {
+    return res.status(400).json({ error: 'invalid_service_id' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const ownership = await fetchOwnedService(connection, serviceId, req.user.id, { lock: true });
+    if (ownership.error) {
+      await connection.rollback();
+      const mapped = mapOwnershipError(ownership.error);
+      return res.status(mapped.status).json(mapped.body);
+    }
+
+    const { service } = ownership;
+
+    const [[activeBookings]] = await connection.query(
+      `SELECT COUNT(*) AS count
+         FROM booking
+        WHERE service_id = ?
+          AND (booking_status IS NULL OR LOWER(booking_status) NOT IN ('cancelled', 'completed'))`,
+      [serviceId]
+    );
+
+    if (activeBookings.count > 0) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'service_has_active_bookings' });
+    }
+
+    await connection.query(
+      'DELETE sra FROM service_report_attachment sra JOIN service_report sr ON sra.report_id = sr.id WHERE sr.service_id = ?',
+      [serviceId]
+    );
+    await connection.query('DELETE FROM service_report WHERE service_id = ?', [serviceId]);
+    await connection.query('DELETE FROM review WHERE service_id = ?', [serviceId]);
+    await connection.query('DELETE FROM item_list WHERE service_id = ?', [serviceId]);
+    await connection.query('DELETE FROM experience_place WHERE service_id = ?', [serviceId]);
+    await connection.query('DELETE FROM service_language WHERE service_id = ?', [serviceId]);
+    await connection.query('DELETE FROM service_tags WHERE service_id = ?', [serviceId]);
+    await connection.query('DELETE FROM service_image WHERE service_id = ?', [serviceId]);
+
+    await connection.query('DELETE FROM service WHERE id = ?', [serviceId]);
+    await connection.query('DELETE FROM price WHERE id = ?', [service.price_id]);
+    if (service.consult_via_id) {
+      await connection.query('DELETE FROM consult_via WHERE id = ?', [service.consult_via_id]);
+    }
+
+    await connection.commit();
+    return res.status(200).json({ message: 'Servicio eliminado correctamente.' });
+  } catch (error) {
+    await connection.rollback();
+    if (error && error.code === 'ER_ROW_IS_REFERENCED_2') {
+      return res.status(409).json({ error: 'service_has_related_records' });
+    }
+    console.error('Error al eliminar el servicio:', error);
+    return res.status(500).json({ error: 'Error al eliminar el servicio.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.patch('/api/services/:id/visibility', async (req, res) => {
+  const serviceId = Number(req.params.id);
+  if (!Number.isInteger(serviceId) || serviceId <= 0) {
+    return res.status(400).json({ error: 'invalid_service_id' });
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(req.body || {}, 'is_hidden')) {
+    return res.status(400).json({ error: 'is_hidden_required' });
+  }
+
+  let isHidden;
+  try {
+    isHidden = parseBooleanInput(req.body.is_hidden, null, 'is_hidden');
+    if (isHidden === null) {
+      throw invalidInputError('invalid_boolean_is_hidden');
+    }
+  } catch (error) {
+    return res.status(error.status || 400).json({ error: error.message || 'invalid_boolean_is_hidden' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const ownership = await fetchOwnedService(connection, serviceId, req.user.id, { lock: true });
+    if (ownership.error) {
+      await connection.rollback();
+      const mapped = mapOwnershipError(ownership.error);
+      return res.status(mapped.status).json(mapped.body);
+    }
+
+    await connection.query(
+      'UPDATE service SET is_hidden = ?, last_edit_datetime = NOW() WHERE id = ?',
+      [isHidden ? 1 : 0, serviceId]
+    );
+
+    await connection.commit();
+    return res.status(200).json({
+      message: isHidden ? 'Servicio ocultado correctamente.' : 'Servicio visible nuevamente.',
+      is_hidden: isHidden ? 1 : 0
+    });
+  } catch (error) {
+    await connection.rollback();
+    console.error('Error al actualizar la visibilidad del servicio:', error);
+    return res.status(500).json({ error: 'Error al actualizar la visibilidad del servicio.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.put('/api/services/:id', async (req, res) => {
+  const serviceId = Number(req.params.id);
+  if (!Number.isInteger(serviceId) || serviceId <= 0) {
+    return res.status(400).json({ error: 'invalid_service_id' });
+  }
+
+  const body = req.body || {};
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const ownership = await fetchOwnedService(connection, serviceId, req.user.id, {
+      lock: true,
+      includePrice: true,
+      includeConsult: true
+    });
+
+    if (ownership.error) {
+      await connection.rollback();
+      const mapped = mapOwnershipError(ownership.error);
+      return res.status(mapped.status).json(mapped.body);
+    }
+
+    const service = ownership.service;
+
+    let serviceTitle = body.service_title !== undefined ? String(body.service_title).trim() : service.service_title;
+    if (!serviceTitle) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'invalid_service_title' });
+    }
+
+    let description = body.description !== undefined ? body.description : service.description;
+    if (description === undefined) {
+      description = null;
+    } else if (description !== null) {
+      description = String(description);
+    }
+
+    let serviceCategoryId;
+    let priceValue;
+    let priceType;
+    let latitude;
+    let longitude;
+    let actionRate;
+    let userCanAsk;
+    let userCanConsult;
+    let priceConsult;
+    let isIndividual;
+    let allowDiscounts;
+    let discountRate;
+    let hobbies;
+    let isHidden;
+    let consultProvider;
+    let consultUsername;
+    let consultUrl;
+
+    try {
+      serviceCategoryId = parseIntegerInput(body.service_category_id, service.service_category_id, 'service_category_id');
+      priceValue = parseNumberInput(body.price, service.current_price, 'price', { allowNull: false });
+      priceType = body.price_type !== undefined ? String(body.price_type) : service.current_price_type;
+      if (!priceType) {
+        throw invalidInputError('invalid_price_type');
+      }
+      priceType = priceType.trim();
+      if (!priceType) {
+        throw invalidInputError('invalid_price_type');
+      }
+      latitude = parseNumberInput(body.latitude, service.latitude, 'latitude');
+      longitude = parseNumberInput(body.longitude, service.longitude, 'longitude');
+      actionRate = parseNumberInput(body.action_rate, service.action_rate, 'action_rate', { allowNull: false });
+      userCanAsk = parseBooleanInput(body.user_can_ask, Boolean(service.user_can_ask), 'user_can_ask');
+      userCanConsult = parseBooleanInput(body.user_can_consult, Boolean(service.user_can_consult), 'user_can_consult');
+      priceConsult = parseNumberInput(body.price_consult, service.price_consult, 'price_consult');
+      isIndividual = parseBooleanInput(body.is_individual, Boolean(service.is_individual), 'is_individual');
+      allowDiscounts = parseBooleanInput(body.allow_discounts, Boolean(service.allow_discounts), 'allow_discounts');
+      discountRate = parseNumberInput(body.discount_rate, service.discount_rate, 'discount_rate');
+      hobbies = body.hobbies !== undefined ? body.hobbies : service.hobbies;
+      if (hobbies !== undefined && hobbies !== null) {
+        hobbies = String(hobbies);
+      }
+      isHidden = parseBooleanInput(body.is_hidden, Boolean(service.is_hidden), 'is_hidden');
+      consultProvider = body.consult_via_provide !== undefined ? body.consult_via_provide : service.consult_provider;
+      consultUsername = body.consult_via_username !== undefined ? body.consult_via_username : service.consult_username;
+      consultUrl = body.consult_via_url !== undefined ? body.consult_via_url : service.consult_url;
+    } catch (parseError) {
+      await connection.rollback();
+      return res.status(parseError.status || 400).json({ error: parseError.message || 'invalid_service_payload' });
+    }
+
+    await connection.query('UPDATE price SET price = ?, price_type = ? WHERE id = ?', [priceValue, priceType, service.price_id]);
+
+    let consultViaId = service.consult_via_id;
+    if (userCanConsult) {
+      if (consultViaId) {
+        await connection.query('UPDATE consult_via SET provider = ?, username = ?, url = ? WHERE id = ?', [consultProvider || null, consultUsername || null, consultUrl || null, consultViaId]);
+      } else {
+        const [insertConsult] = await connection.query('INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)', [consultProvider || null, consultUsername || null, consultUrl || null]);
+        consultViaId = insertConsult.insertId;
+      }
+    } else if (consultViaId) {
+      await connection.query('DELETE FROM consult_via WHERE id = ?', [consultViaId]);
+      consultViaId = null;
+    }
+
+    await connection.query(
+      `UPDATE service
+          SET service_title = ?,
+              description = ?,
+              service_category_id = ?,
+              latitude = ?,
+              longitude = ?,
+              action_rate = ?,
+              user_can_ask = ?,
+              user_can_consult = ?,
+              price_consult = ?,
+              consult_via_id = ?,
+              is_individual = ?,
+              allow_discounts = ?,
+              discount_rate = ?,
+              hobbies = ?,
+              is_hidden = ?,
+              last_edit_datetime = NOW()
+        WHERE id = ?`,
+      [
+        serviceTitle,
+        description,
+        serviceCategoryId,
+        latitude,
+        longitude,
+        actionRate,
+        userCanAsk ? 1 : 0,
+        userCanConsult ? 1 : 0,
+        priceConsult,
+        consultViaId,
+        isIndividual ? 1 : 0,
+        allowDiscounts ? 1 : 0,
+        discountRate,
+        hobbies,
+        isHidden ? 1 : 0,
+        serviceId
+      ]
+    );
+
+    if (body.languages !== undefined) {
+      if (!Array.isArray(body.languages)) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'invalid_languages' });
+      }
+      await connection.query('DELETE FROM service_language WHERE service_id = ?', [serviceId]);
+      if (body.languages.length > 0) {
+        const languageValues = body.languages.map(lang => {
+          if (lang === null || lang === undefined) {
+            throw invalidInputError('invalid_language_value');
+          }
+          return [serviceId, String(lang)];
+        });
+        await connection.query('INSERT INTO service_language (service_id, language) VALUES ?', [languageValues]);
+      }
+    }
+
+    if (body.tags !== undefined) {
+      if (!Array.isArray(body.tags)) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'invalid_tags' });
+      }
+      await connection.query('DELETE FROM service_tags WHERE service_id = ?', [serviceId]);
+      if (body.tags.length > 0) {
+        const tagsValues = body.tags.map(tag => {
+          if (tag === null || tag === undefined) {
+            throw invalidInputError('invalid_tag_value');
+          }
+          return [serviceId, String(tag)];
+        });
+        await connection.query('INSERT INTO service_tags (service_id, tag) VALUES ?', [tagsValues]);
+      }
+    }
+
+    if (body.experiences !== undefined) {
+      if (!Array.isArray(body.experiences)) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'invalid_experiences' });
+      }
+      await connection.query('DELETE FROM experience_place WHERE service_id = ?', [serviceId]);
+      if (body.experiences.length > 0) {
+        const experienceValues = body.experiences.map(exp => {
+          if (!exp || typeof exp !== 'object') {
+            throw invalidInputError('invalid_experience_value');
+          }
+          return [
+            serviceId,
+            exp.experience_title || null,
+            exp.place_name || null,
+            toMySQLDatetime(exp.experience_started_date),
+            toMySQLDatetime(exp.experience_end_date)
+          ];
+        });
+        await connection.query(
+          'INSERT INTO experience_place (service_id, experience_title, place_name, experience_started_date, experience_end_date) VALUES ?',
+          [experienceValues]
+        );
+      }
+    }
+
+    if (body.images !== undefined) {
+      if (!Array.isArray(body.images)) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'invalid_images' });
+      }
+      await connection.query('DELETE FROM service_image WHERE service_id = ?', [serviceId]);
+      if (body.images.length > 0) {
+        const imageValues = body.images.map(img => {
+          if (!img || typeof img !== 'object' || !img.url) {
+            throw invalidInputError('invalid_image_value');
+          }
+          const orderValue = img.order === undefined ? null : parseNumberInput(img.order, null, 'image_order', { allowNull: true, integer: true });
+          return [serviceId, img.url, orderValue];
+        });
+        await connection.query('INSERT INTO service_image (service_id, image_url, `order`) VALUES ?', [imageValues]);
+      }
+    }
+
+    await connection.commit();
+    return res.status(200).json({ message: 'Servicio actualizado correctamente.' });
+  } catch (error) {
+    await connection.rollback();
+    if (error.status === 400) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('Error al actualizar el servicio:', error);
+    return res.status(500).json({ error: 'Error al actualizar el servicio.' });
+  } finally {
+    connection.release();
+  }
 });
 
 //Ruta para crear lista
