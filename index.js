@@ -2087,163 +2087,184 @@ app.post('/api/service', (req, res) => {
         return;
       }
 
-      // 1. Insertar en la tabla 'price'
-      const priceQuery = 'INSERT INTO price (price, price_type) VALUES (?, ?)';
-      connection.query(priceQuery, [price, price_type], (err, result) => {
-        if (err) {
+      const stripeAccountQuery = 'SELECT stripe_account_id FROM user_account WHERE id = ?';
+      connection.query(stripeAccountQuery, [user_id], (accountErr, accountResults) => {
+        if (accountErr) {
           return connection.rollback(() => {
-            console.error('Error al insertar en la tabla price:', err);
-            connection.release(); // Liberar conexión en caso de error
-            res.status(500).json({ error: 'Error al insertar en la tabla price.' });
+            console.error('Error al consultar el método de cobro del profesional:', accountErr);
+            connection.release();
+            res.status(500).json({ error: 'Error al consultar el método de cobro.' });
           });
         }
 
-        const price_id = result.insertId;
+        if (accountResults.length === 0) {
+          return connection.rollback(() => {
+            connection.release();
+            res.status(404).json({ error: 'professional_not_found' });
+          });
+        }
 
-        // 2. Si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
-        let consult_via_id = null;
-        const insertService = () => {
-          // 3. Insertar en la tabla 'service'
-          const serviceQuery = `
-            INSERT INTO service (
-              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime, is_hidden, last_edit_datetime
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
-          `;
-          const serviceValues = [
-            service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-            action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, 0, null
-          ];
+        const hasStripeAccount = Boolean(accountResults[0]?.stripe_account_id);
+        const isHiddenValue = hasStripeAccount ? 0 : 1;
 
-          connection.query(serviceQuery, serviceValues, (err, result) => {
-            if (err) {
-              return connection.rollback(() => {
-                console.error('Error al insertar en la tabla service:', err);
-                connection.release(); // Liberar conexión en caso de error
-                res.status(500).json({ error: 'Error al insertar en la tabla service.' });
-              });
-            }
+        // 1. Insertar en la tabla 'price'
+        const priceQuery = 'INSERT INTO price (price, price_type) VALUES (?, ?)';
+        connection.query(priceQuery, [price, price_type], (err, result) => {
+          if (err) {
+            return connection.rollback(() => {
+              console.error('Error al insertar en la tabla price:', err);
+              connection.release(); // Liberar conexión en caso de error
+              res.status(500).json({ error: 'Error al insertar en la tabla price.' });
+            });
+          }
 
-            const service_id = result.insertId;
+          const price_id = result.insertId;
 
-            // 4. Insertar lenguajes en 'service_language'
-            if (languages && languages.length > 0) {
-              const languageQuery = 'INSERT INTO service_language (service_id, language) VALUES ?';
-              const languageValues = languages.map(lang => [service_id, lang]);
+          // 2. Si user_can_consult es true, insertar en consult_via, de lo contrario, saltarlo.
+          let consult_via_id = null;
+          const insertService = () => {
+            // 3. Insertar en la tabla 'service'
+            const serviceQuery = `
+              INSERT INTO service (
+                action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime, is_hidden, last_edit_datetime
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
+            `;
+            const serviceValues = [
+              service_title, user_id, description, service_category_id, price_id, latitude, longitude,
+              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, isHiddenValue, null
+            ];
 
-              connection.query(languageQuery, [languageValues], err => {
-                if (err) {
-                  return connection.rollback(() => {
-                    console.error('Error al insertar lenguajes:', err);
-                    connection.release(); // Liberar conexión en caso de error
-                    res.status(500).json({ error: 'Error al insertar lenguajes.' });
-                  });
-                }
-              });
-            }
-
-            // 5. Insertar tags en 'service_tags'
-            if (tags && tags.length > 0) {
-              const tagsQuery = 'INSERT INTO service_tags (service_id, tag) VALUES ?';
-              const tagsValues = tags.map(tag => [service_id, tag]);
-
-              connection.query(tagsQuery, [tagsValues], err => {
-                if (err) {
-                  return connection.rollback(() => {
-                    console.error('Error al insertar tags:', err);
-                    connection.release(); // Liberar conexión en caso de error
-                    res.status(500).json({ error: 'Error al insertar tags.' });
-                  });
-                }
-              });
-            }
-
-            // 6. Insertar experiencias en 'experience_place'
-            if (experiences && experiences.length > 0) {
-              const experienceQuery = 'INSERT INTO experience_place (service_id, experience_title, place_name, experience_started_date, experience_end_date) VALUES ?';
-              const experienceValues = experiences.map(exp => [
-                service_id,
-                exp.experience_title,
-                exp.place_name,
-                new Date(exp.experience_started_date).toISOString().slice(0, 19).replace('T', ' '),
-                exp.experience_end_date ? new Date(exp.experience_end_date).toISOString().slice(0, 19).replace('T', ' ') : null
-              ]);
-
-              connection.query(experienceQuery, [experienceValues], err => {
-                if (err) {
-                  return connection.rollback(() => {
-                    console.error('Error al insertar experiencias:', err);
-                    console.error('Consulta:', experienceQuery);
-                    console.error('Valores:', experienceValues);
-                    connection.release(); // Liberar conexión en caso de error
-                    res.status(500).json({ error: 'Error al insertar experiencias.' });
-                  });
-                } else {
-                  console.log('Experiencias insertadas correctamente');
-                }
-              });
-            }
-
-            // 7. Insertar imágenes en 'service_image'
-            if (images && images.length > 0) {
-              const imageQuery = 'INSERT INTO service_image (service_id, image_url, `order`) VALUES ?';
-              const imageValues = images.map(img => [service_id, img.url, img.order]);
-
-              connection.query(imageQuery, [imageValues], err => {
-                if (err) {
-                  return connection.rollback(() => {
-                    console.error('Error al insertar imágenes:', err);
-                    connection.release(); // Liberar conexión en caso de error
-                    res.status(500).json({ error: 'Error al insertar imágenes.' });
-                  });
-                }
-              });
-            }
-            // 8. Marcar al usuario como profesional si aún no lo es
-            const professionalQuery = 'UPDATE user_account SET is_professional = 1, professional_started_datetime = NOW() WHERE id = ? AND is_professional = 0';
-            connection.query(professionalQuery, [user_id], err => {
+            connection.query(serviceQuery, serviceValues, (err, result) => {
               if (err) {
                 return connection.rollback(() => {
-                  console.error('Error al actualizar el usuario como profesional:', err);
-                  connection.release();
-                  res.status(500).json({ error: 'Error al actualizar el usuario.' });
+                  console.error('Error al insertar en la tabla service:', err);
+                  connection.release(); // Liberar conexión en caso de error
+                  res.status(500).json({ error: 'Error al insertar en la tabla service.' });
                 });
               }
 
-              // Commit final
-              connection.commit(err => {
+              const service_id = result.insertId;
+
+              // 4. Insertar lenguajes en 'service_language'
+              if (languages && languages.length > 0) {
+                const languageQuery = 'INSERT INTO service_language (service_id, language) VALUES ?';
+                const languageValues = languages.map(lang => [service_id, lang]);
+
+                connection.query(languageQuery, [languageValues], err => {
+                  if (err) {
+                    return connection.rollback(() => {
+                      console.error('Error al insertar lenguajes:', err);
+                      connection.release(); // Liberar conexión en caso de error
+                      res.status(500).json({ error: 'Error al insertar lenguajes.' });
+                    });
+                  }
+                });
+              }
+
+              // 5. Insertar tags en 'service_tags'
+              if (tags && tags.length > 0) {
+                const tagsQuery = 'INSERT INTO service_tags (service_id, tag) VALUES ?';
+                const tagsValues = tags.map(tag => [service_id, tag]);
+
+                connection.query(tagsQuery, [tagsValues], err => {
+                  if (err) {
+                    return connection.rollback(() => {
+                      console.error('Error al insertar tags:', err);
+                      connection.release(); // Liberar conexión en caso de error
+                      res.status(500).json({ error: 'Error al insertar tags.' });
+                    });
+                  }
+                });
+              }
+
+              // 6. Insertar experiencias en 'experience_place'
+              if (experiences && experiences.length > 0) {
+                const experienceQuery = 'INSERT INTO experience_place (service_id, experience_title, place_name, experience_started_date, experience_end_date) VALUES ?';
+                const experienceValues = experiences.map(exp => [
+                  service_id,
+                  exp.experience_title,
+                  exp.place_name,
+                  new Date(exp.experience_started_date).toISOString().slice(0, 19).replace('T', ' '),
+                  exp.experience_end_date ? new Date(exp.experience_end_date).toISOString().slice(0, 19).replace('T', ' ') : null
+                ]);
+
+                connection.query(experienceQuery, [experienceValues], err => {
+                  if (err) {
+                    return connection.rollback(() => {
+                      console.error('Error al insertar experiencias:', err);
+                      console.error('Consulta:', experienceQuery);
+                      console.error('Valores:', experienceValues);
+                      connection.release(); // Liberar conexión en caso de error
+                      res.status(500).json({ error: 'Error al insertar experiencias.' });
+                    });
+                  } else {
+                    console.log('Experiencias insertadas correctamente');
+                  }
+                });
+              }
+
+              // 7. Insertar imágenes en 'service_image'
+              if (images && images.length > 0) {
+                const imageQuery = 'INSERT INTO service_image (service_id, image_url, `order`) VALUES ?';
+                const imageValues = images.map(img => [service_id, img.url, img.order]);
+
+                connection.query(imageQuery, [imageValues], err => {
+                  if (err) {
+                    return connection.rollback(() => {
+                      console.error('Error al insertar imágenes:', err);
+                      connection.release(); // Liberar conexión en caso de error
+                      res.status(500).json({ error: 'Error al insertar imágenes.' });
+                    });
+                  }
+                });
+              }
+              // 8. Marcar al usuario como profesional si aún no lo es
+              const professionalQuery = 'UPDATE user_account SET is_professional = 1, professional_started_datetime = NOW() WHERE id = ? AND is_professional = 0';
+              connection.query(professionalQuery, [user_id], err => {
                 if (err) {
                   return connection.rollback(() => {
-                    console.error('Error al hacer commit de la transacción:', err);
-                    connection.release(); // Liberar conexión en caso de error
-                    res.status(500).json({ error: 'Error al hacer commit de la transacción.' });
+                    console.error('Error al actualizar el usuario como profesional:', err);
+                    connection.release();
+                    res.status(500).json({ error: 'Error al actualizar el usuario.' });
                   });
                 }
 
-                connection.release(); // Liberar conexión después del commit exitoso
-                res.status(201).json({ message: 'Servicio creado con éxito.' });
+                // Commit final
+                connection.commit(err => {
+                  if (err) {
+                    return connection.rollback(() => {
+                      console.error('Error al hacer commit de la transacción:', err);
+                      connection.release(); // Liberar conexión en caso de error
+                      res.status(500).json({ error: 'Error al hacer commit de la transacción.' });
+                    });
+                  }
+
+                  connection.release(); // Liberar conexión después del commit exitoso
+                  res.status(201).json({ message: 'Servicio creado con éxito.' });
+                });
               });
             });
-          });
-        };
+          };
 
-        // 2.1. Insertar consult_via y continuar con insertService
-        if (user_can_consult) {
-          const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
-          connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
-            if (err) {
-              return connection.rollback(() => {
-                console.error('Error al insertar en la tabla consult_via:', err);
-                connection.release(); // Liberar conexión en caso de error
-                res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
-              });
-            }
+          // 2.1. Insertar consult_via y continuar con insertService
+          if (user_can_consult) {
+            const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
+            connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
+              if (err) {
+                return connection.rollback(() => {
+                  console.error('Error al insertar en la tabla consult_via:', err);
+                  connection.release(); // Liberar conexión en caso de error
+                  res.status(500).json({ error: 'Error al insertar en la tabla consult_via.' });
+                });
+              }
 
-            consult_via_id = result.insertId;
-            insertService(); // Llama a insertService después de haber obtenido el consult_via_id
-          });
-        } else {
-          insertService(); // Llama a insertService directamente si user_can_consult es false
-        }
+              consult_via_id = result.insertId;
+              insertService(); // Llama a insertService después de haber obtenido el consult_via_id
+            });
+          } else {
+            insertService(); // Llama a insertService directamente si user_can_consult es false
+          }
+        });
       });
     });
   });
@@ -4270,12 +4291,22 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
               const updateQuery =
                 'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1, professional_started_datetime = IF(is_professional = 1, professional_started_datetime, NOW()) WHERE id = ?';
               connection.query(updateQuery, [date_of_birth, nif, phone, account.id, id], (updErr) => {
-                connection.release();
                 if (updErr) {
+                  connection.release();
                   console.error('Error al actualizar el usuario:', updErr);
                   return res.status(500).json({ error: 'Error al guardar la cuenta.' });
                 }
-                res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
+
+                const unhideQuery = 'UPDATE service SET is_hidden = 0 WHERE user_id = ? AND is_hidden = 1';
+                connection.query(unhideQuery, [id], (unhideErr) => {
+                  connection.release();
+                  if (unhideErr) {
+                    console.error('Error al actualizar la visibilidad de los servicios del profesional:', unhideErr);
+                    return res.status(500).json({ error: 'Error al actualizar los servicios del profesional.' });
+                  }
+
+                  res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
+                });
               });
             }
           );
