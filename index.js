@@ -1659,7 +1659,8 @@ app.get('/api/lists/:id/items', (req, res) => {
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
-      WHERE item_list.list_id = ?;
+      WHERE item_list.list_id = ?
+        AND service.is_hidden = 0;
     `;
 
 
@@ -1868,7 +1869,8 @@ app.get('/api/category/:id/services', (req, res) => {
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
-      WHERE service.service_category_id = ?;
+      WHERE service.service_category_id = ?
+        AND service.is_hidden = 0;
     `;
 
     connection.query(query, [id], (err, servicesData) => {
@@ -2408,6 +2410,18 @@ app.get('/api/service/:id', (req, res) => {
       if (serviceData.length > 0) {
         const service = serviceData[0];
 
+        const viewerIdParam = req.query.viewerId ?? req.query.viewer_id ?? req.query.userId ?? req.query.user_id;
+        const viewerId = viewerIdParam !== undefined
+          ? Number(viewerIdParam)
+          : req.user?.id !== undefined
+            ? Number(req.user.id)
+            : undefined;
+        const isOwner = viewerId !== undefined && !Number.isNaN(viewerId) && viewerId === service.user_id;
+
+        if (service.is_hidden && !isOwner) {
+          return res.status(404).json({ notFound: true, message: 'Servicio no disponible.' });
+        }
+
         try {
           const responseTimeResult = await computeServiceResponseTime({
             serviceId: service.service_id,
@@ -2463,12 +2477,14 @@ app.get('/api/suggested_professional', (req, res) => {
         SELECT s.user_id, AVG(r.rating) AS average_rating
         FROM review r
         JOIN service s ON r.service_id = s.id
+        WHERE s.is_hidden = 0
         GROUP BY s.user_id
       ) rs ON ua.id = rs.user_id
       LEFT JOIN (
         SELECT s.user_id, COUNT(b.id) AS booking_count
         FROM booking b
         JOIN service s ON b.service_id = s.id
+        WHERE s.is_hidden = 0
         /* opcional: WHERE b.status IN ('confirmed','completed') */
         GROUP BY s.user_id
       ) bu ON ua.id = bu.user_id
@@ -2503,6 +2519,7 @@ app.get('/api/suggested_professional', (req, res) => {
             /* opcional: WHERE status IN ('confirmed','completed') */
             GROUP BY service_id
           ) b_by_s ON b_by_s.service_id = s.id
+          WHERE s.is_hidden = 0
           /* opcional: WHERE s.status='published' AND s.is_active=1 */
         ) ranked
         WHERE rn = 1
@@ -5304,11 +5321,14 @@ app.get('/api/suggestions', (req, res) => {
       LEFT JOIN service_family f ON c.service_family_id = f.id 
       LEFT JOIN service_category_type ct ON c.service_category_type_id = ct.id 
       LEFT JOIN service_tags t ON s.id = t.service_id 
-      WHERE 
-        s.service_title LIKE ? 
-        OR ct.service_category_name LIKE ? 
-        OR f.service_family LIKE ? 
-        OR t.tag LIKE ?
+      WHERE
+        s.is_hidden = 0
+        AND (
+          s.service_title LIKE ?
+          OR ct.service_category_name LIKE ?
+          OR f.service_family LIKE ?
+          OR t.tag LIKE ?
+        )
       LIMIT 8
     `;
 
@@ -5434,11 +5454,14 @@ app.get('/api/services', (req, res) => {
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
-      WHERE service.service_title LIKE ?
-        OR category_type.service_category_name LIKE ?
-        OR family.service_family LIKE ?
-        OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?)
-        OR service.description LIKE ?
+      WHERE service.is_hidden = 0
+        AND (
+          service.service_title LIKE ?
+          OR category_type.service_category_name LIKE ?
+          OR family.service_family LIKE ?
+          OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?)
+          OR service.description LIKE ?
+        )
       ORDER BY 
         CASE 
           WHEN service.service_title LIKE ? THEN 1 -- Más importante
@@ -5543,7 +5566,21 @@ app.get('/api/services/:id', (req, res) => {
       }
 
       if (serviceData.length > 0) {
-        res.status(200).json(serviceData[0]); // Devolver la información del servicio
+        const service = serviceData[0];
+
+        const viewerIdParam = req.query.viewerId ?? req.query.viewer_id ?? req.query.userId ?? req.query.user_id;
+        const viewerId = viewerIdParam !== undefined
+          ? Number(viewerIdParam)
+          : req.user?.id !== undefined
+            ? Number(req.user.id)
+            : undefined;
+        const isOwner = viewerId !== undefined && !Number.isNaN(viewerId) && viewerId === service.user_id;
+
+        if (service.is_hidden && !isOwner) {
+          return res.status(404).json({ notFound: true, message: 'Servicio no disponible.' });
+        }
+
+        res.status(200).json(service); // Devolver la información del servicio
       } else {
         res.status(404).json({ notFound: true, message: 'Servicio no encontrado.' });
       }
