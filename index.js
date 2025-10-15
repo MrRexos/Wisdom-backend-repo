@@ -2382,6 +2382,7 @@ app.patch('/api/services/:id/visibility', async (req, res) => {
   }
 });
 
+//Ruta para actualizar un servicio
 app.put('/api/services/:id', async (req, res) => {
   const serviceId = Number(req.params.id);
   if (!Number.isInteger(serviceId) || serviceId <= 0) {
@@ -2815,9 +2816,15 @@ app.get('/api/service/:id', (req, res) => {
          FROM experience_place ep
          WHERE ep.service_id = s.id) AS experiences,
         -- Información de consult_via
-        (SELECT JSON_OBJECT('id', cv.id, 'provider', cv.provider, 'username', cv.username, 'url', cv.url)
-         FROM consult_via cv 
-         WHERE cv.id = s.consult_via_id) AS consult_via,
+        CASE
+          WHEN cv.id IS NOT NULL THEN JSON_OBJECT(
+            'id', cv.id,
+            'provider', cv.provider,
+            'username', cv.username,
+            'url', cv.url
+          )
+          ELSE NULL
+        END AS consult_via,
         -- Información de la categoría del servicio
         (SELECT JSON_OBJECT('id', sc.id,
           'name', sct.service_category_name,
@@ -2862,6 +2869,7 @@ app.get('/api/service/:id', (req, res) => {
       FROM service s
       JOIN price p ON s.price_id = p.id
       JOIN user_account ua ON s.user_id = ua.id
+      LEFT JOIN consult_via cv ON cv.id = s.consult_via_id
       WHERE s.id = ?;
     `;
 
@@ -2876,6 +2884,15 @@ app.get('/api/service/:id', (req, res) => {
 
       if (serviceData.length > 0) {
         const service = serviceData[0];
+
+        if (typeof service.consult_via === 'string') {
+          try {
+            service.consult_via = JSON.parse(service.consult_via);
+          } catch (parseError) {
+            console.error('Error parsing consult_via JSON:', parseError);
+            service.consult_via = null;
+          }
+        }
 
         const viewerIdParam = req.query.viewerId ?? req.query.viewer_id ?? req.query.userId ?? req.query.user_id;
         const viewerId = viewerIdParam !== undefined
