@@ -2401,6 +2401,11 @@ app.patch('/api/services/:id/visibility', async (req, res) => {
 //Ruta para actualizar un servicio
 app.put('/api/services/:id', async (req, res) => {
   const serviceId = Number(req.params.id);
+  console.log('[TEMP-DEBUG] Actualizar servicio - parámetros recibidos:', {
+    serviceId,
+    body: req.body,
+    userId: req.user && req.user.id
+  });
   if (!Number.isInteger(serviceId) || serviceId <= 0) {
     return res.status(400).json({ error: 'invalid_service_id' });
   }
