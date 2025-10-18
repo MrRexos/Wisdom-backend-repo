@@ -202,6 +202,14 @@ const round2 = (n) => {
   return Math.round(x * 100) / 100;
 };
 
+function generateObjectName(originalName = '') {
+  const extension = path.extname(originalName || '') || '';
+  const uniqueId = typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : crypto.randomBytes(16).toString('hex');
+  return `${Date.now()}_${uniqueId}${extension}`;
+}
+
 // Recalcula base, comisión y total como en BookingScreen.pricing
 function computePricing({ priceType, unitPrice, durationMinutes }) {
   const type = String(priceType || '').toLowerCase();
@@ -1463,7 +1471,8 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
       return;
     }
 
-    const blob = bucket.file(req.file.originalname);
+    const objectName = generateObjectName(req.file.originalname);
+    const blob = bucket.file(objectName);
     const blobStream = blob.createWriteStream();
 
     blobStream.on('error', err => {
@@ -1472,7 +1481,7 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
 
     blobStream.on('finish', () => {
       const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
-      res.status(200).send({ url: publicUrl });
+      res.status(200).send({ url: publicUrl, objectName });
     });
 
     blobStream.end(compressedImage);
@@ -1532,14 +1541,15 @@ app.get('/api/user/:userId/lists', (req, res) => {
                 const servicesWithImagesPromises = services.map(service => {
                   return new Promise((resolve, reject) => {
                     // Obtener la primera imagen para cada service_id
-                    connection.query('SELECT image_url FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1', [service.service_id], (err, images) => {
+                    connection.query('SELECT image_url, object_name FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1', [service.service_id], (err, images) => {
                       if (err) {
                         return reject(err);
                       }
 
                       resolve({
                         service_id: service.service_id,
-                        image_url: images.length > 0 ? images[0].image_url : null // Si no hay imagen, devuelve null
+                        image_url: images.length > 0 ? images[0].image_url : null, // Si no hay imagen, devuelve null
+                        object_name: images.length > 0 ? images[0].object_name : null
                       });
                     });
                   });
@@ -1955,7 +1965,7 @@ app.get('/api/category/:id/services', (req, res) => {
          FROM service_tags 
          WHERE service_tags.service_id = service.id) AS tags,
         -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
          FROM service_image si 
          WHERE si.service_id = service.id) AS images
       FROM service
@@ -2024,14 +2034,15 @@ app.post('/api/upload-images', upload.array('files'), async (req, res, next) => 
         throw new Error('Formato de archivo no soportado.');
       }
 
-      const blob = bucket.file(`${Date.now()}_${file.originalname}`);
+      const objectName = generateObjectName(file.originalname);
+      const blob = bucket.file(objectName);
       const blobStream = blob.createWriteStream();
 
       return new Promise((resolve, reject) => {
         blobStream.on('error', reject);
         blobStream.on('finish', () => {
           const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
-          resolve({ url: publicUrl, order: index + 1 });
+          resolve({ url: publicUrl, objectName, order: index + 1 });
         });
         blobStream.end(compressedImage);
       });
@@ -2205,8 +2216,13 @@ app.post('/api/service', (req, res) => {
 
               // 7. Insertar imágenes en 'service_image'
               if (images && images.length > 0) {
-                const imageQuery = 'INSERT INTO service_image (service_id, image_url, `order`) VALUES ?';
-                const imageValues = images.map(img => [service_id, img.url, img.order]);
+                const imageQuery = 'INSERT INTO service_image (service_id, image_url, object_name, `order`) VALUES ?';
+                const imageValues = images.map(img => [
+                  service_id,
+                  img.url,
+                  img.object_name || img.objectName || null,
+                  img.order
+                ]);
 
                 connection.query(imageQuery, [imageValues], err => {
                   if (err) {
@@ -2597,9 +2613,9 @@ app.put('/api/services/:id', async (req, res) => {
             throw invalidInputError('invalid_image_value');
           }
           const orderValue = img.order === undefined ? null : parseNumberInput(img.order, null, 'image_order', { allowNull: true, integer: true });
-          return [serviceId, img.url, orderValue];
+          return [serviceId, img.url, img.object_name || img.objectName || null, orderValue];
         });
-        await connection.query('INSERT INTO service_image (service_id, image_url, `order`) VALUES ?', [imageValues]);
+        await connection.query('INSERT INTO service_image (service_id, image_url, object_name, `order`) VALUES ?', [imageValues]);
       }
     }
 
@@ -2763,7 +2779,7 @@ app.get('/api/service/:id', (req, res) => {
          FROM service_language 
          WHERE service_id = s.id) AS languages,
         -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
          FROM service_image si 
          WHERE si.service_id = s.id) AS images,
         -- Subconsulta para obtener las reseñas del servicio con información del usuario
@@ -3096,7 +3112,7 @@ app.get('/api/user/:userId/bookings', (req, res) => {
           user_account.profile_picture,
           user_account.is_professional,
           user_account.language,
-          (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+          (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
           FROM service_image si 
           WHERE si.service_id = service.id) AS images
       FROM booking
@@ -3194,7 +3210,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         booking_user.is_professional AS booking_user_is_professional,
         booking_user.language AS booking_user_language,
         -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
          FROM service_image si 
          WHERE si.service_id = service.id) AS images
       FROM booking
@@ -3277,7 +3293,7 @@ app.get('/api/user/:id/services', (req, res) => {
          FROM service_tags 
          WHERE service_tags.service_id = service.id) AS tags,
         -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
          FROM service_image si 
          WHERE si.service_id = service.id) AS images
       FROM service
@@ -5929,7 +5945,7 @@ app.get('/api/services', (req, res) => {
         WHERE service_tags.service_id = service.id) AS tags,
         
         -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
         FROM service_image si 
         WHERE si.service_id = service.id) AS images
       FROM service
@@ -6029,7 +6045,7 @@ app.get('/api/services/:id', (req, res) => {
         (SELECT JSON_ARRAYAGG(tag)
         FROM service_tags
         WHERE service_tags.service_id = service.id) AS tags,
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'order', si.order))
+        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
         FROM service_image si
         WHERE si.service_id = service.id) AS images
       FROM service
