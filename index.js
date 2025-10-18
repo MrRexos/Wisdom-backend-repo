@@ -2601,11 +2601,31 @@ app.put('/api/services/:id', async (req, res) => {
       }
     }
 
+    let imagesToDeleteFromBucket = [];
+
     if (body.images !== undefined) {
       if (!Array.isArray(body.images)) {
         await connection.rollback();
         return res.status(400).json({ error: 'invalid_images' });
       }
+      const [existingImages] = await connection.query('SELECT object_name FROM service_image WHERE service_id = ?', [serviceId]);
+      const existingObjectNames = existingImages
+        .map(row => row.object_name)
+        .filter(name => typeof name === 'string' && name.trim().length > 0);
+      const newObjectNames = new Set(
+        body.images
+          .map(img => {
+            if (!img || typeof img !== 'object') {
+              return null;
+            }
+            const objectName = img.object_name || img.objectName || null;
+            return typeof objectName === 'string' && objectName.trim().length > 0
+              ? objectName.trim()
+              : null;
+          })
+          .filter(Boolean)
+      );
+      imagesToDeleteFromBucket = existingObjectNames.filter(objectName => !newObjectNames.has(objectName));
       await connection.query('DELETE FROM service_image WHERE service_id = ?', [serviceId]);
       if (body.images.length > 0) {
         const imageValues = body.images.map(img => {
@@ -2620,6 +2640,21 @@ app.put('/api/services/:id', async (req, res) => {
     }
 
     await connection.commit();
+
+    if (imagesToDeleteFromBucket.length > 0) {
+      await Promise.all(
+        imagesToDeleteFromBucket.map(async objectName => {
+          try {
+            await bucket.file(objectName).delete({ ignoreNotFound: true });
+          } catch (deleteError) {
+            if (deleteError.code !== 404) {
+              console.error(`Error al eliminar la imagen ${objectName} del bucket:`, deleteError);
+            }
+          }
+        })
+      );
+    }
+
     return res.status(200).json({ message: 'Servicio actualizado correctamente.' });
   } catch (error) {
     await connection.rollback();
