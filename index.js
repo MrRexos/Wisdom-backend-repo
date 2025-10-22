@@ -3514,7 +3514,45 @@ app.put('/api/user/:id/email', (req, res) => {
   });
 });
 
-// Cambiar contraseña 
+// Ruta para actualizar el idioma preferido del usuario
+app.put('/api/user/:id/language', (req, res) => {
+  const { id } = req.params;
+  const { language } = req.body;
+
+  if (typeof language !== 'string' || language.trim() === '') {
+    return res.status(400).json({ error: 'invalid_language' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `
+      UPDATE user_account
+      SET language = ?
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [language.trim(), id], (queryErr, result) => {
+      connection.release();
+
+      if (queryErr) {
+        console.error('Error al actualizar el idioma del usuario:', queryErr);
+        return res.status(500).json({ error: 'Error al actualizar el idioma del usuario.' });
+      }
+
+      if (result.affectedRows > 0) {
+        return res.status(200).json({ message: 'Idioma actualizado exitosamente.' });
+      }
+
+      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+    });
+  });
+});
+
+// Cambiar contraseña
 app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
   const { id } = req.params;
   const { currentPassword, newPassword } = req.body;
