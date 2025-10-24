@@ -210,6 +210,57 @@ function generateObjectName(originalName = '') {
   return `${Date.now()}_${uniqueId}${extension}`;
 }
 
+function extractObjectNameFromUrl(url, bucketName) {
+  if (!bucketName || typeof url !== 'string') {
+    return null;
+  }
+
+  const trimmedUrl = url.trim();
+  if (!trimmedUrl) {
+    return null;
+  }
+
+  const prefixes = [
+    `https://storage.googleapis.com/${bucketName}/`,
+    `http://storage.googleapis.com/${bucketName}/`,
+    `https://${bucketName}.storage.googleapis.com/`,
+    `http://${bucketName}.storage.googleapis.com/`
+  ];
+
+  for (const prefix of prefixes) {
+    if (trimmedUrl.startsWith(prefix)) {
+      const objectPath = trimmedUrl.slice(prefix.length);
+      return objectPath ? decodeURIComponent(objectPath) : null;
+    }
+  }
+
+  return null;
+}
+
+function resolveImageObjectName(candidate, url, bucketName) {
+  if (typeof candidate === 'string') {
+    const trimmed = candidate.trim();
+    if (trimmed.length > 0) {
+      return trimmed;
+    }
+  }
+
+  const fromUrl = extractObjectNameFromUrl(url, bucketName);
+  return fromUrl || null;
+}
+
+function resolveImageUrl(image) {
+  if (!image || typeof image !== 'object') {
+    return null;
+  }
+  const raw = image.url ?? image.image_url ?? image.imageUrl;
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 // Recalcula base, comisión y total como en BookingScreen.pricing
 function computePricing({ priceType, unitPrice, durationMinutes }) {
   const type = String(priceType || '').toLowerCase();
@@ -818,7 +869,8 @@ const storage = new Storage({
   credentials: credentials,
 });
 
-const bucket = storage.bucket(process.env.GCLOUD_BUCKET_NAME);
+const bucketName = process.env.GCLOUD_BUCKET_NAME;
+const bucket = storage.bucket(bucketName);
 
 // Configura Multer para manejar la subida de archivos
 const multerMid = multer({
@@ -2217,12 +2269,21 @@ app.post('/api/service', (req, res) => {
               // 7. Insertar imágenes en 'service_image'
               if (images && images.length > 0) {
                 const imageQuery = 'INSERT INTO service_image (service_id, image_url, object_name, `order`) VALUES ?';
-                const imageValues = images.map(img => [
-                  service_id,
-                  img.url,
-                  img.object_name || img.objectName || null,
-                  img.order
-                ]);
+                const imageValues = images.map((img, index) => {
+                  const imageUrl = resolveImageUrl(img);
+                  const objectName = resolveImageObjectName(
+                    img?.object_name ?? img?.objectName,
+                    imageUrl,
+                    bucketName
+                  );
+
+                  return [
+                    service_id,
+                    imageUrl,
+                    objectName,
+                    img?.order ?? index + 1
+                  ];
+                });
 
                 connection.query(imageQuery, [imageValues], err => {
                   if (err) {
@@ -2613,20 +2674,22 @@ app.put('/api/services/:id', async (req, res) => {
         await connection.rollback();
         return res.status(400).json({ error: 'invalid_images' });
       }
-      const [existingImages] = await connection.query('SELECT object_name FROM service_image WHERE service_id = ?', [serviceId]);
+      const [existingImages] = await connection.query('SELECT image_url, object_name FROM service_image WHERE service_id = ?', [serviceId]);
       const existingObjectNames = existingImages
-        .map(row => row.object_name)
-        .filter(name => typeof name === 'string' && name.trim().length > 0);
+        .map(row => resolveImageObjectName(row?.object_name, row?.image_url, bucketName))
+        .filter(name => typeof name === 'string' && name.length > 0);
       const newObjectNames = new Set(
         body.images
           .map(img => {
             if (!img || typeof img !== 'object') {
               return null;
             }
-            const objectName = img.object_name || img.objectName || null;
-            return typeof objectName === 'string' && objectName.trim().length > 0
-              ? objectName.trim()
-              : null;
+            const imageUrl = resolveImageUrl(img);
+            return resolveImageObjectName(
+              img.object_name ?? img.objectName,
+              imageUrl,
+              bucketName
+            );
           })
           .filter(Boolean)
       );
@@ -2634,11 +2697,20 @@ app.put('/api/services/:id', async (req, res) => {
       await connection.query('DELETE FROM service_image WHERE service_id = ?', [serviceId]);
       if (body.images.length > 0) {
         const imageValues = body.images.map(img => {
-          if (!img || typeof img !== 'object' || !img.url) {
+          if (!img || typeof img !== 'object') {
+            throw invalidInputError('invalid_image_value');
+          }
+          const imageUrl = resolveImageUrl(img);
+          if (!imageUrl) {
             throw invalidInputError('invalid_image_value');
           }
           const orderValue = img.order === undefined ? null : parseNumberInput(img.order, null, 'image_order', { allowNull: true, integer: true });
-          return [serviceId, img.url, img.object_name || img.objectName || null, orderValue];
+          return [
+            serviceId,
+            imageUrl,
+            resolveImageObjectName(img.object_name ?? img.objectName, imageUrl, bucketName),
+            orderValue
+          ];
         });
         await connection.query('INSERT INTO service_image (service_id, image_url, object_name, `order`) VALUES ?', [imageValues]);
       }
