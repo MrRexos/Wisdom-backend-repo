@@ -1045,14 +1045,25 @@ app.post('/api/login', (req, res) => {
 
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
-  const { email, username, password, first_name, surname, language, allow_notis, profile_picture, phone } = req.body;
+  const {
+    email,
+    username,
+    password,
+    first_name,
+    surname,
+    language,
+    allow_notis,
+    profile_picture,
+    phone,
+    is_professional = 0,
+  } = req.body;
 
   try {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0)';
-    const values = [email, username, hashedPassword, first_name, surname, phone, language, allow_notis, profile_picture];
+    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0, ?)';
+    const values = [email, username, hashedPassword, first_name, surname, phone, language, allow_notis, profile_picture, is_professional];
 
     pool.getConnection((err, connection) => {
       if (err) {
