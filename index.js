@@ -6049,23 +6049,14 @@ app.get('/api/suggestions', (req, res) => {
   });
 });
 
-//Ruta para obtener todos los servicios de una busqueda 
-app.get('/api/services', (req, res) => {
-  const { query } = req.query; // Obtener la consulta de búsqueda de los parámetros de la solicitud
+//Ruta para obtener todos los servicios de una busqueda
+app.get('/api/services', async (req, res) => {
+  const searchTerm = (req.query.query || '').trim();
+  const hasSearchTerm = searchTerm.length > 0;
+  const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
-
-    // Definir el patrón de búsqueda
-    const searchPattern = `%${query}%`;
-
-    // Consulta para obtener la información de todos los servicios, sus tags y las imágenes
-    const queryServices = ` 
-      SELECT 
+  const queryServices = `
+      SELECT
         service.id AS service_id,
         service.service_title,
         service.description,
@@ -6095,20 +6086,10 @@ app.get('/api/services', (req, res) => {
         user_account.language,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating,
-        
-        -- Campos adicionales
         category_type.service_category_name,
         family.service_family,
-        
-        -- Subconsulta para obtener los tags del servicio
-        (SELECT JSON_ARRAYAGG(tag) 
-        FROM service_tags 
-        WHERE service_tags.service_id = service.id) AS tags,
-        
-        -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
-        FROM service_image si 
-        WHERE si.service_id = service.id) AS images
+        tags_data.tags,
+        images_data.images
       FROM service
       JOIN price ON service.price_id = price.id
       JOIN user_account ON service.user_id = user_account.id
@@ -6116,47 +6097,85 @@ app.get('/api/services', (req, res) => {
       JOIN service_family family ON category.service_family_id = family.id
       JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
       LEFT JOIN (
-        SELECT 
+        SELECT
           service_id,
           COUNT(*) AS review_count,
           AVG(rating) AS average_rating
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          JSON_ARRAYAGG(tag ORDER BY tag) AS tags
+        FROM service_tags
+        GROUP BY service_id
+      ) AS tags_data ON tags_data.service_id = service.id
+      LEFT JOIN (
+        SELECT
+          ordered_images.service_id,
+          JSON_ARRAYAGG(
+            JSON_OBJECT(
+              'id', ordered_images.id,
+              'image_url', ordered_images.image_url,
+              'object_name', ordered_images.object_name,
+              'order', ordered_images.image_order
+            )
+          ) AS images
+        FROM (
+          SELECT
+            si.service_id,
+            si.id,
+            si.image_url,
+            si.object_name,
+            si.`order` AS image_order
+          FROM service_image si
+          ORDER BY si.service_id, si.`order`, si.id
+        ) AS ordered_images
+        GROUP BY ordered_images.service_id
+      ) AS images_data ON images_data.service_id = service.id
       WHERE service.is_hidden = 0
         AND (
           service.service_title LIKE ?
           OR category_type.service_category_name LIKE ?
           OR family.service_family LIKE ?
-          OR service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?)
+          OR EXISTS (
+            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+          )
           OR service.description LIKE ?
         )
-      ORDER BY 
-        CASE 
-          WHEN service.service_title LIKE ? THEN 1 -- Más importante
-          WHEN category_type.service_category_name LIKE ? THEN 1 -- Más importante
-          WHEN family.service_family LIKE ? THEN 1 -- Más importante
-          WHEN service.id IN (SELECT service_id FROM service_tags WHERE tag LIKE ?) THEN 1 -- Más importante
-          WHEN service.description LIKE ? THEN 2 -- Menos importante
+      ORDER BY
+        CASE
+          WHEN service.service_title LIKE ? THEN 1
+          WHEN category_type.service_category_name LIKE ? THEN 1
+          WHEN family.service_family LIKE ? THEN 1
+          WHEN EXISTS (
+            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+          ) THEN 1
+          WHEN service.description LIKE ? THEN 2
           ELSE 3
         END;`;
 
-    connection.query(queryServices, [searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern, searchPattern], (err, servicesData) => {
-      connection.release(); // Liberar la conexión después de usarla
+  try {
+    const searchParams = new Array(10).fill(searchPattern);
+    const [servicesData] = await promisePool.query(queryServices, searchParams);
 
-      if (err) {
-        console.error('Error al obtener la información de los servicios:', err);
-        res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
-        return;
-      }
+    if (servicesData.length > 0) {
+      return res.status(200).json(servicesData);
+    }
 
-      if (servicesData.length > 0) {
-        res.status(200).json(servicesData); // Devolver la lista de servicios con tags e imágenes
-      } else {
-        res.status(200).json({ notFound: true, message: 'No se encontraron servicios que coincidan con la búsqueda.' });
-      }
+    if (!hasSearchTerm) {
+      return res.status(200).json([]);
+    }
+
+    return res.status(200).json({
+      notFound: true,
+      message: 'No se encontraron servicios que coincidan con la búsqueda.'
     });
-  });
+  } catch (error) {
+    console.error('Error al obtener la información de los servicios:', error);
+    return res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
+  }
 });
 
 //Ruta para obtener la información de un servicio por su id
