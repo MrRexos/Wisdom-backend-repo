@@ -43,25 +43,47 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 async function fetchConversationsByProfessional(db, collectionNames, participantFields, proValues, debug) {
   const out = new Map();
+  const tasks = [];
+
   for (const col of collectionNames) {
     for (const field of participantFields) {
       for (const val of proValues) {
         // prueba número y string porque tu array guarda números
-        const needles = [val, Number(val), String(val)].filter(v => v !== null && v !== undefined);
+        const needles = [val, Number(val), String(val)].filter(
+          (v) => v !== null && v !== undefined && v !== '',
+        );
         for (const needle of needles) {
-          try {
-            const snap = await db.collection(col).where(field, 'array-contains', needle).get();
-            snap.forEach(doc => {
-              const key = doc.ref.path;
-              if (!out.has(key)) out.set(key, { id: doc.id, ref: doc.ref, data: doc.data() || {} });
-            });
-          } catch (error) {
-            recordDebugStep(debug, 'fetch_conversations_by_professional_failed', { col, field, needle, error: error.message });
-          }
+          tasks.push(
+            db
+              .collection(col)
+              .where(field, 'array-contains', needle)
+              .get()
+              .then((snap) => {
+                snap.forEach((doc) => {
+                  const key = doc.ref.path;
+                  if (!out.has(key)) {
+                    out.set(key, { id: doc.id, ref: doc.ref, data: doc.data() || {} });
+                  }
+                });
+              })
+              .catch((error) => {
+                recordDebugStep(debug, 'fetch_conversations_by_professional_failed', {
+                  col,
+                  field,
+                  needle,
+                  error: error.message,
+                });
+              }),
+          );
         }
       }
     }
   }
+
+  if (tasks.length) {
+    await Promise.all(tasks);
+  }
+
   const arr = Array.from(out.values());
   recordDebugStep(debug, 'fetch_conversations_by_professional_done', { count: arr.length });
   return arr;
@@ -562,66 +584,91 @@ async function extractMessagesFromConversation(entry, proIdentifiers) {
 
 async function fetchConversations(db, collectionNames, fieldNames, serviceValues) {
   const conversations = new Map();
+  const tasks = [];
+
   for (const collectionName of collectionNames) {
     for (const fieldName of fieldNames) {
       for (const value of serviceValues) {
-        if (value === null || value === undefined) continue;
-        try {
-          const snapshot = await db.collection(collectionName).where(fieldName, '==', value).get();
-          snapshot.forEach((doc) => {
-            const key = doc.ref.path;
-            if (!conversations.has(key)) {
-              conversations.set(key, {
-                id: doc.id,
-                ref: doc.ref,
-                data: doc.data() || {},
+        if (value === null || value === undefined || value === '') continue;
+        tasks.push(
+          db
+            .collection(collectionName)
+            .where(fieldName, '==', value)
+            .get()
+            .then((snapshot) => {
+              snapshot.forEach((doc) => {
+                const key = doc.ref.path;
+                if (!conversations.has(key)) {
+                  conversations.set(key, {
+                    id: doc.id,
+                    ref: doc.ref,
+                    data: doc.data() || {},
+                  });
+                }
               });
-            }
-          });
-        } catch (error) {
-          if (process.env.NODE_ENV !== 'production') {
-            console.warn(`Firestore query failed for ${collectionName}.${fieldName}:`, error.message);
-          }
-        }
+            })
+            .catch((error) => {
+              if (process.env.NODE_ENV !== 'production') {
+                console.warn(`Firestore query failed for ${collectionName}.${fieldName}:`, error.message);
+              }
+            }),
+        );
       }
     }
   }
+
+  if (tasks.length) {
+    await Promise.all(tasks);
+  }
+
   return Array.from(conversations.values());
 }
 
 async function fetchMessagesFromCollectionGroup(db, fieldNames, serviceValues, proIdentifiers) {
   const messages = [];
   const seenIds = new Set();
+  const tasks = [];
+
   try {
     for (const fieldName of fieldNames) {
       for (const value of serviceValues) {
-        if (value === null || value === undefined) continue;
-        try {
-          const snapshot = await db.collectionGroup('messages').where(fieldName, '==', value).get();
-          snapshot.forEach((doc) => {
-            const data = doc.data() || {};
-            augmentProIdentifiersFromMessage(data, proIdentifiers);
-            const parentId = doc.ref.parent?.parent?.id;
-            const normalized = normalizeMessage({ id: doc.id, ...data }, {
-              id: parentId,
-              conversationId: parentId,
-              fallbackConversationId: parentId || 'conversation',
-              proIdentifiers,
-            });
-            if (normalized) {
-              const key = normalized.conversationId + '::' + normalized.id;
-              if (!seenIds.has(key)) {
-                seenIds.add(key);
-                messages.push(normalized);
+        if (value === null || value === undefined || value === '') continue;
+        tasks.push(
+          db
+            .collectionGroup('messages')
+            .where(fieldName, '==', value)
+            .get()
+            .then((snapshot) => {
+              snapshot.forEach((doc) => {
+                const data = doc.data() || {};
+                augmentProIdentifiersFromMessage(data, proIdentifiers);
+                const parentId = doc.ref.parent?.parent?.id;
+                const normalized = normalizeMessage({ id: doc.id, ...data }, {
+                  id: parentId,
+                  conversationId: parentId,
+                  fallbackConversationId: parentId || 'conversation',
+                  proIdentifiers,
+                });
+                if (normalized) {
+                  const key = normalized.conversationId + '::' + normalized.id;
+                  if (!seenIds.has(key)) {
+                    seenIds.add(key);
+                    messages.push(normalized);
+                  }
+                }
+              });
+            })
+            .catch((error) => {
+              if (process.env.NODE_ENV !== 'production') {
+                console.warn('collectionGroup query failed:', error.message);
               }
-            }
-          });
-        } catch (error) {
-          if (process.env.NODE_ENV !== 'production') {
-            console.warn('collectionGroup query failed:', error.message);
-          }
-        }
+            }),
+        );
       }
+    }
+
+    if (tasks.length) {
+      await Promise.all(tasks);
     }
   } catch (error) {
     if (process.env.NODE_ENV !== 'production') {
@@ -634,37 +681,50 @@ async function fetchMessagesFromCollectionGroup(db, fieldNames, serviceValues, p
 async function fetchMessagesFromCollections(db, collectionNames, fieldNames, serviceValues, proIdentifiers) {
   const messages = [];
   const seenIds = new Set();
+  const tasks = [];
+
   for (const collectionName of collectionNames) {
     for (const fieldName of fieldNames) {
       for (const value of serviceValues) {
-        if (value === null || value === undefined) continue;
-        try {
-          const snapshot = await db.collection(collectionName).where(fieldName, '==', value).get();
-          snapshot.forEach((doc) => {
-            const data = doc.data() || {};
-            augmentProIdentifiersFromMessage(data, proIdentifiers);
-            const normalized = normalizeMessage({ id: doc.id, ...data }, {
-              id: doc.id,
-              conversationId: normalizeIdentifier(data.conversationId) || doc.id,
-              fallbackConversationId: doc.id,
-              proIdentifiers,
-            });
-            if (normalized) {
-              const key = normalized.conversationId + '::' + normalized.id;
-              if (!seenIds.has(key)) {
-                seenIds.add(key);
-                messages.push(normalized);
+        if (value === null || value === undefined || value === '') continue;
+        tasks.push(
+          db
+            .collection(collectionName)
+            .where(fieldName, '==', value)
+            .get()
+            .then((snapshot) => {
+              snapshot.forEach((doc) => {
+                const data = doc.data() || {};
+                augmentProIdentifiersFromMessage(data, proIdentifiers);
+                const normalized = normalizeMessage({ id: doc.id, ...data }, {
+                  id: doc.id,
+                  conversationId: normalizeIdentifier(data.conversationId) || doc.id,
+                  fallbackConversationId: doc.id,
+                  proIdentifiers,
+                });
+                if (normalized) {
+                  const key = normalized.conversationId + '::' + normalized.id;
+                  if (!seenIds.has(key)) {
+                    seenIds.add(key);
+                    messages.push(normalized);
+                  }
+                }
+              });
+            })
+            .catch((error) => {
+              if (process.env.NODE_ENV !== 'production') {
+                console.warn(`Direct message collection query failed for ${collectionName}.${fieldName}:`, error.message);
               }
-            }
-          });
-        } catch (error) {
-          if (process.env.NODE_ENV !== 'production') {
-            console.warn(`Direct message collection query failed for ${collectionName}.${fieldName}:`, error.message);
-          }
-        }
+            }),
+        );
       }
     }
   }
+
+  if (tasks.length) {
+    await Promise.all(tasks);
+  }
+
   return messages;
 }
 
@@ -678,10 +738,16 @@ async function collectServiceMessages(db, serviceId, proIdentifiers) {
   const conversations = await fetchConversations(db, DEFAULT_CONVERSATION_COLLECTIONS, DEFAULT_SERVICE_FIELD_NAMES, serviceValues);
   const messages = [];
 
-  for (const conversation of conversations) {
-    augmentProIdentifiersFromConversation(conversation.data, proIdentifiers);
-    const conversationMessages = await extractMessagesFromConversation(conversation, proIdentifiers);
-    messages.push(...conversationMessages);
+  if (conversations.length) {
+    const conversationResults = await Promise.all(
+      conversations.map(async (conversation) => {
+        augmentProIdentifiersFromConversation(conversation.data, proIdentifiers);
+        return extractMessagesFromConversation(conversation, proIdentifiers);
+      }),
+    );
+    for (const conversationMessages of conversationResults) {
+      messages.push(...conversationMessages);
+    }
   }
 
   if (!messages.length) {
@@ -702,9 +768,16 @@ async function collectServiceMessages(db, serviceId, proIdentifiers) {
       Array.from(proIdentifiers),
       /*debug*/ null
     );
-    for (const c of dbConvs) {
-      augmentProIdentifiersFromConversation(c.data, proIdentifiers);
-      messages.push(...await extractMessagesFromConversation(c, proIdentifiers));
+    if (dbConvs.length) {
+      const convResults = await Promise.all(
+        dbConvs.map(async (c) => {
+          augmentProIdentifiersFromConversation(c.data, proIdentifiers);
+          return extractMessagesFromConversation(c, proIdentifiers);
+        }),
+      );
+      for (const convoMessages of convResults) {
+        messages.push(...convoMessages);
+      }
     }
   }
 
