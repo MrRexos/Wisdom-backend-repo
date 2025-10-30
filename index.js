@@ -2532,16 +2532,47 @@ app.put('/api/services/:id', async (req, res) => {
     let consultUrl;
 
     try {
-      serviceCategoryId = parseIntegerInput(body.service_category_id, service.service_category_id, 'service_category_id');
-      priceValue = parseNumberInput(body.price, service.current_price, 'price', { allowNull: false });
-      priceType = body.price_type !== undefined ? String(body.price_type) : service.current_price_type;
-      if (!priceType) {
+      serviceCategoryId = parseIntegerInput(
+        body.service_category_id,
+        service.service_category_id,
+        'service_category_id'
+      );
+    
+      // === NUEVO ORDEN Y REGLAS ===
+      // 1) price_type primero
+      priceType = (body.price_type !== undefined && body.price_type !== null)
+        ? String(body.price_type).trim().toLowerCase()
+        : (service.current_price_type || 'hour');
+    
+      if (!['hour', 'fix', 'budget'].includes(priceType)) {
         throw invalidInputError('invalid_price_type');
       }
-      priceType = priceType.trim();
-      if (!priceType) {
-        throw invalidInputError('invalid_price_type');
+    
+      // 2) price según el tipo
+      const allowNullPrice = (priceType === 'budget');
+      const defaultWhenRequired = allowNullPrice ? null : service.current_price;
+    
+      // Si no es budget y no viene ni en body ni en la BD, error explícito
+      if (!allowNullPrice && (body.price === undefined) && (defaultWhenRequired === null)) {
+        throw invalidInputError('invalid_number_price');
       }
+    
+      priceValue = parseNumberInput(
+        body.price,
+        defaultWhenRequired,
+        'price',
+        { allowNull: allowNullPrice }
+      );
+    
+      // Invariantes
+      if (priceType !== 'budget' && priceValue === null) {
+        throw invalidInputError('invalid_number_price');
+      }
+      if (priceValue !== null && Number(priceValue) < 0) {
+        throw invalidInputError('invalid_number_price');
+      }
+    
+      // resto de parseos como ya tenías
       latitude = parseNumberInput(body.latitude, service.latitude, 'latitude');
       longitude = parseNumberInput(body.longitude, service.longitude, 'longitude');
       actionRate = parseNumberInput(body.action_rate, service.action_rate, 'action_rate', { allowNull: false });
@@ -2564,7 +2595,10 @@ app.put('/api/services/:id', async (req, res) => {
       return res.status(parseError.status || 400).json({ error: parseError.message || 'invalid_service_payload' });
     }
 
-    await connection.query('UPDATE price SET price = ?, price_type = ? WHERE id = ?', [priceValue, priceType, service.price_id]);
+    await connection.query(
+      'UPDATE price SET price = ?, price_type = ? WHERE id = ?',
+      [priceType === 'budget' ? null : priceValue, priceType, service.price_id]
+    );
 
     let consultViaId = service.consult_via_id;
     if (userCanConsult) {
