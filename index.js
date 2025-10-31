@@ -3104,6 +3104,29 @@ app.get('/api/service/:id', (req, res) => {
           service.success_rate = null;
         }
 
+        let isLiked = false;
+        if (Number.isFinite(viewerId)) {
+          try {
+            const likedQuery = `
+              SELECT 1
+              FROM item_list il
+              JOIN service_list sl ON il.list_id = sl.id
+              LEFT JOIN shared_list sh ON sh.list_id = il.list_id
+              WHERE il.service_id = ? AND (sl.user_id = ? OR sh.user_id = ?)
+              LIMIT 1
+            `;
+            const [likedRows] = await promisePool.query(
+              likedQuery,
+              [service.service_id, viewerId, viewerId]
+            );
+            isLiked = likedRows.length > 0;
+          } catch (likedError) {
+            console.error('Error checking liked status:', likedError);
+          }
+        }
+
+        service.is_liked = isLiked;
+
         res.status(200).json(service); // Devolver la información del servicio
       } else {
         res.status(404).json({ notFound: true, message: 'Servicio no encontrado.' });
