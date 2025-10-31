@@ -6088,6 +6088,7 @@ app.get('/api/services', async (req, res) => {
   const searchTerm = (req.query.query || '').trim();
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
+  const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
 
   const queryServices = `
       SELECT
@@ -6185,10 +6186,43 @@ app.get('/api/services', async (req, res) => {
     const searchParams = new Array(10).fill(searchPattern);
     const [servicesData] = await promisePool.query(queryServices, searchParams);
 
-    if (servicesData.length > 0) {
-      return res.status(200).json(servicesData);
+    if (servicesData.length > 0) { 
+      // Marcar is_liked si llega un viewerId válido 
+      let likedServiceIds = new Set(); 
+      if (Number.isFinite(viewerId)) { 
+        const serviceIds = servicesData 
+          .map(s => s.service_id) 
+          .filter(id => id !== null && id !== undefined); 
+ 
+        if (serviceIds.length > 0) { 
+          const placeholders = serviceIds.map(() => '?').join(', '); 
+          const likedQuery = ` 
+            SELECT DISTINCT il.service_id 
+            FROM item_list il 
+            JOIN service_list sl ON il.list_id = sl.id 
+            LEFT JOIN shared_list sh ON sh.list_id = il.list_id 
+            WHERE (sl.user_id = ? OR sh.user_id = ?) 
+              AND il.service_id IN (${placeholders}) 
+          `; 
+          try { 
+            const [likedRows] = await promisePool.query( 
+              likedQuery, 
+              [viewerId, viewerId, ...serviceIds] 
+            ); 
+            likedServiceIds = new Set(likedRows.map(r => Number(r.service_id))); 
+          } catch (e) { 
+            console.error('Error consultando liked services:', e); 
+          } 
+        } 
+      } 
+ 
+      const withLiked = servicesData.map(s => ({ 
+        ...s, 
+        is_liked: likedServiceIds.has(Number(s.service_id)) ? 1 : 0, 
+      })); 
+      return res.status(200).json(withLiked); 
     }
-
+    
     if (!hasSearchTerm) {
       return res.status(200).json([]);
     }
