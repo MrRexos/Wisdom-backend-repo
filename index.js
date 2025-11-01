@@ -2032,23 +2032,29 @@ app.get('/api/category/:id/services', async (req, res) => {
       GROUP BY service_id
     ) AS review_data ON service.id = review_data.service_id
     LEFT JOIN (
-      SELECT service_id, JSON_ARRAYAGG(tag ORDER BY tag) AS tags
-      FROM service_tags
+      SELECT service_id, JSON_ARRAYAGG(tag) AS tags
+      FROM (
+        SELECT service_id, tag
+        FROM service_tags
+        ORDER BY service_id, tag
+      ) AS ordered_tags
       GROUP BY service_id
     ) AS tags_data ON tags_data.service_id = service.id
     LEFT JOIN (
-      SELECT
-        si.service_id,
-        JSON_ARRAYAGG(
+      SELECT service_id, JSON_ARRAYAGG(image_data) AS images
+      FROM (
+        SELECT
+          si.service_id,
           JSON_OBJECT(
             'id', si.id,
             'image_url', si.image_url,
             'object_name', si.object_name,
             'order', si.\`order\`
-          ) ORDER BY si.\`order\`
-        ) AS images
-      FROM service_image si
-      GROUP BY si.service_id
+          ) AS image_data
+        FROM service_image si
+        ORDER BY si.service_id, si.\`order\`
+      ) AS ordered_images
+      GROUP BY service_id
     ) AS images_data ON images_data.service_id = service.id
     WHERE service.is_hidden = 0
       AND service.service_category_id = ?;
