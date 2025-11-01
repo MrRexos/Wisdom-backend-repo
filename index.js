@@ -1981,87 +1981,116 @@ app.get('/api/service-family/:id/categories', (req, res) => {
 });
 
 //Ruta para mostrar todos los servicios de una categoria
-app.get('/api/category/:id/services', (req, res) => {
-  const { id } = req.params; // ID de la categoría
+app.get('/api/category/:id/services', async (req, res) => {
+  const categoryId = Number(req.params.id);
+  const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+  const query = `
+    SELECT
+      service.id AS service_id,
+      service.service_title,
+      service.description,
+      service.service_category_id,
+      service.price_id,
+      service.latitude,
+      service.longitude,
+      service.action_rate,
+      service.user_can_ask,
+      service.user_can_consult,
+      service.price_consult,
+      service.consult_via_id,
+      service.is_individual,
+      service.is_hidden,
+      service.service_created_datetime,
+      service.last_edit_datetime,
+      price.price,
+      price.price_type,
+      user_account.id AS user_id,
+      user_account.email,
+      user_account.phone,
+      user_account.username,
+      user_account.first_name,
+      user_account.surname,
+      user_account.profile_picture,
+      user_account.is_professional,
+      user_account.language,
+      COALESCE(review_data.review_count, 0) AS review_count,
+      COALESCE(review_data.average_rating, 0) AS average_rating,
+      category_type.service_category_name,
+      family.service_family,
+      tags_data.tags,
+      images_data.images
+    FROM service
+    JOIN price ON service.price_id = price.id
+    JOIN user_account ON service.user_id = user_account.id
+    JOIN service_category category ON service.service_category_id = category.id
+    JOIN service_family family ON category.service_family_id = family.id
+    JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+    LEFT JOIN (
+      SELECT service_id, COUNT(*) AS review_count, AVG(rating) AS average_rating
+      FROM review
+      GROUP BY service_id
+    ) AS review_data ON service.id = review_data.service_id
+    LEFT JOIN (
+      SELECT service_id, JSON_ARRAYAGG(tag ORDER BY tag) AS tags
+      FROM service_tags
+      GROUP BY service_id
+    ) AS tags_data ON tags_data.service_id = service.id
+    LEFT JOIN (
+      SELECT
+        si.service_id,
+        JSON_ARRAYAGG(
+          JSON_OBJECT(
+            'id', si.id,
+            'image_url', si.image_url,
+            'object_name', si.object_name,
+            'order', si.\`order\`
+          ) ORDER BY si.\`order\`
+        ) AS images
+      FROM service_image si
+      GROUP BY si.service_id
+    ) AS images_data ON images_data.service_id = service.id
+    WHERE service.is_hidden = 0
+      AND service.service_category_id = ?;
+  `;
+
+  try {
+    const [rows] = await promisePool.query(query, [categoryId]);
+    if (rows.length === 0) return res.status(200).json([]);
+
+    let likedServiceIds = new Set();
+
+    // Sólo calculamos likes si nos llega un viewerId válido
+    if (Number.isFinite(viewerId)) {
+      const serviceIds = rows.map(s => s.service_id).filter(Boolean);
+      if (serviceIds.length) {
+        const placeholders = serviceIds.map(() => '?').join(', ');
+        const likedQuery = `
+          SELECT DISTINCT il.service_id
+          FROM item_list il
+          JOIN service_list sl ON il.list_id = sl.id
+          LEFT JOIN shared_list sh ON sh.list_id = il.list_id
+          WHERE (sl.user_id = ? OR sh.user_id = ?)
+            AND il.service_id IN (${placeholders})
+        `;
+        const [likedRows] = await promisePool.query(
+          likedQuery,
+          [viewerId, viewerId, ...serviceIds]
+        );
+        likedServiceIds = new Set(likedRows.map(r => Number(r.service_id)));
+      }
     }
 
-    // Consulta para obtener la información de todos los servicios, sus tags y las imágenes
-    const query = `
-      SELECT 
-        service.id AS service_id,
-        service.service_title,
-        service.description,
-        service.service_category_id,
-        service.price_id,
-        service.latitude,
-        service.longitude,
-        service.action_rate,
-        service.user_can_ask,
-        service.user_can_consult,
-        service.price_consult,
-        service.consult_via_id,
-        service.is_individual,
-        service.is_hidden,
-        service.service_created_datetime,
-        service.last_edit_datetime,
-        price.price,
-        price.price_type,
-        user_account.id AS user_id,
-        user_account.email,
-        user_account.phone,
-        user_account.username,
-        user_account.first_name,
-        user_account.surname,
-        user_account.profile_picture,
-        user_account.is_professional,
-        user_account.language,
-        COALESCE(review_data.review_count, 0) AS review_count,
-        COALESCE(review_data.average_rating, 0) AS average_rating,
-        -- Subconsulta para obtener los tags del servicio
-        (SELECT JSON_ARRAYAGG(tag) 
-         FROM service_tags 
-         WHERE service_tags.service_id = service.id) AS tags,
-        -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
-         FROM service_image si 
-         WHERE si.service_id = service.id) AS images
-      FROM service
-      JOIN price ON service.price_id = price.id
-      JOIN user_account ON service.user_id = user_account.id
-      LEFT JOIN (
-        SELECT 
-          service_id,
-          COUNT(*) AS review_count,
-          AVG(rating) AS average_rating
-        FROM review
-        GROUP BY service_id
-      ) AS review_data ON service.id = review_data.service_id
-      WHERE service.service_category_id = ?
-        AND service.is_hidden = 0;
-    `;
+    const withLiked = rows.map(s => ({
+      ...s,
+      is_liked: likedServiceIds.has(Number(s.service_id)) ? 1 : 0,
+    }));
 
-    connection.query(query, [id], (err, servicesData) => {
-      connection.release(); // Liberar la conexión después de usarla
-
-      if (err) {
-        console.error('Error al obtener la información de los servicios:', err);
-        res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
-        return;
-      }
-
-      if (servicesData.length > 0) {
-        res.status(200).json(servicesData); // Devolver la lista de servicios con tags e imágenes
-      } else {
-        res.status(200).json({ notFound: true, message: 'No se encontraron servicios para esta categoría.' });
-      }
-    });
-  });
+    return res.status(200).json(withLiked);
+  } catch (err) {
+    console.error('Error al obtener servicios por categoría:', err);
+    return res.status(500).json({ error: 'Error al obtener servicios por categoría.' });
+  }
 });
 
 //Ruta para subir varias fotos (create service)
