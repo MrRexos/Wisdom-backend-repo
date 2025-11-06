@@ -2918,6 +2918,35 @@ app.post('/api/lists/:list_id/items', (req, res) => {
   });
 });
 
+// Ruta para eliminar un item de una lista por su ID
+app.delete('/api/lists/:list_id/items/:item_id', (req, res) => {
+  const { list_id, item_id } = req.params;
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const deleteQuery = 'DELETE FROM item_list WHERE id = ? AND list_id = ?';
+
+    connection.query(deleteQuery, [item_id, list_id], (err, result) => {
+      connection.release();
+
+      if (err) {
+        console.error('Error al eliminar el item de la lista:', err);
+        return res.status(500).json({ error: 'Error al eliminar el item de la lista.' });
+      }
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ error: 'Item no encontrado en la lista.' });
+      }
+
+      return res.status(200).json({ message: 'Item eliminado con éxito.' });
+    });
+  });
+});
+
 //Ruta para obtener toda la info de un servicio y mostrar su profile
 app.get('/api/service/:id', (req, res) => {
   const { id } = req.params; // ID del servicio
