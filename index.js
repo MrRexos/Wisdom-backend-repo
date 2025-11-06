@@ -1584,56 +1584,50 @@ app.get('/api/user/:userId/lists', (req, res) => {
 
       // Iterar sobre las listas para obtener los detalles
       const listsWithDetailsPromises = lists.map(list => {
-        return new Promise((resolve, reject) => {
-          connection.query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id], (err, itemCountResult) => {
+        const query = (sql, params) => new Promise((resolve, reject) => {
+          connection.query(sql, params, (err, results) => {
             if (err) {
-              return reject(err);
+              reject(err);
+            } else {
+              resolve(results);
             }
-
-            connection.query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id], (err, lastItemDateResult) => {
-              if (err) {
-                return reject(err);
-              }
-
-              // Obtener los tres primeros servicios (service_id) de la lista
-              connection.query('SELECT service_id FROM item_list WHERE list_id = ? ORDER BY id LIMIT 3', [list.id], (err, services) => {
-                if (err) {
-                  return reject(err);
-                }
-
-                const servicesWithImagesPromises = services.map(service => {
-                  return new Promise((resolve, reject) => {
-                    // Obtener la primera imagen para cada service_id
-                    connection.query('SELECT image_url, object_name FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1', [service.service_id], (err, images) => {
-                      if (err) {
-                        return reject(err);
-                      }
-
-                      resolve({
-                        service_id: service.service_id,
-                        image_url: images.length > 0 ? images[0].image_url : null, // Si no hay imagen, devuelve null
-                        object_name: images.length > 0 ? images[0].object_name : null
-                      });
-                    });
-                  });
-                });
-
-                Promise.all(servicesWithImagesPromises)
-                  .then(servicesWithImages => {
-                    resolve({
-                      id: list.id,
-                      title: list.list_name,
-                      role: list.role,  // Rol del usuario en la lista (propietario o compartido)
-                      item_count: itemCountResult[0].item_count,
-                      last_item_date: lastItemDateResult[0].last_item_date,
-                      services: servicesWithImages
-                    });
-                  })
-                  .catch(error => reject(error));
-              });
-            });
           });
         });
+
+        return (async () => {
+          const itemCountResult = await query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id]);
+          const lastItemDateResult = await query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
+
+          // Obtener todos los servicios de la lista ordenados por el id de inserción
+          const services = await query('SELECT service_id FROM item_list WHERE list_id = ? ORDER BY id', [list.id]);
+
+          const servicesWithImages = [];
+
+          for (const service of services) {
+            if (servicesWithImages.length >= 3) {
+              break;
+            }
+
+            const images = await query('SELECT image_url, object_name FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1', [service.service_id]);
+
+            if (images.length > 0 && images[0].image_url) {
+              servicesWithImages.push({
+                service_id: service.service_id,
+                image_url: images[0].image_url,
+                object_name: images[0].object_name
+              });
+            }
+          }
+
+          return {
+            id: list.id,
+            title: list.list_name,
+            role: list.role,  // Rol del usuario en la lista (propietario o compartido)
+            item_count: itemCountResult[0].item_count,
+            last_item_date: lastItemDateResult[0].last_item_date,
+            services: servicesWithImages
+          };
+        })();
       });
 
       Promise.all(listsWithDetailsPromises)
