@@ -1565,46 +1565,6 @@ app.post('/api/token/refresh', async (req, res) => {
   }
 });
 
-
-//--------------------------------
-
-// Proteger las rutas siguientes
-app.use('/api', authenticateToken);
-
-
-// Ruta para obtener usuarios
-app.get('/api/users', (req, res) => {
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
-
-    connection.query('SELECT * FROM user_account', (err, results) => {
-      connection.release(); // Libera la conexión después de usarla
-
-      if (err) {
-        console.error('Error al obtener usuarios:', err);
-        res.status(500).json({ error: 'Error al obtener usuarios.' });
-        return;
-      }
-      res.json(results);
-    });
-  });
-});
-
-// Revoca todas las sesiones del usuario actual (requiere access token)
-app.post('/api/logout-all', async (req, res) => {
-  try {
-    await revokeAllUserSessions(req.user.id);
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('Error en logout-all:', e);
-    return res.status(500).json({ error: 'Error al revocar sesiones' });
-  }
-});
-
 // Nueva ruta para generar URL firmada de subida a Google Cloud Storage
 app.options('/api/uploads/sign', uploadSignCors, (req, res) => {
   res.sendStatus(204);
@@ -1655,6 +1615,47 @@ app.post('/api/uploads/sign', uploadSignCors, uploadSignLimiter, async (req, res
   } catch (error) {
     console.error('Error generating upload signature:', error);
     res.status(500).json({ error: 'signature_failed' });
+  }
+});
+
+
+
+//--------------------------------
+
+// Proteger las rutas siguientes
+app.use('/api', authenticateToken);
+
+
+// Ruta para obtener usuarios
+app.get('/api/users', (req, res) => {
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      return;
+    }
+
+    connection.query('SELECT * FROM user_account', (err, results) => {
+      connection.release(); // Libera la conexión después de usarla
+
+      if (err) {
+        console.error('Error al obtener usuarios:', err);
+        res.status(500).json({ error: 'Error al obtener usuarios.' });
+        return;
+      }
+      res.json(results);
+    });
+  });
+});
+
+// Revoca todas las sesiones del usuario actual (requiere access token)
+app.post('/api/logout-all', async (req, res) => {
+  try {
+    await revokeAllUserSessions(req.user.id);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Error en logout-all:', e);
+    return res.status(500).json({ error: 'Error al revocar sesiones' });
   }
 });
 
