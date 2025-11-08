@@ -9,6 +9,8 @@ const { Storage } = require('@google-cloud/storage');
 const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const crypto = require("crypto");
 const PDFDocument = require('pdfkit');
@@ -208,6 +210,83 @@ function generateObjectName(originalName = '') {
     ? crypto.randomUUID()
     : crypto.randomBytes(16).toString('hex');
   return `${Date.now()}_${uniqueId}${extension}`;
+}
+
+const ALLOWED_UPLOAD_IMAGE_TYPES = new Map([
+  ['image/jpeg', '.jpg'],
+  ['image/jpg', '.jpg'],
+  ['image/pjpeg', '.jpg'],
+  ['image/png', '.png'],
+  ['image/webp', '.webp'],
+]);
+
+const MAX_UPLOAD_IMAGE_SIZE_BYTES = (() => {
+  const envValue = Number(process.env.UPLOAD_SIGN_MAX_SIZE_BYTES);
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return envValue;
+  }
+  return 5 * 1024 * 1024; // 5MB por defecto
+})();
+
+const DEFAULT_UPLOAD_SIGN_EXPIRATION_SECONDS = (() => {
+  const envValue = Number(process.env.UPLOAD_SIGN_EXPIRES_SECONDS);
+  if (Number.isFinite(envValue)) {
+    return Math.min(Math.max(envValue, 60), 120);
+  }
+  return 90;
+})();
+
+function normalizeUploadPrefix(prefix) {
+  const fallback = 'reg/';
+  if (typeof prefix !== 'string' || !prefix.trim()) {
+    return fallback;
+  }
+
+  const sanitized = prefix
+    .trim()
+    .replace(/^\/+/, '')
+    .replace(/\.\.+/g, '')
+    .replace(/[^A-Za-z0-9/_-]/g, '');
+
+  if (!sanitized) {
+    return fallback;
+  }
+
+  return sanitized.endsWith('/') ? sanitized : `${sanitized}/`;
+}
+
+const UPLOAD_SIGN_PREFIX = normalizeUploadPrefix(process.env.UPLOAD_SIGN_PREFIX);
+
+function sanitizeUploadBaseName(name) {
+  if (typeof name !== 'string') {
+    return 'image';
+  }
+
+  const basename = path.posix.basename(name).replace(/\s+/g, '_');
+  const parsed = path.parse(basename);
+  const clean = parsed.name.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 80);
+  return clean || 'image';
+}
+
+function createUploadObjectKey(originalName, extension) {
+  const base = sanitizeUploadBaseName(originalName);
+  const uniqueId = typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : crypto.randomBytes(12).toString('hex');
+  return `${UPLOAD_SIGN_PREFIX}${base}_${Date.now()}_${uniqueId}${extension}`;
+}
+
+function buildPublicUrl(bucketName, objectKey) {
+  if (!bucketName || !objectKey) {
+    return null;
+  }
+
+  const encodedKey = objectKey
+    .split('/')
+    .map(segment => encodeURIComponent(segment))
+    .join('/');
+
+  return `https://storage.googleapis.com/${bucketName}/${encodedKey}`;
 }
 
 function extractObjectNameFromUrl(url, bucketName) {
@@ -880,6 +959,43 @@ const multerMid = multer({
   },
 });
 
+const uploadSignAllowedOrigins = process.env.UPLOAD_SIGN_ALLOWED_ORIGINS
+  ? process.env.UPLOAD_SIGN_ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
+  : null;
+
+const uploadSignCors = cors({
+  origin: uploadSignAllowedOrigins && uploadSignAllowedOrigins.length > 0 ? uploadSignAllowedOrigins : true,
+  methods: ['POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  maxAge: 86400,
+});
+
+const uploadSignWindowMs = (() => {
+  const value = Number(process.env.UPLOAD_SIGN_RATE_WINDOW_MS);
+  if (Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  return 60 * 1000;
+})();
+
+const uploadSignMaxRequests = (() => {
+  const value = Number(process.env.UPLOAD_SIGN_RATE_LIMIT);
+  if (Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  return 10;
+})();
+
+const uploadSignLimiter = rateLimit({
+  windowMs: uploadSignWindowMs,
+  max: uploadSignMaxRequests,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ error: 'rate_limit_exceeded' });
+  },
+});
+
 
 
 // Ruta de prueba
@@ -1489,7 +1605,60 @@ app.post('/api/logout-all', async (req, res) => {
   }
 });
 
-// Nueva ruta para subir imágenes a Google Cloud Storage
+// Nueva ruta para generar URL firmada de subida a Google Cloud Storage
+app.options('/api/uploads/sign', uploadSignCors, (req, res) => {
+  res.sendStatus(204);
+});
+
+app.post('/api/uploads/sign', uploadSignCors, uploadSignLimiter, async (req, res) => {
+  try {
+    const { name, type, size } = req.body || {};
+
+    if (typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'invalid_name' });
+    }
+
+    const normalizedType = typeof type === 'string' ? type.toLowerCase() : '';
+    const extension = ALLOWED_UPLOAD_IMAGE_TYPES.get(normalizedType);
+    if (!extension) {
+      return res.status(400).json({ error: 'invalid_type' });
+    }
+
+    const numericSize = Number(size);
+    if (!Number.isFinite(numericSize) || numericSize <= 0 || numericSize > MAX_UPLOAD_IMAGE_SIZE_BYTES) {
+      return res.status(400).json({ error: 'invalid_size' });
+    }
+
+    if (!bucketName) {
+      console.error('Missing GCLOUD_BUCKET_NAME configuration');
+      return res.status(500).json({ error: 'upload_not_configured' });
+    }
+
+    const objectKey = createUploadObjectKey(name, extension);
+    const expiresInSeconds = DEFAULT_UPLOAD_SIGN_EXPIRATION_SECONDS;
+    const expiresAt = Date.now() + expiresInSeconds * 1000;
+
+    const [uploadUrl] = await bucket.file(objectKey).getSignedUrl({
+      version: 'v4',
+      action: 'write',
+      expires: expiresAt,
+      contentType: normalizedType,
+    });
+
+    const publicUrl = buildPublicUrl(bucket.name, objectKey);
+
+    res.status(200).json({
+      uploadUrl,
+      publicUrl,
+      key: objectKey,
+    });
+  } catch (error) {
+    console.error('Error generating upload signature:', error);
+    res.status(500).json({ error: 'signature_failed' });
+  }
+});
+
+// Ruta legacy que sube imágenes directamente desde el backend
 app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) => {
 
   console.log('Archivo recibido:', req.file);
