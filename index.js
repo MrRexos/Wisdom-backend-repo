@@ -38,6 +38,8 @@ async function handleStripeRollbackIfNeeded(error) {
 
 
 const app = express();
+// Heroku y otros proxies envían cabeceras X-Forwarded-*; esto permite que Express las use.
+app.set('trust proxy', 1);
 const port = process.env.PORT || 3000;
 
 app.set('etag', false);
