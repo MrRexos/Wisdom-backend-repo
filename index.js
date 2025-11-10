@@ -2671,6 +2671,33 @@ app.patch('/api/services/:id/visibility', async (req, res) => {
   }
 });
 
+//Ruta mira si profesional tiene vacation mode activo o no
+app.get('/api/professionals/:id/vacation-mode', authenticateToken, async (req, res) => {
+  const professionalId = Number(req.params.id);
+  if (!Number.isInteger(professionalId) || professionalId <= 0) {
+    return res.status(400).json({ error: 'invalid_professional_id' });
+  }
+  // Solo el dueño, admin o soporte
+  const isOwner = req.user && Number(req.user.id) === professionalId;
+  const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+  if (!isOwner && !isStaff) return res.status(403).json({ error: 'not_authorized' });
+
+  try {
+    const [[row]] = await promisePool.query(
+      'SELECT id, is_professional, vacation_mode FROM user_account WHERE id = ?',
+      [professionalId]
+    );
+    if (!row) return res.status(404).json({ error: 'professional_not_found' });
+    if (!row.is_professional) return res.status(400).json({ error: 'user_not_professional' });
+
+    return res.status(200).json({ vacation_mode: !!row.vacation_mode });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'read_vacation_mode_failed' });
+  }
+});
+
+//Ruta cambia vacation mode a true o false i oculta/muestra todos sus servicios
 app.patch('/api/professionals/:id/vacation-mode', async (req, res) => {
   const professionalId = Number(req.params.id);
   if (!Number.isInteger(professionalId) || professionalId <= 0) {
