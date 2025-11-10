@@ -2671,6 +2671,78 @@ app.patch('/api/services/:id/visibility', async (req, res) => {
   }
 });
 
+app.patch('/api/professionals/:id/vacation-mode', async (req, res) => {
+  const professionalId = Number(req.params.id);
+  if (!Number.isInteger(professionalId) || professionalId <= 0) {
+    return res.status(400).json({ error: 'invalid_professional_id' });
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(req.body || {}, 'vacation_mode')) {
+    return res.status(400).json({ error: 'vacation_mode_required' });
+  }
+
+  let vacationMode;
+  try {
+    vacationMode = parseBooleanInput(req.body.vacation_mode, null, 'vacation_mode');
+    if (vacationMode === null) {
+      throw invalidInputError('invalid_boolean_vacation_mode');
+    }
+  } catch (error) {
+    return res.status(error.status || 400).json({ error: error.message || 'invalid_boolean_vacation_mode' });
+  }
+
+  const isOwner = req.user && Number(req.user.id) === professionalId;
+  const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+  if (!isOwner && !isStaff) {
+    return res.status(403).json({ error: 'not_authorized' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [[professional]] = await connection.query(
+      'SELECT id, is_professional FROM user_account WHERE id = ? FOR UPDATE',
+      [professionalId]
+    );
+
+    if (!professional) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'professional_not_found' });
+    }
+
+    if (!professional.is_professional) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'user_not_professional' });
+    }
+
+    const [result] = await connection.query(
+      'UPDATE service SET is_hidden = ?, last_edit_datetime = NOW() WHERE user_id = ?',
+      [vacationMode ? 1 : 0, professionalId]
+    );
+
+    await connection.commit();
+
+    return res.status(200).json({
+      message: vacationMode
+        ? 'Servicios del profesional ocultados (modo vacaciones activado).'
+        : 'Servicios del profesional visibles (modo vacaciones desactivado).',
+      affected_services: result.affectedRows,
+      vacation_mode: vacationMode
+    });
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error('Error al revertir la transacción de modo vacaciones:', rollbackError);
+    }
+    console.error('Error al actualizar el modo vacaciones del profesional:', error);
+    return res.status(500).json({ error: 'error_updating_vacation_mode' });
+  } finally {
+    connection.release();
+  }
+});
+
 //Ruta para actualizar un servicio
 app.put('/api/services/:id', async (req, res) => {
   const serviceId = Number(req.params.id);
