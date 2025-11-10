@@ -2743,6 +2743,11 @@ app.patch('/api/professionals/:id/vacation-mode', async (req, res) => {
       return res.status(400).json({ error: 'user_not_professional' });
     }
 
+    await connection.query(
+      'UPDATE user_account SET vacation_mode = ? WHERE id = ?',
+      [vacationMode ? 1 : 0, professionalId]
+    );
+
     const [result] = await connection.query(
       'UPDATE service SET is_hidden = ?, last_edit_datetime = NOW() WHERE user_id = ?',
       [vacationMode ? 1 : 0, professionalId]
