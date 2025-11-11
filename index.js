@@ -3538,7 +3538,13 @@ app.get('/api/suggested_professional', (req, res) => {
         ) ranked
         WHERE rn = 1
       ) bs ON ua.id = bs.user_id
-      WHERE ua.is_professional = 1;
+      WHERE ua.is_professional = 1
+        AND EXISTS (
+          SELECT 1
+          FROM service s_exist
+          WHERE s_exist.user_id = ua.id
+            AND s_exist.is_hidden = 0
+        );
     `;
 
     connection.query(query, (err, pros) => {
