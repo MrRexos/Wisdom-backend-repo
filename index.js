@@ -206,6 +206,180 @@ const round2 = (n) => {
   return Math.round(x * 100) / 100;
 };
 
+function parseQueryNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (Array.isArray(value)) {
+    for (let i = value.length - 1; i >= 0; i -= 1) {
+      const parsed = parseQueryNumber(value[i]);
+      if (parsed !== null) return parsed;
+    }
+    return null;
+  }
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parseQueryBoolean(value) {
+  if (value === undefined || value === null) return false;
+  if (Array.isArray(value) && value.length > 0) {
+    return parseQueryBoolean(value[value.length - 1]);
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return false;
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return false;
+  }
+  return Boolean(value);
+}
+
+function parseQueryStringArray(value) {
+  const result = new Set();
+
+  const process = (val) => {
+    if (val === undefined || val === null) return;
+    if (Array.isArray(val)) {
+      val.forEach(process);
+      return;
+    }
+
+    if (typeof val === 'string') {
+      const trimmed = val.trim();
+      if (!trimmed) return;
+
+      if ((trimmed.startsWith('[') && trimmed.endsWith(']')) || (trimmed.startsWith('{') && trimmed.endsWith('}'))) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          process(parsed);
+          return;
+        } catch (e) {
+          // Valor no es JSON válido, continuar con el flujo habitual.
+        }
+      }
+
+      trimmed.split(',').forEach((part) => {
+        const piece = part.trim();
+        if (piece) result.add(piece);
+      });
+      return;
+    }
+
+    const str = String(val).trim();
+    if (str) result.add(str);
+  };
+
+  process(value);
+  return Array.from(result);
+}
+
+function extractServiceFilters(query) {
+  const minPrice = parseQueryNumber(query.min_price ?? query.price_min);
+  const maxPrice = parseQueryNumber(query.max_price ?? query.price_max);
+  const durationMinutes = parseQueryNumber(query.duration_minutes ?? query.duration ?? query.duration_min ?? query.duration_mins);
+  const maxActionRate = parseQueryNumber(query.max_action_rate ?? query.action_rate_max);
+  const minRating = parseQueryNumber(query.min_rating ?? query.rating_min);
+  const requireCompany = parseQueryBoolean(query.require_company ?? query.company_profile ?? query.company_only);
+  const requireVerified = parseQueryBoolean(query.require_verified ?? query.verified_only);
+  const languages = parseQueryStringArray(query.languages ?? query.language ?? query.lang);
+
+  return {
+    minPrice,
+    maxPrice,
+    durationMinutes,
+    maxActionRate,
+    minRating,
+    requireCompany,
+    requireVerified,
+    languages,
+  };
+}
+
+function buildServiceFilterClause(filters, {
+  serviceAlias = 'service',
+  priceAlias = 'price',
+  userAlias = 'user_account',
+  reviewAlias = 'review_data',
+} = {}) {
+  const clauses = [];
+  const params = [];
+
+  const {
+    minPrice,
+    maxPrice,
+    durationMinutes,
+    maxActionRate,
+    minRating,
+    requireCompany,
+    requireVerified,
+    languages,
+  } = filters;
+
+  if (minPrice !== null || maxPrice !== null) {
+    const priceConditions = [`${priceAlias}.price_type = 'budget'`];
+
+    const fixParts = [`${priceAlias}.price_type = 'fix'`];
+    if (minPrice !== null) {
+      fixParts.push(`${priceAlias}.price >= ?`);
+      params.push(minPrice);
+    }
+    if (maxPrice !== null) {
+      fixParts.push(`${priceAlias}.price <= ?`);
+      params.push(maxPrice);
+    }
+    priceConditions.push(fixParts.join(' AND '));
+
+    const hourlyParts = [`${priceAlias}.price_type = 'hour'`];
+    if (durationMinutes !== null) {
+      if (minPrice !== null) {
+        hourlyParts.push(`${priceAlias}.price * (? / 60.0) >= ?`);
+        params.push(durationMinutes, minPrice);
+      }
+      if (maxPrice !== null) {
+        hourlyParts.push(`${priceAlias}.price * (? / 60.0) <= ?`);
+        params.push(durationMinutes, maxPrice);
+      }
+    }
+    priceConditions.push(hourlyParts.join(' AND '));
+
+    clauses.push(`(${priceConditions.map((condition) => `(${condition})`).join(' OR ')})`);
+  }
+
+  if (Number.isFinite(maxActionRate)) {
+    clauses.push(`(${serviceAlias}.action_rate IS NULL OR ${serviceAlias}.action_rate <= ?)`);
+    params.push(maxActionRate);
+  }
+
+  if (Number.isFinite(minRating)) {
+    clauses.push(`COALESCE(${reviewAlias}.average_rating, 0) >= ?`);
+    params.push(minRating);
+  }
+
+  if (requireCompany) {
+    clauses.push(`COALESCE(${serviceAlias}.is_individual, 0) = 0`);
+  }
+
+  if (requireVerified) {
+    clauses.push(`${userAlias}.is_professional = 1`);
+    clauses.push(`${userAlias}.is_verified = 1`);
+  }
+
+  if (languages && languages.length > 0) {
+    const placeholders = languages.map(() => '?').join(', ');
+    clauses.push(`EXISTS (SELECT 1 FROM service_language sl WHERE sl.service_id = ${serviceAlias}.id AND sl.language IN (${placeholders}))`);
+    params.push(...languages);
+  }
+
+  if (!clauses.length) {
+    return { sql: '', params: [] };
+  }
+
+  return {
+    sql: ` AND ${clauses.join(' AND ')}`,
+    params,
+  };
+}
+
 function generateObjectName(originalName = '') {
   const extension = path.extname(originalName || '') || '';
   const uniqueId = typeof crypto.randomUUID === 'function'
@@ -2151,6 +2325,9 @@ app.get('/api/category/:id/services', async (req, res) => {
   const categoryId = Number(req.params.id);
   const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
 
+  const filters = extractServiceFilters(req.query);
+  const filtersClause = buildServiceFilterClause(filters);
+
   const query = `
     SELECT
       service.id AS service_id,
@@ -2179,13 +2356,15 @@ app.get('/api/category/:id/services', async (req, res) => {
       user_account.surname,
       user_account.profile_picture,
       user_account.is_professional,
+      user_account.is_verified,
       user_account.language,
       COALESCE(review_data.review_count, 0) AS review_count,
       COALESCE(review_data.average_rating, 0) AS average_rating,
       category_type.service_category_name,
       family.service_family,
       tags_data.tags,
-      images_data.images
+      images_data.images,
+      language_data.languages
     FROM service
     JOIN price ON service.price_id = price.id
     JOIN user_account ON service.user_id = user_account.id
@@ -2222,12 +2401,18 @@ app.get('/api/category/:id/services', async (req, res) => {
       ) AS ordered_images
       GROUP BY service_id
     ) AS images_data ON images_data.service_id = service.id
+    LEFT JOIN (
+      SELECT service_id, JSON_ARRAYAGG(language) AS languages
+      FROM service_language
+      GROUP BY service_id
+    ) AS language_data ON language_data.service_id = service.id
     WHERE service.is_hidden = 0
-      AND service.service_category_id = ?;
+      AND service.service_category_id = ?${filtersClause.sql};
   `;
 
   try {
-    const [rows] = await promisePool.query(query, [categoryId]);
+    const params = [categoryId, ...filtersClause.params];
+    const [rows] = await promisePool.query(query, params);
     if (rows.length === 0) return res.status(200).json([]);
 
     let likedServiceIds = new Set();
@@ -6452,6 +6637,8 @@ app.get('/api/services', async (req, res) => {
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
   const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
+  const filters = extractServiceFilters(req.query);
+  const filtersClause = buildServiceFilterClause(filters);
 
   const queryServices = `
       SELECT
@@ -6481,13 +6668,15 @@ app.get('/api/services', async (req, res) => {
         user_account.surname,
         user_account.profile_picture,
         user_account.is_professional,
+        user_account.is_verified,
         user_account.language,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating,
         category_type.service_category_name,
         family.service_family,
         tags_data.tags,
-        images_data.images
+        images_data.images,
+        language_data.languages
       FROM service
       JOIN price ON service.price_id = price.id
       JOIN user_account ON service.user_id = user_account.id
@@ -6536,6 +6725,11 @@ app.get('/api/services', async (req, res) => {
         ) AS ordered_images
         GROUP BY ordered_images.service_id
       ) AS images_data ON images_data.service_id = service.id
+      LEFT JOIN (
+        SELECT service_id, JSON_ARRAYAGG(language) AS languages
+        FROM service_language
+        GROUP BY service_id
+      ) AS language_data ON language_data.service_id = service.id
       WHERE service.is_hidden = 0
         AND (
           service.service_title LIKE ?
@@ -6545,7 +6739,7 @@ app.get('/api/services', async (req, res) => {
             SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
           )
           OR service.description LIKE ?
-        )
+        )${filtersClause.sql}
       ORDER BY
         CASE
           WHEN service.service_title LIKE ? THEN 1
@@ -6560,7 +6754,8 @@ app.get('/api/services', async (req, res) => {
 
   try {
     const searchParams = new Array(10).fill(searchPattern);
-    const [servicesData] = await promisePool.query(queryServices, searchParams);
+    const params = [...searchParams, ...filtersClause.params];
+    const [servicesData] = await promisePool.query(queryServices, params);
 
     if (servicesData.length > 0) { 
       // Marcar is_liked si llega un viewerId válido 
@@ -6610,6 +6805,55 @@ app.get('/api/services', async (req, res) => {
   } catch (error) {
     console.error('Error al obtener la información de los servicios:', error);
     return res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
+  }
+});
+
+app.get('/api/services/count', async (req, res) => {
+  const searchTerm = (req.query.query || '').trim();
+  const hasSearchTerm = searchTerm.length > 0;
+  const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
+  const categoryId = parseQueryNumber(req.query.category_id ?? req.query.categoryId ?? req.query.category);
+  const filters = extractServiceFilters(req.query);
+  const filtersClause = buildServiceFilterClause(filters);
+
+  const countQuery = `
+    SELECT COUNT(DISTINCT service.id) AS total
+    FROM service
+    JOIN price ON service.price_id = price.id
+    JOIN user_account ON service.user_id = user_account.id
+    JOIN service_category category ON service.service_category_id = category.id
+    JOIN service_family family ON category.service_family_id = family.id
+    JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+    LEFT JOIN (
+      SELECT service_id, COUNT(*) AS review_count, AVG(rating) AS average_rating
+      FROM review
+      GROUP BY service_id
+    ) AS review_data ON service.id = review_data.service_id
+    WHERE service.is_hidden = 0
+      ${Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : ''}
+      AND (
+        service.service_title LIKE ?
+        OR category_type.service_category_name LIKE ?
+        OR family.service_family LIKE ?
+        OR EXISTS (
+          SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+        )
+        OR service.description LIKE ?
+      )${filtersClause.sql};
+  `;
+
+  try {
+    const params = [];
+    if (Number.isFinite(categoryId)) params.push(categoryId);
+    params.push(...new Array(5).fill(searchPattern));
+    params.push(...filtersClause.params);
+
+    const [[row]] = await promisePool.query(countQuery, params);
+    const total = row && row.total !== undefined && row.total !== null ? Number(row.total) : 0;
+    return res.status(200).json({ count: Number.isFinite(total) ? total : 0 });
+  } catch (error) {
+    console.error('Error al contar servicios:', error);
+    return res.status(500).json({ error: 'Error al contar los servicios.' });
   }
 });
 
