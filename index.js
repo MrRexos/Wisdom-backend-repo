@@ -282,6 +282,11 @@ function extractServiceFilters(query) {
   const requireCompany = parseQueryBoolean(query.require_company ?? query.company_profile ?? query.company_only);
   const requireVerified = parseQueryBoolean(query.require_verified ?? query.verified_only);
   const languages = parseQueryStringArray(query.languages ?? query.language ?? query.lang);
+  const categoryIds = parseQueryStringArray(query.category_ids ?? query.categoryIds ?? query.categories);
+  const serviceFamilyId = parseQueryNumber(query.service_family_id ?? query.family_id ?? query.family ?? query.serviceFamilyId);
+  const maxDistanceKm = parseQueryNumber(query.max_distance_km ?? query.distance_km ?? query.distance ?? query.distance_max ?? query.maxDistance);
+  const originLat = parseQueryNumber(query.origin_lat ?? query.originLat ?? query.latitude ?? query.lat);
+  const originLng = parseQueryNumber(query.origin_lng ?? query.originLng ?? query.longitude ?? query.lng);
 
   return {
     minPrice,
@@ -292,6 +297,11 @@ function extractServiceFilters(query) {
     requireCompany,
     requireVerified,
     languages,
+    categoryIds,
+    serviceFamilyId,
+    maxDistanceKm,
+    originLat,
+    originLng,
   };
 }
 
@@ -300,6 +310,7 @@ function buildServiceFilterClause(filters, {
   priceAlias = 'price',
   userAlias = 'user_account',
   reviewAlias = 'review_data',
+  distanceExpression = null,
 } = {}) {
   const clauses = [];
   const params = [];
@@ -313,6 +324,11 @@ function buildServiceFilterClause(filters, {
     requireCompany,
     requireVerified,
     languages,
+    categoryIds,
+    serviceFamilyId,
+    maxDistanceKm,
+    originLat,
+    originLng,
   } = filters;
 
   if (minPrice !== null || maxPrice !== null) {
@@ -370,6 +386,38 @@ function buildServiceFilterClause(filters, {
     params.push(...languages);
   }
 
+  const numericCategoryIds = Array.isArray(categoryIds)
+    ? categoryIds
+      .map((value) => {
+        const num = Number(value);
+        return Number.isFinite(num) ? num : null;
+      })
+      .filter((value) => value !== null)
+    : [];
+
+  if (numericCategoryIds.length > 0) {
+    const placeholders = numericCategoryIds.map(() => '?').join(', ');
+    clauses.push(`${serviceAlias}.service_category_id IN (${placeholders})`);
+    params.push(...numericCategoryIds);
+  }
+
+  if (Number.isFinite(serviceFamilyId)) {
+    clauses.push(`${serviceAlias}.service_category_id IN (
+      SELECT id FROM service_category WHERE service_family_id = ?
+    )`);
+    params.push(serviceFamilyId);
+  }
+
+  const hasDistanceContext = Number.isFinite(maxDistanceKm) && distanceExpression && distanceExpression.sql;
+  if (hasDistanceContext) {
+    clauses.push(`(
+      ${serviceAlias}.latitude IS NOT NULL
+      AND ${serviceAlias}.longitude IS NOT NULL
+      AND ${distanceExpression.sql} <= ?
+    )`);
+    params.push(...distanceExpression.params, maxDistanceKm);
+  }
+
   if (!clauses.length) {
     return { sql: '', params: [] };
   }
@@ -377,6 +425,33 @@ function buildServiceFilterClause(filters, {
   return {
     sql: ` AND ${clauses.join(' AND ')}`,
     params,
+    distanceExpression,
+  };
+}
+
+function buildDistanceExpression({
+  latColumn,
+  lngColumn,
+  originLat,
+  originLng,
+}) {
+  if (!Number.isFinite(originLat) || !Number.isFinite(originLng)) {
+    return null;
+  }
+
+  const sql = `
+    6371 * ACOS(
+      LEAST(1, GREATEST(-1,
+        COS(RADIANS(?)) * COS(RADIANS(${latColumn})) *
+        COS(RADIANS(${lngColumn}) - RADIANS(?)) +
+        SIN(RADIANS(?)) * SIN(RADIANS(${latColumn}))
+      ))
+    )
+  `;
+
+  return {
+    sql: sql.trim(),
+    params: [originLat, originLng, originLat],
   };
 }
 
@@ -3027,33 +3102,33 @@ app.put('/api/services/:id', async (req, res) => {
         service.service_category_id,
         'service_category_id'
       );
-    
+
       // === NUEVO ORDEN Y REGLAS ===
       // 1) price_type primero
       priceType = (body.price_type !== undefined && body.price_type !== null)
         ? String(body.price_type).trim().toLowerCase()
         : (service.current_price_type || 'hour');
-    
+
       if (!['hour', 'fix', 'budget'].includes(priceType)) {
         throw invalidInputError('invalid_price_type');
       }
-    
+
       // 2) price según el tipo
       const allowNullPrice = (priceType === 'budget');
       const defaultWhenRequired = allowNullPrice ? null : service.current_price;
-    
+
       // Si no es budget y no viene ni en body ni en la BD, error explícito
       if (!allowNullPrice && (body.price === undefined) && (defaultWhenRequired === null)) {
         throw invalidInputError('invalid_number_price');
       }
-    
+
       priceValue = parseNumberInput(
         body.price,
         defaultWhenRequired,
         'price',
         { allowNull: allowNullPrice }
       );
-    
+
       // Invariantes
       if (priceType !== 'budget' && priceValue === null) {
         throw invalidInputError('invalid_number_price');
@@ -3061,7 +3136,7 @@ app.put('/api/services/:id', async (req, res) => {
       if (priceValue !== null && Number(priceValue) < 0) {
         throw invalidInputError('invalid_number_price');
       }
-    
+
       // resto de parseos como ya tenías
       latitude = parseNumberInput(body.latitude, service.latitude, 'latitude');
       longitude = parseNumberInput(body.longitude, service.longitude, 'longitude');
@@ -6637,8 +6712,82 @@ app.get('/api/services', async (req, res) => {
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
   const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
+  const orderByRaw = req.query.order_by ?? req.query.orderBy ?? '';
+  const orderBy = typeof orderByRaw === 'string' ? orderByRaw.toLowerCase() : '';
+  const categoryId = parseQueryNumber(req.query.category_id ?? req.query.categoryId ?? req.query.category);
+
   const filters = extractServiceFilters(req.query);
-  const filtersClause = buildServiceFilterClause(filters);
+  const distanceExpression = buildDistanceExpression({
+    latColumn: 'service.latitude',
+    lngColumn: 'service.longitude',
+    originLat: filters.originLat,
+    originLng: filters.originLng,
+  });
+  const filtersClause = buildServiceFilterClause(filters, { distanceExpression });
+  const includeDistanceColumn = Boolean(distanceExpression && distanceExpression.sql);
+  const distanceSelect = includeDistanceColumn
+    ? `,
+        ${distanceExpression.sql} AS distance_km`
+    : '';
+  const distanceSelectParams = includeDistanceColumn ? [...distanceExpression.params] : [];
+  const categoryClause = Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : '';
+
+  let orderClause = '';
+  let orderParams = [];
+  switch (orderBy) {
+    case 'cheapest':
+      orderClause = `ORDER BY price.price ASC, service.service_created_datetime DESC`;
+      break;
+    case 'mostexpensive':
+      orderClause = `ORDER BY price.price DESC, service.service_created_datetime DESC`;
+      break;
+    case 'bestrated':
+      orderClause = `ORDER BY COALESCE(review_data.average_rating, 0) DESC, COALESCE(review_data.review_count, 0) DESC, service.service_created_datetime DESC`;
+      break;
+    case 'nearest':
+      if (includeDistanceColumn) {
+        orderClause = `ORDER BY distance_km ASC, service.service_created_datetime DESC`;
+      } else {
+        orderClause = `ORDER BY
+        CASE
+          WHEN service.service_title LIKE ? THEN 1
+          WHEN category_type.service_category_name LIKE ? THEN 1
+          WHEN family.service_family LIKE ? THEN 1
+          WHEN EXISTS (
+            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+          ) THEN 1
+          WHEN service.description LIKE ? THEN 2
+          ELSE 3
+        END,
+        service.service_created_datetime DESC`;
+        orderParams = new Array(5).fill(searchPattern);
+      }
+      break;
+    case 'availability':
+      orderClause = `ORDER BY
+        CASE WHEN service.action_rate IS NULL THEN 1 ELSE 0 END ASC,
+        service.action_rate ASC,
+        service.service_created_datetime DESC`;
+      break;
+    default:
+      orderClause = `ORDER BY
+        CASE
+          WHEN service.service_title LIKE ? THEN 1
+          WHEN category_type.service_category_name LIKE ? THEN 1
+          WHEN family.service_family LIKE ? THEN 1
+          WHEN EXISTS (
+            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+          ) THEN 1
+          WHEN service.description LIKE ? THEN 2
+          ELSE 3
+        END,
+        service.service_created_datetime DESC`;
+      orderParams = new Array(5).fill(searchPattern);
+      break;
+  }
+  if (!orderClause) {
+    orderClause = `ORDER BY service.service_created_datetime DESC`;
+  }
 
   const queryServices = `
       SELECT
@@ -6674,9 +6823,11 @@ app.get('/api/services', async (req, res) => {
         COALESCE(review_data.average_rating, 0) AS average_rating,
         category_type.service_category_name,
         family.service_family,
+        family.id AS service_family_id,
         tags_data.tags,
         images_data.images,
         language_data.languages
+        ${distanceSelect}
       FROM service
       JOIN price ON service.price_id = price.id
       JOIN user_account ON service.user_id = user_account.id
@@ -6739,34 +6890,34 @@ app.get('/api/services', async (req, res) => {
             SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
           )
           OR service.description LIKE ?
-        )${filtersClause.sql}
-      ORDER BY
-        CASE
-          WHEN service.service_title LIKE ? THEN 1
-          WHEN category_type.service_category_name LIKE ? THEN 1
-          WHEN family.service_family LIKE ? THEN 1
-          WHEN EXISTS (
-            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
-          ) THEN 1
-          WHEN service.description LIKE ? THEN 2
-          ELSE 3
-        END;`;
+        )
+        ${categoryClause}
+        ${filtersClause.sql}
+      ${orderClause};`;
 
   try {
-    const searchParams = new Array(10).fill(searchPattern);
-    const params = [...searchParams, ...filtersClause.params];
+    const whereSearchParams = new Array(5).fill(searchPattern);
+    const params = [
+      ...distanceSelectParams,
+      ...whereSearchParams,
+    ];
+    if (Number.isFinite(categoryId)) {
+      params.push(categoryId);
+    }
+    params.push(...filtersClause.params);
+    params.push(...orderParams);
     const [servicesData] = await promisePool.query(queryServices, params);
 
-    if (servicesData.length > 0) { 
+    if (servicesData.length > 0) {
       // Marcar is_liked si llega un viewerId válido 
-      let likedServiceIds = new Set(); 
-      if (Number.isFinite(viewerId)) { 
-        const serviceIds = servicesData 
-          .map(s => s.service_id) 
-          .filter(id => id !== null && id !== undefined); 
- 
-        if (serviceIds.length > 0) { 
-          const placeholders = serviceIds.map(() => '?').join(', '); 
+      let likedServiceIds = new Set();
+      if (Number.isFinite(viewerId)) {
+        const serviceIds = servicesData
+          .map(s => s.service_id)
+          .filter(id => id !== null && id !== undefined);
+
+        if (serviceIds.length > 0) {
+          const placeholders = serviceIds.map(() => '?').join(', ');
           const likedQuery = ` 
             SELECT DISTINCT il.service_id 
             FROM item_list il 
@@ -6774,26 +6925,44 @@ app.get('/api/services', async (req, res) => {
             LEFT JOIN shared_list sh ON sh.list_id = il.list_id 
             WHERE (sl.user_id = ? OR sh.user_id = ?) 
               AND il.service_id IN (${placeholders}) 
-          `; 
-          try { 
-            const [likedRows] = await promisePool.query( 
-              likedQuery, 
-              [viewerId, viewerId, ...serviceIds] 
-            ); 
-            likedServiceIds = new Set(likedRows.map(r => Number(r.service_id))); 
-          } catch (e) { 
-            console.error('Error consultando liked services:', e); 
-          } 
-        } 
-      } 
- 
-      const withLiked = servicesData.map(s => ({ 
-        ...s, 
-        is_liked: likedServiceIds.has(Number(s.service_id)) ? 1 : 0, 
-      })); 
-      return res.status(200).json(withLiked); 
+          `;
+          try {
+            const [likedRows] = await promisePool.query(
+              likedQuery,
+              [viewerId, viewerId, ...serviceIds]
+            );
+            likedServiceIds = new Set(likedRows.map(r => Number(r.service_id)));
+          } catch (e) {
+            console.error('Error consultando liked services:', e);
+          }
+        }
+      }
+
+      const parseJsonSafe = (value, fallback) => {
+        if (Array.isArray(value)) return value;
+        if (value === null || value === undefined) return fallback;
+        if (typeof value === 'string') {
+          try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : parsed ?? fallback;
+          } catch (err) {
+            return fallback;
+          }
+        }
+        return value ?? fallback;
+      };
+
+      const withLiked = servicesData.map(s => ({
+        ...s,
+        tags: parseJsonSafe(s.tags, []),
+        images: parseJsonSafe(s.images, []),
+        languages: parseJsonSafe(s.languages, []),
+        distance_km: s.distance_km !== undefined && s.distance_km !== null ? Number(s.distance_km) : null,
+        is_liked: likedServiceIds.has(Number(s.service_id)) ? 1 : 0,
+      }));
+      return res.status(200).json(withLiked);
     }
-    
+
     if (!hasSearchTerm) {
       return res.status(200).json([]);
     }
@@ -6814,7 +6983,14 @@ app.get('/api/services/count', async (req, res) => {
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
   const categoryId = parseQueryNumber(req.query.category_id ?? req.query.categoryId ?? req.query.category);
   const filters = extractServiceFilters(req.query);
-  const filtersClause = buildServiceFilterClause(filters);
+  const distanceExpression = buildDistanceExpression({
+    latColumn: 'service.latitude',
+    lngColumn: 'service.longitude',
+    originLat: filters.originLat,
+    originLng: filters.originLng,
+  });
+  const filtersClause = buildServiceFilterClause(filters, { distanceExpression });
+  const categoryClause = Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : '';
 
   const countQuery = `
     SELECT COUNT(DISTINCT service.id) AS total
@@ -6830,7 +7006,6 @@ app.get('/api/services/count', async (req, res) => {
       GROUP BY service_id
     ) AS review_data ON service.id = review_data.service_id
     WHERE service.is_hidden = 0
-      ${Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : ''}
       AND (
         service.service_title LIKE ?
         OR category_type.service_category_name LIKE ?
@@ -6839,13 +7014,15 @@ app.get('/api/services/count', async (req, res) => {
           SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
         )
         OR service.description LIKE ?
-      )${filtersClause.sql};
+      )
+      ${categoryClause}
+      ${filtersClause.sql};
   `;
 
   try {
     const params = [];
-    if (Number.isFinite(categoryId)) params.push(categoryId);
     params.push(...new Array(5).fill(searchPattern));
+    if (Number.isFinite(categoryId)) params.push(categoryId);
     params.push(...filtersClause.params);
 
     const [[row]] = await promisePool.query(countQuery, params);
