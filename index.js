@@ -1430,6 +1430,10 @@ app.post('/api/login', (req, res) => {
       const user = results[0];
 
       try {
+        if (typeof user.password !== 'string' || !user.password) {
+          return res.json({ success: null, message: 'Wrong user or password.' });
+        }
+
         const match = await bcrypt.compare(password, user.password);
         if (!match) {
           return res.json({ success: false, message: 'Password incorrect.' });
@@ -1465,12 +1469,14 @@ app.post('/api/signup', async (req, res) => {
   const rawFirstName = typeof req.body?.first_name === 'string' ? req.body.first_name : '';
   const rawSurname = typeof req.body?.surname === 'string' ? req.body.surname : '';
   const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
+  const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
   const rawPhone = typeof req.body?.phone === 'string' ? req.body.phone.trim() : null;
 
   const email = rawEmail.trim().toLowerCase();
   const first_name = rawFirstName.trim();
   const surname = rawSurname.trim();
   const language = rawLanguage.trim() || 'en';
+  const platform = rawPlatform.trim().toLowerCase() === 'android' ? 'android' : 'ios';
   const phone = rawPhone || null;
 
   if (!email || !password || !first_name || !surname) {
@@ -1505,8 +1511,8 @@ app.post('/api/signup', async (req, res) => {
 
       try {
         const [result] = await connection.query(
-          'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0, 0)',
-          [email, username, hashedPassword, first_name, surname, phone, language, null, null]
+          'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional, auth_provider, platform) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0, 0, ?, ?)',
+          [email, username, hashedPassword, first_name, surname, phone, language, null, null, 'email', platform]
         );
 
         userId = result.insertId;
@@ -1555,6 +1561,8 @@ app.post('/api/signup', async (req, res) => {
       surname,
       phone,
       language,
+      auth_provider: 'email',
+      platform,
       allow_notis: null,
       profile_picture: null,
       is_verified: 0,
@@ -4423,6 +4431,11 @@ app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
       if (results.length === 0) {
         connection.release();
         return res.status(404).json({ error: 'Usuario no encontrado.' });
+      }
+
+      if (typeof results[0].password !== 'string' || !results[0].password) {
+        connection.release();
+        return res.status(400).json({ error: 'Contraseña actual incorrecta.' });
       }
 
       const match = await bcrypt.compare(currentPassword, results[0].password);
