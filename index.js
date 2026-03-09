@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 
 const bodyParser = require('body-parser');
 const express = require('express');
@@ -986,8 +986,56 @@ const pool = mysql.createPool({
   connectTimeout: 20000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada.
 });
 
+
 const promisePool = pool.promise();
 
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^$()|[\]\\]/g, '\\$&');
+}
+
+function normalizeGeneratedUsernamePart(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildGeneratedUsername(firstName, surname) {
+  const base = [firstName, surname]
+    .map(normalizeGeneratedUsernamePart)
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+  return base || 'user';
+}
+
+async function generateUniqueUsername(connection, firstName, surname) {
+  const base = buildGeneratedUsername(firstName, surname);
+  const usernamePattern = '^' + escapeRegex(base) + '[0-9]+$';
+
+  const [rows] = await connection.query(
+    'SELECT username FROM user_account WHERE username = ? OR username REGEXP ?',
+    [base, usernamePattern]
+  );
+
+  const usedUsernames = new Set(rows.map((row) => String(row.username || '')));
+  if (!usedUsernames.has(base)) {
+    return base;
+  }
+
+  let suffix = 2;
+  while (usedUsernames.has(base + suffix)) {
+    suffix += 1;
+  }
+
+  return base + suffix;
+}
 function invalidInputError(code) {
   const err = new Error(code);
   err.status = 400;
@@ -1412,69 +1460,116 @@ app.post('/api/login', (req, res) => {
 
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
-  const {
-    email,
-    username,
-    password,
-    first_name,
-    surname,
-    language,
-    allow_notis,
-    profile_picture,
-    phone,
-    is_professional = 0,
-  } = req.body;
+  const rawEmail = typeof req.body?.email === 'string' ? req.body.email : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const rawFirstName = typeof req.body?.first_name === 'string' ? req.body.first_name : '';
+  const rawSurname = typeof req.body?.surname === 'string' ? req.body.surname : '';
+  const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
+  const rawPhone = typeof req.body?.phone === 'string' ? req.body.phone.trim() : null;
+
+  const email = rawEmail.trim().toLowerCase();
+  const first_name = rawFirstName.trim();
+  const surname = rawSurname.trim();
+  const language = rawLanguage.trim() || 'en';
+  const phone = rawPhone || null;
+
+  if (!email || !password || !first_name || !surname) {
+    return res.status(400).json({ error: 'MISSING_SIGNUP_FIELDS' });
+  }
+
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'PASSWORD_TOO_SHORT' });
+  }
+
+  let connection;
+  let userId;
+  let username;
 
   try {
-    const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const [existingUsers] = await promisePool.query(
+      'SELECT id FROM user_account WHERE email = ? LIMIT 1',
+      [email]
+    );
 
-    const query = 'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0, ?)';
-    const values = [email, username, hashedPassword, first_name, surname, phone, language, allow_notis, profile_picture, is_professional];
+    if (existingUsers.length > 0) {
+      return res.status(409).json({ error: 'EMAIL_EXISTS' });
+    }
 
-    pool.getConnection((err, connection) => {
-      if (err) {
-        console.error('Error al obtener la conexión:', err);
-        res.status(500).json({ error: 'Error al obtener la conexión.' });
-        return;
-      }
+    const hashedPassword = await bcrypt.hash(password, 10);
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
 
-      // Inserta el nuevo usuario
-      connection.query(query, values, (err, results) => {
-        if (err) {
-          connection.release(); // Libera la conexión
-          console.error('Error al crear el usuario:', err);
-          res.status(500).send('Error al crear el usuario.');
-          return;
-        }
+    let inserted = false;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      username = await generateUniqueUsername(connection, first_name, surname);
 
-        const userId = results.insertId; // ID del usuario recién creado
+      try {
+        const [result] = await connection.query(
+          'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0, 0)',
+          [email, username, hashedPassword, first_name, surname, phone, language, null, null]
+        );
 
-        // Inserta la lista "Recently seen" en la tabla service_list
-        const serviceListQuery = 'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)';
-        const serviceListValues = ['Recently seen', userId];
-
-        connection.query(serviceListQuery, serviceListValues, async (err) => {
-          connection.release(); // Libera la conexión después de la segunda consulta
-
-          if (err) {
-            console.error('Error al crear la lista de servicios:', err);
-            res.status(500).send('Error al crear la lista de servicios.');
-            return;
+        userId = result.insertId;
+        inserted = true;
+        break;
+      } catch (insertErr) {
+        if (insertErr.code === 'ER_DUP_ENTRY') {
+          const duplicateMessage = String(insertErr.sqlMessage || '');
+          if (duplicateMessage.includes('email')) {
+            await connection.rollback();
+            return res.status(409).json({ error: 'EMAIL_EXISTS' });
           }
-          const access_token = signAccessToken({ id: userId });
-          const refresh_token = generateRefreshToken();
-          await persistRefreshToken(userId, refresh_token, req);
+          if (duplicateMessage.includes('username')) {
+            continue;
+          }
+        }
+        throw insertErr;
+      }
+    }
 
-          // Enviar correo de verificación
-          try {
-            const verifyToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1d' });
-            const url = `${process.env.BASE_URL}/api/verify-email?token=${verifyToken}`;
-            await transporter.sendMail({
-              from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
-              to: email,
-              subject: 'Confirm your Wisdom',
-              html: `
+    if (!inserted) {
+      throw new Error('USERNAME_GENERATION_FAILED');
+    }
+
+    await connection.query(
+      'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)',
+      ['Recently seen', userId]
+    );
+
+    await connection.commit();
+
+    const access_token = signAccessToken({ id: userId });
+    const refresh_token = generateRefreshToken();
+    await persistRefreshToken(userId, refresh_token, req);
+
+    const [userRows] = await promisePool.query(
+      'SELECT * FROM user_account WHERE id = ? LIMIT 1',
+      [userId]
+    );
+
+    const user = userRows[0] ? { ...userRows[0] } : {
+      id: userId,
+      email,
+      username,
+      first_name,
+      surname,
+      phone,
+      language,
+      allow_notis: null,
+      profile_picture: null,
+      is_verified: 0,
+      is_professional: 0,
+    };
+    delete user.password;
+
+    try {
+      const verifyToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1d' });
+      const url = process.env.BASE_URL + '/api/verify-email?token=' + verifyToken;
+      await transporter.sendMail({
+        from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
+        to: email,
+        subject: 'Confirm your Wisdom',
+        html: `
               <!doctype html>
               <html lang="en" style="background:#ffffff;">
                 <head>
@@ -1505,7 +1600,6 @@ app.post('/api/signup', async (req, res) => {
             
                     <hr style="border:none;height:1px;background-color:#f3f4f6;margin:70px 0;width:100%;" />
             
-                    <!-- Social sin fondos ni padding extra; logos más grandes -->
                     <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
                       <tr>
                         <td style="padding:0 10px;">
@@ -1541,28 +1635,40 @@ app.post('/api/signup', async (req, res) => {
                   </div>
                 </body>
               </html>`
-            });
-
-          } catch (mailErr) {
-            console.error('Error al enviar el correo de verificación:', mailErr);
-          }
-
-          res.status(201).json({
-            message: 'Usuario y lista de servicios creados.',
-            userId,
-            token: access_token,        // compat
-            access_token,
-            refresh_token
-          });
-        });
       });
+    } catch (mailErr) {
+      console.error('Error al enviar el correo de verificación:', mailErr);
+    }
+
+    return res.status(201).json({
+      message: 'Usuario creado.',
+      userId,
+      user,
+      token: access_token,
+      access_token,
+      refresh_token,
     });
   } catch (err) {
-    console.error('Error al hashear la contraseña:', err);
-    res.status(500).send('Error al procesar la solicitud.');
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackErr) {
+        console.error('Error al revertir signup:', rollbackErr);
+      }
+    }
+
+    if (err?.code === 'ER_DUP_ENTRY' && String(err.sqlMessage || '').includes('email')) {
+      return res.status(409).json({ error: 'EMAIL_EXISTS' });
+    }
+
+    console.error('Error al crear el usuario:', err);
+    return res.status(500).json({ error: 'Error al crear el usuario.' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
-
 // Revoca una sesión concreta por refresh token
 app.post('/api/logout', async (req, res) => {
   const { refresh_token } = req.body || {};
@@ -7557,6 +7663,4 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
 });
-
-
 
