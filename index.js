@@ -6,6 +6,7 @@ const mysql = require('mysql2');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Storage } = require('@google-cloud/storage');
+const { OAuth2Client } = require('google-auth-library');
 const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
@@ -988,6 +989,8 @@ const pool = mysql.createPool({
 
 
 const promisePool = pool.promise();
+const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID || '232292898356-u0584r99cq2hckjlj6i0q2v4gchmuqsg.apps.googleusercontent.com';
+const googleAuthClient = new OAuth2Client(GOOGLE_WEB_CLIENT_ID);
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^$()|[\]\\]/g, '\\$&');
@@ -1036,10 +1039,131 @@ async function generateUniqueUsername(connection, firstName, surname) {
 
   return base + suffix;
 }
+function conflictInputError(code) {
+  const err = new Error(code);
+  err.status = 409;
+  return err;
+}
+
 function invalidInputError(code) {
   const err = new Error(code);
   err.status = 400;
   return err;
+}
+
+function sanitizeUserRecord(user) {
+  if (!user) return null;
+  const sanitizedUser = { ...user };
+  delete sanitizedUser.password;
+  return sanitizedUser;
+}
+
+function resolveGoogleNameParts(payload) {
+  let first_name = typeof payload?.given_name === 'string' ? payload.given_name.trim() : '';
+  let surname = typeof payload?.family_name === 'string' ? payload.family_name.trim() : '';
+  const displayName = typeof payload?.name === 'string' ? payload.name.trim() : '';
+
+  if (!first_name || !surname) {
+    const parts = displayName.split(/\s+/).filter(Boolean);
+    if (!first_name && parts.length > 0) {
+      first_name = parts[0];
+    }
+    if (!surname && parts.length > 1) {
+      surname = parts.slice(1).join(' ');
+    }
+  }
+
+  if (!first_name) {
+    const emailLocalPart = typeof payload?.email === 'string' ? payload.email.split('@')[0].trim() : '';
+    first_name = emailLocalPart || 'Google';
+  }
+
+  if (!surname) {
+    surname = first_name;
+  }
+
+  return { first_name, surname };
+}
+
+async function createUserAccountWithDefaults(connection, {
+  email,
+  password = null,
+  first_name,
+  surname,
+  phone = null,
+  language = 'en',
+  allow_notis = null,
+  profile_picture = null,
+  is_verified = 0,
+  is_professional = 0,
+  auth_provider = 'email',
+  provider_id = null,
+  platform = 'ios',
+}) {
+  let userId;
+  let username;
+  let inserted = false;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    username = await generateUniqueUsername(connection, first_name, surname);
+
+    try {
+      const [result] = await connection.query(
+        'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional, auth_provider, provider_id, platform) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?)',
+        [email, username, password, first_name, surname, phone, language, allow_notis, profile_picture, is_verified, is_professional, auth_provider, provider_id, platform]
+      );
+
+      userId = result.insertId;
+      inserted = true;
+      break;
+    } catch (insertErr) {
+      if (insertErr.code === 'ER_DUP_ENTRY') {
+        const duplicateMessage = String(insertErr.sqlMessage || '');
+        if (duplicateMessage.includes('email')) {
+          throw conflictInputError('EMAIL_EXISTS');
+        }
+        if (duplicateMessage.includes('provider_id')) {
+          throw conflictInputError('PROVIDER_ID_EXISTS');
+        }
+        if (duplicateMessage.includes('username')) {
+          continue;
+        }
+      }
+      throw insertErr;
+    }
+  }
+
+  if (!inserted) {
+    throw new Error('USERNAME_GENERATION_FAILED');
+  }
+
+  await connection.query(
+    'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)',
+    ['Recently seen', userId]
+  );
+
+  return { userId, username };
+}
+
+async function fetchSanitizedUserById(userId) {
+  const [rows] = await promisePool.query(
+    'SELECT * FROM user_account WHERE id = ? LIMIT 1',
+    [userId]
+  );
+
+  return sanitizeUserRecord(rows[0] || null);
+}
+
+async function issueAuthTokens(userId, req) {
+  const access_token = signAccessToken({ id: userId });
+  const refresh_token = generateRefreshToken();
+  await persistRefreshToken(userId, refresh_token, req);
+
+  return {
+    token: access_token,
+    access_token,
+    refresh_token,
+  };
 }
 
 function parseBooleanInput(value, defaultValue, fieldName) {
@@ -1327,25 +1451,29 @@ app.get('/api/users', (req, res) => {
 // Ruta para verificar si un email ya existe
 app.get('/api/check-email', (req, res) => {
   const { email } = req.query;
-  const query = 'SELECT COUNT(*) AS count FROM user_account WHERE email = ?';
+  const query = 'SELECT auth_provider FROM user_account WHERE email = ? LIMIT 1';
 
   pool.getConnection((err, connection) => {
     if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
+      console.error('Error al obtener la conexi?n:', err);
+      res.status(500).json({ error: 'Error al obtener la conexi?n.' });
       return;
     }
 
     connection.query(query, [email], (err, results) => {
-      connection.release(); // Libera la conexión después de usarla
+      connection.release();
 
       if (err) {
         console.error('Error al verificar el email:', err);
         res.status(500).json({ error: 'Error al verificar el email.' });
         return;
       }
-      const count = results[0].count;
-      res.json({ exists: count > 0 });
+
+      const existingUser = results[0] || null;
+      res.json({
+        exists: Boolean(existingUser),
+        auth_provider: existingUser?.auth_provider || null,
+      });
     });
   });
 });
@@ -1405,63 +1533,49 @@ app.get('/api/verify-email', (req, res) => {
 });
 
 // Ruta para hacer login  (Access 15m + Refresh 30d)
-app.post('/api/login', (req, res) => {
-  const { usernameOrEmail, password } = req.body;
+app.post('/api/login', async (req, res) => {
+  const usernameOrEmail = typeof req.body?.usernameOrEmail === 'string' ? req.body.usernameOrEmail.trim() : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
   const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  try {
+    const [results] = await promisePool.query(query, [usernameOrEmail, usernameOrEmail]);
+
+    if (!results.length) {
+      return res.json({ success: null, message: 'Wrong user or password.' });
     }
 
-    connection.query(query, [usernameOrEmail, usernameOrEmail], async (err, results) => {
-      connection.release();
+    const user = results[0];
 
-      if (err) {
-        console.error('Error al iniciar sesión:', err);
-        return res.status(500).json({ error: 'Error al iniciar sesión.' });
-      }
+    if (user.auth_provider && user.auth_provider !== 'email') {
+      return res.status(409).json({
+        error: 'AUTH_PROVIDER_MISMATCH',
+        auth_provider: user.auth_provider,
+      });
+    }
 
-      if (!results.length) {
-        return res.json({ success: null, message: 'Wrong user or password.' });
-      }
+    if (typeof user.password !== 'string' || !user.password) {
+      return res.json({ success: null, message: 'Wrong user or password.' });
+    }
 
-      const user = results[0];
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) {
+      return res.json({ success: false, message: 'Password incorrect.' });
+    }
 
-      try {
-        if (typeof user.password !== 'string' || !user.password) {
-          return res.json({ success: null, message: 'Wrong user or password.' });
-        }
+    const tokens = await issueAuthTokens(user.id, req);
 
-        const match = await bcrypt.compare(password, user.password);
-        if (!match) {
-          return res.json({ success: false, message: 'Password incorrect.' });
-        }
-
-        delete user.password;
-
-        const access_token = signAccessToken({ id: user.id });
-        const refresh_token = generateRefreshToken();
-        await persistRefreshToken(user.id, refresh_token, req);
-
-        // Para compatibilidad con el front actual, mantenemos "token" con el access token
-        return res.json({
-          success: true,
-          message: 'Inicio de sesión exitoso.',
-          user,
-          token: access_token,
-          access_token,
-          refresh_token
-        });
-      } catch (e) {
-        console.error('Error al comparar la contraseña:', e);
-        return res.status(500).json({ error: 'Error al procesar la solicitud.' });
-      }
+    return res.json({
+      success: true,
+      message: 'Inicio de sesión exitoso.',
+      user: sanitizeUserRecord(user),
+      ...tokens,
     });
-  });
+  } catch (err) {
+    console.error('Error al iniciar sesión:', err);
+    return res.status(500).json({ error: 'Error al iniciar sesión.' });
+  }
 });
-
 // Ruta para crear un nuevo usuario
 app.post('/api/signup', async (req, res) => {
   const rawEmail = typeof req.body?.email === 'string' ? req.body.email : '';
@@ -1493,11 +1607,18 @@ app.post('/api/signup', async (req, res) => {
 
   try {
     const [existingUsers] = await promisePool.query(
-      'SELECT id FROM user_account WHERE email = ? LIMIT 1',
+      'SELECT id, auth_provider FROM user_account WHERE email = ? LIMIT 1',
       [email]
     );
 
     if (existingUsers.length > 0) {
+      const existingUser = existingUsers[0];
+      if (existingUser.auth_provider && existingUser.auth_provider !== 'email') {
+        return res.status(409).json({
+          error: 'AUTH_PROVIDER_MISMATCH',
+          auth_provider: existingUser.auth_provider,
+        });
+      }
       return res.status(409).json({ error: 'EMAIL_EXISTS' });
     }
 
@@ -1505,55 +1626,26 @@ app.post('/api/signup', async (req, res) => {
     connection = await promisePool.getConnection();
     await connection.beginTransaction();
 
-    let inserted = false;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      username = await generateUniqueUsername(connection, first_name, surname);
-
-      try {
-        const [result] = await connection.query(
-          'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional, auth_provider, platform) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, 0, 0, ?, ?)',
-          [email, username, hashedPassword, first_name, surname, phone, language, null, null, 'email', platform]
-        );
-
-        userId = result.insertId;
-        inserted = true;
-        break;
-      } catch (insertErr) {
-        if (insertErr.code === 'ER_DUP_ENTRY') {
-          const duplicateMessage = String(insertErr.sqlMessage || '');
-          if (duplicateMessage.includes('email')) {
-            await connection.rollback();
-            return res.status(409).json({ error: 'EMAIL_EXISTS' });
-          }
-          if (duplicateMessage.includes('username')) {
-            continue;
-          }
-        }
-        throw insertErr;
-      }
-    }
-
-    if (!inserted) {
-      throw new Error('USERNAME_GENERATION_FAILED');
-    }
-
-    await connection.query(
-      'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)',
-      ['Recently seen', userId]
-    );
+    ({ userId, username } = await createUserAccountWithDefaults(connection, {
+      email,
+      password: hashedPassword,
+      first_name,
+      surname,
+      phone,
+      language,
+      allow_notis: null,
+      profile_picture: null,
+      is_verified: 0,
+      is_professional: 0,
+      auth_provider: 'email',
+      provider_id: null,
+      platform,
+    }));
 
     await connection.commit();
 
-    const access_token = signAccessToken({ id: userId });
-    const refresh_token = generateRefreshToken();
-    await persistRefreshToken(userId, refresh_token, req);
-
-    const [userRows] = await promisePool.query(
-      'SELECT * FROM user_account WHERE id = ? LIMIT 1',
-      [userId]
-    );
-
-    const user = userRows[0] ? { ...userRows[0] } : {
+    const tokens = await issueAuthTokens(userId, req);
+    const user = (await fetchSanitizedUserById(userId)) || {
       id: userId,
       email,
       username,
@@ -1562,13 +1654,13 @@ app.post('/api/signup', async (req, res) => {
       phone,
       language,
       auth_provider: 'email',
+      provider_id: null,
       platform,
       allow_notis: null,
       profile_picture: null,
       is_verified: 0,
       is_professional: 0,
     };
-    delete user.password;
 
     try {
       const verifyToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1d' });
@@ -1652,9 +1744,7 @@ app.post('/api/signup', async (req, res) => {
       message: 'Usuario creado.',
       userId,
       user,
-      token: access_token,
-      access_token,
-      refresh_token,
+      ...tokens,
     });
   } catch (err) {
     if (connection) {
@@ -1665,12 +1755,172 @@ app.post('/api/signup', async (req, res) => {
       }
     }
 
-    if (err?.code === 'ER_DUP_ENTRY' && String(err.sqlMessage || '').includes('email')) {
+    if (err?.status === 409 && err.message === 'EMAIL_EXISTS') {
       return res.status(409).json({ error: 'EMAIL_EXISTS' });
     }
 
     console.error('Error al crear el usuario:', err);
     return res.status(500).json({ error: 'Error al crear el usuario.' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
+  const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
+  const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
+  const language = rawLanguage.trim() || 'en';
+  const platform = rawPlatform.trim().toLowerCase() === 'android' ? 'android' : 'ios';
+
+  if (!idToken) {
+    return res.status(400).json({ error: 'GOOGLE_ID_TOKEN_REQUIRED' });
+  }
+
+  let connection;
+  let providerIdFromToken = '';
+  let emailFromToken = '';
+
+  try {
+    const ticket = await googleAuthClient.verifyIdToken({
+      idToken,
+      audience: GOOGLE_WEB_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    emailFromToken = typeof payload?.email === 'string' ? payload.email.trim().toLowerCase() : '';
+    providerIdFromToken = typeof payload?.sub === 'string' ? payload.sub.trim() : '';
+
+    if (!emailFromToken || !providerIdFromToken) {
+      return res.status(400).json({ error: 'GOOGLE_PROFILE_INCOMPLETE' });
+    }
+
+    if (!payload?.email_verified) {
+      return res.status(400).json({ error: 'GOOGLE_EMAIL_NOT_VERIFIED' });
+    }
+
+    const { first_name, surname } = resolveGoogleNameParts(payload);
+    const profile_picture = typeof payload?.picture === 'string' && payload.picture.trim() ? payload.picture.trim() : null;
+
+    const [existingUsers] = await promisePool.query(
+      'SELECT * FROM user_account WHERE provider_id = ? OR email = ?',
+      [providerIdFromToken, emailFromToken]
+    );
+
+    const providerMatch = existingUsers.find((item) => String(item.provider_id || '') === providerIdFromToken) || null;
+    const emailMatch = existingUsers.find((item) => String(item.email || '').toLowerCase() === emailFromToken) || null;
+    const existingUser = providerMatch || emailMatch;
+
+    if (emailMatch && emailMatch.auth_provider === 'google' && emailMatch.provider_id && emailMatch.provider_id !== providerIdFromToken) {
+      return res.status(409).json({ error: 'GOOGLE_PROVIDER_MISMATCH', auth_provider: 'google' });
+    }
+
+    if (existingUser) {
+      if (existingUser.auth_provider !== 'google') {
+        return res.status(409).json({
+          error: 'AUTH_PROVIDER_MISMATCH',
+          auth_provider: existingUser.auth_provider,
+        });
+      }
+
+      await promisePool.query(
+        'UPDATE user_account SET provider_id = COALESCE(provider_id, ?), platform = ?, profile_picture = COALESCE(profile_picture, ?) WHERE id = ?',
+        [providerIdFromToken, platform, profile_picture, existingUser.id]
+      );
+
+      const user = (await fetchSanitizedUserById(existingUser.id)) || sanitizeUserRecord(existingUser);
+      const tokens = await issueAuthTokens(existingUser.id, req);
+
+      return res.json({
+        success: true,
+        message: 'Inicio de sesión exitoso.',
+        user,
+        ...tokens,
+      });
+    }
+
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
+
+    const { userId, username } = await createUserAccountWithDefaults(connection, {
+      email: emailFromToken,
+      password: null,
+      first_name,
+      surname,
+      phone: null,
+      language,
+      allow_notis: null,
+      profile_picture,
+      is_verified: 1,
+      is_professional: 0,
+      auth_provider: 'google',
+      provider_id: providerIdFromToken,
+      platform,
+    });
+
+    await connection.commit();
+
+    const user = (await fetchSanitizedUserById(userId)) || {
+      id: userId,
+      email: emailFromToken,
+      username,
+      first_name,
+      surname,
+      phone: null,
+      language,
+      auth_provider: 'google',
+      provider_id: providerIdFromToken,
+      platform,
+      allow_notis: null,
+      profile_picture,
+      is_verified: 1,
+      is_professional: 0,
+    };
+    const tokens = await issueAuthTokens(userId, req);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Usuario creado.',
+      userId,
+      user,
+      ...tokens,
+    });
+  } catch (err) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackErr) {
+        console.error('Error al revertir signup con Google:', rollbackErr);
+      }
+    }
+
+    if (err?.status === 409 && err.message === 'EMAIL_EXISTS') {
+      const [existingUsers] = await promisePool.query(
+        'SELECT auth_provider FROM user_account WHERE email = ? LIMIT 1',
+        [emailFromToken]
+      );
+      return res.status(409).json({
+        error: 'AUTH_PROVIDER_MISMATCH',
+        auth_provider: existingUsers[0]?.auth_provider || 'email',
+      });
+    }
+
+    if (err?.status === 409 && err.message === 'PROVIDER_ID_EXISTS' && providerIdFromToken) {
+      const [existingUsers] = await promisePool.query(
+        'SELECT * FROM user_account WHERE provider_id = ? LIMIT 1',
+        [providerIdFromToken]
+      );
+      if (existingUsers.length > 0) {
+        const user = sanitizeUserRecord(existingUsers[0]);
+        const tokens = await issueAuthTokens(existingUsers[0].id, req);
+        return res.json({ success: true, message: 'Inicio de sesión exitoso.', user, ...tokens });
+      }
+    }
+
+    console.error('Error al autenticar con Google:', err);
+    return res.status(401).json({ error: 'GOOGLE_AUTH_FAILED' });
   } finally {
     if (connection) {
       connection.release();
@@ -1693,52 +1943,44 @@ app.post('/api/logout', async (req, res) => {
 });
 
 // Enviar enlace para restablecer contraseña
-app.post('/api/forgot-password', (req, res) => {
-
-  const { emailOrUsername } = req.body;
+app.post('/api/forgot-password', async (req, res) => {
+  const emailOrUsername = typeof req.body?.emailOrUsername === 'string' ? req.body.emailOrUsername.trim() : '';
   if (!emailOrUsername) {
     return res.status(400).json({ error: 'Email or username required' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  try {
+    const [results] = await promisePool.query(
+      'SELECT id, email, auth_provider FROM user_account WHERE email = ? OR username = ? LIMIT 1',
+      [emailOrUsername, emailOrUsername]
+    );
+
+    if (results.length === 0) {
+      return res.status(400).json({ error: 'User not found' });
     }
 
-    const query = 'SELECT id, email FROM user_account WHERE email = ? OR username = ?';
-    connection.query(query, [emailOrUsername, emailOrUsername], async (err, results) => {
-      if (err) {
-        connection.release();
-        console.error('Error al buscar el usuario:', err);
-        return res.status(500).json({ error: 'Error al buscar el usuario.' });
-      }
+    const account = results[0];
+    if (account.auth_provider && account.auth_provider !== 'email') {
+      return res.status(409).json({
+        error: 'PASSWORD_RESET_NOT_AVAILABLE_FOR_PROVIDER',
+        auth_provider: account.auth_provider,
+      });
+    }
 
-      if (results.length === 0) {
-        connection.release();
-        return res.status(200).json({ notFound: true });
-      }
+    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-      const { id, email } = results[0];
-      const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    await promisePool.query(
+      'REPLACE INTO password_reset_codes (user_id, code, expires_at) VALUES (?, ?, ?)',
+      [account.id, resetCode, expiresAt]
+    );
 
-      connection.query(
-        'REPLACE INTO password_reset_codes (user_id, code, expires_at) VALUES (?, ?, ?)',
-        [id, resetCode, expiresAt],
-        async (codeErr) => {
-          connection.release();
-          if (codeErr) {
-            console.error('Error al guardar el código de restablecimiento:', codeErr);
-            return res.status(500).json({ error: 'Error al generar el código.' });
-          }
-
-          try {
-            await transporter.sendMail({
-              from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
-              to: email,
-              subject: 'Reset your password for Wisdom',
-              html: `
+    try {
+      await transporter.sendMail({
+        from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
+        to: account.email,
+        subject: 'Reset your password for Wisdom',
+        html: `
               <!doctype html>
               <html lang="en" style="background:#ffffff;">
                 <head>
@@ -1764,7 +2006,6 @@ app.post('/api/forgot-password', (req, res) => {
             
                     <hr style="border:none;height:1px;background-color:#f3f4f6;margin:70px 0;width:100%;" />
             
-                    <!-- Social sin fondos ni padding extra; logos más grandes -->
                     <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
                       <tr>
                         <td style="padding:0 10px;">
@@ -1795,116 +2036,92 @@ app.post('/api/forgot-password', (req, res) => {
                       <br /><br />
                       Mataró, BCN, 08304
                       <br /><br />
-                      This email was sent to ${email}
+                      This email was sent to ${account.email}
                     </div>
                   </div>
                 </body>
               </html>`
-            });
+      });
+    } catch (mailErr) {
+      console.error('Error al enviar el correo de restablecimiento:', mailErr);
+    }
 
-          } catch (mailErr) {
-            console.error('Error al enviar el correo de restablecimiento:', mailErr);
-          }
-
-          res.json({ message: 'Reset code sent' });
-        }
-      );
-    });
-  });
+    return res.json({ message: 'Reset code sent' });
+  } catch (err) {
+    console.error('Error al generar el código de restablecimiento:', err);
+    return res.status(500).json({ error: 'Error al generar el código.' });
+  }
 });
 
 // Restablecer contraseña con token
 app.post('/api/reset-password', async (req, res) => {
-  const { emailOrUsername, code, newPassword } = req.body;
+  const emailOrUsername = typeof req.body?.emailOrUsername === 'string' ? req.body.emailOrUsername.trim() : '';
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+  const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+
   if (!emailOrUsername || !code || !newPassword) {
     return res.status(400).json({ error: 'Code, user and new password required' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  try {
+    const [userRes] = await promisePool.query(
+      'SELECT id, auth_provider FROM user_account WHERE email = ? OR username = ? LIMIT 1',
+      [emailOrUsername, emailOrUsername]
+    );
+
+    if (userRes.length === 0) {
+      return res.status(400).json({ error: 'User not found' });
     }
 
-    const queryUser = 'SELECT id FROM user_account WHERE email = ? OR username = ?';
-    connection.query(queryUser, [emailOrUsername, emailOrUsername], async (userErr, userRes) => {
-      if (userErr) {
-        connection.release();
-        console.error('Error al buscar el usuario:', userErr);
-        return res.status(500).json({ error: 'Error al buscar el usuario.' });
-      }
-
-      if (userRes.length === 0) {
-        connection.release();
-        return res.status(400).json({ error: 'User not found' });
-      }
-
-      const userId = userRes[0].id;
-      connection.query('SELECT code, expires_at FROM password_reset_codes WHERE user_id = ?', [userId], async (codeErr, codeRes) => {
-        if (codeErr) {
-          connection.release();
-          console.error('Error al obtener el código:', codeErr);
-          return res.status(500).json({ error: 'Error al verificar el código.' });
-        }
-
-        if (codeRes.length === 0) {
-          connection.release();
-          return res.status(400).json({ error: 'Invalid code' });
-        }
-
-        const record = codeRes[0];
-        if (record.code !== code || new Date(record.expires_at) < new Date()) {
-          connection.release();
-          return res.status(400).json({ error: 'Invalid or expired code' });
-        }
-
-        try {
-          const hashed = await bcrypt.hash(newPassword, 10);
-          connection.query('UPDATE user_account SET password = ? WHERE id = ?', [hashed, userId], (updErr) => {
-            if (updErr) {
-              connection.release();
-              console.error('Error al actualizar la contraseña:', updErr);
-              return res.status(500).json({ error: 'Error al actualizar la contraseña.' });
-            }
-
-            connection.query('DELETE FROM password_reset_codes WHERE user_id = ?', [userId], (delErr) => {
-              if (delErr) {
-                connection.release();
-                console.error('Error al eliminar el código de restablecimiento:', delErr);
-                return res.status(500).json({ error: 'Error interno' });
-              }
-
-              connection.query('SELECT id, email, username, first_name, surname, phone, profile_picture, is_professional, language FROM user_account WHERE id = ?', [userId], async (selErr, results) => {
-                connection.release();
-                if (selErr || results.length === 0) {
-                  return res.status(500).json({ error: 'Error al obtener el usuario.' });
-                }
-
-                const user = results[0];
-                const access_token = signAccessToken({ id: userId });
-                const refresh_token = generateRefreshToken();
-                await persistRefreshToken(userId, refresh_token, req);
-
-                res.json({
-                  message: 'Password reset successfully',
-                  user,
-                  token: access_token,     // compat
-                  access_token,
-                  refresh_token
-                });
-              });
-            });
-          });
-        } catch (hashErr) {
-          connection.release();
-          console.error('Error al hashear la nueva contraseña:', hashErr);
-          res.status(500).json({ error: 'Error al procesar la solicitud.' });
-        }
+    const account = userRes[0];
+    if (account.auth_provider && account.auth_provider !== 'email') {
+      return res.status(409).json({
+        error: 'PASSWORD_RESET_NOT_AVAILABLE_FOR_PROVIDER',
+        auth_provider: account.auth_provider,
       });
-    });
-  });
-});
+    }
 
+    const userId = account.id;
+    const [codeRes] = await promisePool.query(
+      'SELECT code, expires_at FROM password_reset_codes WHERE user_id = ?',
+      [userId]
+    );
+
+    if (codeRes.length === 0) {
+      return res.status(400).json({ error: 'Invalid code' });
+    }
+
+    const record = codeRes[0];
+    if (record.code !== code || new Date(record.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Invalid or expired code' });
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await promisePool.query('UPDATE user_account SET password = ? WHERE id = ?', [hashed, userId]);
+    await promisePool.query('DELETE FROM password_reset_codes WHERE user_id = ?', [userId]);
+
+    const [results] = await promisePool.query(
+      'SELECT id, email, username, first_name, surname, phone, profile_picture, is_professional, language, auth_provider FROM user_account WHERE id = ? LIMIT 1',
+      [userId]
+    );
+
+    if (results.length === 0) {
+      return res.status(500).json({ error: 'Error al obtener el usuario.' });
+    }
+
+    const user = sanitizeUserRecord(results[0]);
+    const tokens = await issueAuthTokens(userId, req);
+
+    return res.json({
+      message: 'Password reset successfully',
+      user,
+      ...tokens,
+    });
+  } catch (err) {
+    console.error('Error al restablecer la contraseña:', err);
+    return res.status(500).json({ error: 'Error al procesar la solicitud.' });
+  }
+});
 // Intercambia refresh_token por nuevos tokens (rota refresh)
 app.post('/api/token/refresh', async (req, res) => {
   const { refresh_token } = req.body || {};
@@ -4332,42 +4549,50 @@ app.put('/api/user/:id/profile', (req, res) => {
 });
 
 //Ruta para actualizar account (ahora mismo solo actualiza email)
-app.put('/api/user/:id/email', (req, res) => {
-  const { id } = req.params; // ID del usuario
-  const { email } = req.body; // Nuevo email a actualizar
+app.put('/api/user/:id/email', async (req, res) => {
+  const { id } = req.params;
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+  if (!email) {
+    return res.status(400).json({ error: 'invalid_email' });
+  }
+
+  try {
+    const [users] = await promisePool.query(
+      'SELECT auth_provider FROM user_account WHERE id = ? LIMIT 1',
+      [id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
     }
 
-    // Consulta para actualizar el email en user_account
-    const query = `
-      UPDATE user_account
-      SET email = ?
-      WHERE id = ?;
-    `;
+    if (users[0].auth_provider && users[0].auth_provider !== 'email') {
+      return res.status(409).json({
+        error: 'EMAIL_CHANGE_NOT_AVAILABLE_FOR_PROVIDER',
+        auth_provider: users[0].auth_provider,
+      });
+    }
 
-    connection.query(query, [email, id], (err, result) => {
-      connection.release(); // Liberar la conexión después de usarla
+    const [result] = await promisePool.query(
+      'UPDATE user_account SET email = ? WHERE id = ?',
+      [email, id]
+    );
 
-      if (err) {
-        console.error('Error al actualizar el email del usuario:', err);
-        res.status(500).json({ error: 'Error al actualizar el email del usuario.' });
-        return;
-      }
+    if (result.affectedRows > 0) {
+      return res.status(200).json({ message: 'Email actualizado exitosamente.' });
+    }
 
-      if (result.affectedRows > 0) {
-        res.status(200).json({ message: 'Email actualizado exitosamente.' });
-      } else {
-        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
-      }
-    });
-  });
+    return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+  } catch (err) {
+    if (err?.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'EMAIL_EXISTS' });
+    }
+
+    console.error('Error al actualizar el email del usuario:', err);
+    return res.status(500).json({ error: 'Error al actualizar el email del usuario.' });
+  }
 });
-
 // Ruta para actualizar el idioma preferido del usuario
 app.put('/api/user/:id/language', (req, res) => {
   const { id } = req.params;
@@ -4421,7 +4646,7 @@ app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    connection.query('SELECT password FROM user_account WHERE id = ?', [id], async (err, results) => {
+    connection.query('SELECT password, auth_provider FROM user_account WHERE id = ?', [id], async (err, results) => {
       if (err) {
         connection.release();
         console.error('Error al obtener la contraseña:', err);
@@ -4431,6 +4656,14 @@ app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
       if (results.length === 0) {
         connection.release();
         return res.status(404).json({ error: 'Usuario no encontrado.' });
+      }
+
+      if (results[0].auth_provider && results[0].auth_provider !== 'email') {
+        connection.release();
+        return res.status(409).json({
+          error: 'PASSWORD_CHANGE_NOT_AVAILABLE_FOR_PROVIDER',
+          auth_provider: results[0].auth_provider,
+        });
       }
 
       if (typeof results[0].password !== 'string' || !results[0].password) {
@@ -4456,7 +4689,6 @@ app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
     });
   });
 });
-
 //Ruta para borrar una cuenta
 app.delete('/api/user/:id', (req, res) => {
   const { id } = req.params; // ID del usuario
@@ -7676,4 +7908,9 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
 });
+
+
+
+
+
 
