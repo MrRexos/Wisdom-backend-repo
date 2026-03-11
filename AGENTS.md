@@ -1,3 +1,9 @@
+# Reglas del Proyecto
+- Encoding: UTF-8 obligatorio.
+- No corromper caracteres especiales en comentarios y strings en español,chino,arabe,catalan,ingles,frances o el resto de idiomas.
+
+
+
 # Contexto de la Base de Datos
 
 > **Nota para el LLM:** Este documento describe la estructura exacta de la base de datos MySQL (tablas, columnas, tipos de datos, restricciones y relaciones) para asegurar una perfecta alineación entre el frontend, el backend y la persistencia de datos. Siempre que generes o modifiques una APi o funcionalidad respeta estrictamente la nulabilidad, los valores por defecto y las relaciones listadas aquí. Si crees que se ha de modificar o añadir una tabla siempre comunicamenlo i actualiza este documento

@@ -1,4 +1,4 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 
 const bodyParser = require('body-parser');
 const express = require('express');
@@ -7,6 +7,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const { Storage } = require('@google-cloud/storage');
 const { OAuth2Client } = require('google-auth-library');
+const appleSigninAuth = require('apple-signin-auth');
 const multer = require('multer');
 const path = require('path');
 const sharp = require('sharp');
@@ -25,6 +26,15 @@ const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || 'com.rexos.Wisdom';
+const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || '';
+const APPLE_KEY_ID = process.env.APPLE_KEY_ID || '';
+const APPLE_PRIVATE_KEY = typeof process.env.APPLE_PRIVATE_KEY === 'string'
+  ? process.env.APPLE_PRIVATE_KEY.replace(/\\n/g, '\n').trim()
+  : '';
+const APPLE_PRIVATE_KEY_PATH = typeof process.env.APPLE_PRIVATE_KEY_PATH === 'string'
+  ? process.env.APPLE_PRIVATE_KEY_PATH.trim()
+  : '';
 async function handleStripeRollbackIfNeeded(error) {
   try {
     if (error && error.payment_intent) {
@@ -1085,6 +1095,85 @@ function resolveGoogleNameParts(payload) {
   return { first_name, surname };
 }
 
+function resolveAppleNameParts({ first_name, surname, email }) {
+  let resolvedFirstName = typeof first_name === 'string' ? first_name.trim() : '';
+  let resolvedSurname = typeof surname === 'string' ? surname.trim() : '';
+
+  if (!resolvedFirstName) {
+    const emailLocalPart = typeof email === 'string' ? email.split('@')[0].trim() : '';
+    resolvedFirstName = emailLocalPart || 'Apple';
+  }
+
+  if (!resolvedSurname) {
+    resolvedSurname = resolvedFirstName;
+  }
+
+  return {
+    first_name: resolvedFirstName,
+    surname: resolvedSurname,
+  };
+}
+
+function getAppleClientSecret() {
+  if (!APPLE_TEAM_ID || !APPLE_KEY_ID || (!APPLE_PRIVATE_KEY && !APPLE_PRIVATE_KEY_PATH)) {
+    const err = new Error('APPLE_REVOKE_CONFIG_MISSING');
+    err.status = 500;
+    throw err;
+  }
+
+  return appleSigninAuth.getClientSecret({
+    clientID: APPLE_CLIENT_ID,
+    teamID: APPLE_TEAM_ID,
+    keyIdentifier: APPLE_KEY_ID,
+    ...(APPLE_PRIVATE_KEY_PATH ? { privateKeyPath: APPLE_PRIVATE_KEY_PATH } : { privateKey: APPLE_PRIVATE_KEY }),
+    expAfter: 15777000,
+  });
+}
+
+async function exchangeAppleAuthorizationCode(authorizationCode) {
+  const clientSecret = getAppleClientSecret();
+  const tokenResponse = await appleSigninAuth.getAuthorizationToken(authorizationCode, {
+    clientID: APPLE_CLIENT_ID,
+    clientSecret,
+  });
+
+  if (tokenResponse?.error) {
+    const err = new Error(tokenResponse.error);
+    err.status = 400;
+    err.code = 'APPLE_TOKEN_EXCHANGE_FAILED';
+    err.details = tokenResponse;
+    throw err;
+  }
+
+  return { clientSecret, tokenResponse };
+}
+
+async function revokeAppleSessionWithAuthorizationCode(authorizationCode) {
+  const { clientSecret, tokenResponse } = await exchangeAppleAuthorizationCode(authorizationCode);
+  const tokenToRevoke = tokenResponse?.refresh_token || tokenResponse?.access_token || '';
+  const tokenTypeHint = tokenResponse?.refresh_token ? 'refresh_token' : 'access_token';
+
+  if (!tokenToRevoke) {
+    const err = new Error('APPLE_REVOKE_TOKEN_MISSING');
+    err.status = 400;
+    throw err;
+  }
+
+  const revokeResponse = await appleSigninAuth.revokeAuthorizationToken(tokenToRevoke, {
+    clientID: APPLE_CLIENT_ID,
+    clientSecret,
+    tokenTypeHint,
+  });
+
+  if (revokeResponse?.error) {
+    const err = new Error(revokeResponse.error);
+    err.status = 400;
+    err.code = 'APPLE_TOKEN_REVOKE_FAILED';
+    err.details = revokeResponse;
+    throw err;
+  }
+}
+
 async function createUserAccountWithDefaults(connection, {
   email,
   password = null,
@@ -1921,6 +2010,183 @@ app.post('/api/auth/google', async (req, res) => {
 
     console.error('Error al autenticar con Google:', err);
     return res.status(401).json({ error: 'GOOGLE_AUTH_FAILED' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/auth/apple', async (req, res) => {
+  const identityToken = typeof req.body?.identityToken === 'string' ? req.body.identityToken.trim() : '';
+  const rawEmail = typeof req.body?.email === 'string' ? req.body.email : '';
+  const rawFirstName = typeof req.body?.first_name === 'string' ? req.body.first_name : '';
+  const rawSurname = typeof req.body?.surname === 'string' ? req.body.surname : '';
+  const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
+  const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
+  const language = rawLanguage.trim() || 'en';
+  const platform = rawPlatform.trim().toLowerCase() === 'android' ? 'android' : 'ios';
+
+  if (!identityToken) {
+    return res.status(400).json({ error: 'APPLE_ID_TOKEN_REQUIRED' });
+  }
+
+  let connection;
+  let providerIdFromToken = '';
+  let emailFromApple = '';
+
+  try {
+    const payload = await appleSigninAuth.verifyIdToken(identityToken, {
+      audience: APPLE_CLIENT_ID,
+    });
+
+    providerIdFromToken = typeof payload?.sub === 'string' ? payload.sub.trim() : '';
+    const emailFromToken = typeof payload?.email === 'string' ? payload.email.trim().toLowerCase() : '';
+    const emailFromBody = rawEmail.trim().toLowerCase();
+    emailFromApple = emailFromToken || emailFromBody;
+
+    if (!providerIdFromToken) {
+      return res.status(400).json({ error: 'APPLE_PROFILE_INCOMPLETE' });
+    }
+
+    const query = emailFromApple
+      ? 'SELECT * FROM user_account WHERE provider_id = ? OR email = ?'
+      : 'SELECT * FROM user_account WHERE provider_id = ?';
+    const params = emailFromApple ? [providerIdFromToken, emailFromApple] : [providerIdFromToken];
+    const [existingUsers] = await promisePool.query(query, params);
+
+    const providerMatch = existingUsers.find((item) => String(item.provider_id || '') === providerIdFromToken) || null;
+    const emailMatch = emailFromApple
+      ? existingUsers.find((item) => String(item.email || '').toLowerCase() === emailFromApple) || null
+      : null;
+
+    if (providerMatch && emailMatch && providerMatch.id !== emailMatch.id) {
+      return res.status(409).json({
+        error: 'AUTH_PROVIDER_MISMATCH',
+        auth_provider: emailMatch.auth_provider || 'email',
+      });
+    }
+
+    if (emailMatch && emailMatch.auth_provider === 'apple' && emailMatch.provider_id && emailMatch.provider_id !== providerIdFromToken) {
+      return res.status(409).json({ error: 'APPLE_PROVIDER_MISMATCH', auth_provider: 'apple' });
+    }
+
+    const existingUser = providerMatch || emailMatch;
+
+    if (existingUser) {
+      if (existingUser.auth_provider !== 'apple') {
+        return res.status(409).json({
+          error: 'AUTH_PROVIDER_MISMATCH',
+          auth_provider: existingUser.auth_provider,
+        });
+      }
+
+      await promisePool.query(
+        'UPDATE user_account SET provider_id = COALESCE(provider_id, ?), platform = ? WHERE id = ?',
+        [providerIdFromToken, platform, existingUser.id]
+      );
+
+      const user = (await fetchSanitizedUserById(existingUser.id)) || sanitizeUserRecord(existingUser);
+      const tokens = await issueAuthTokens(existingUser.id, req);
+
+      return res.json({
+        success: true,
+        message: 'Inicio de sesión exitoso.',
+        user,
+        ...tokens,
+      });
+    }
+
+    if (!emailFromApple) {
+      return res.status(400).json({ error: 'APPLE_EMAIL_REQUIRED' });
+    }
+
+    const { first_name, surname } = resolveAppleNameParts({
+      first_name: rawFirstName,
+      surname: rawSurname,
+      email: emailFromApple,
+    });
+
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
+
+    const { userId, username } = await createUserAccountWithDefaults(connection, {
+      email: emailFromApple,
+      password: null,
+      first_name,
+      surname,
+      phone: null,
+      language,
+      allow_notis: null,
+      profile_picture: null,
+      is_verified: 1,
+      is_professional: 0,
+      auth_provider: 'apple',
+      provider_id: providerIdFromToken,
+      platform,
+    });
+
+    await connection.commit();
+
+    const user = (await fetchSanitizedUserById(userId)) || {
+      id: userId,
+      email: emailFromApple,
+      username,
+      first_name,
+      surname,
+      phone: null,
+      language,
+      auth_provider: 'apple',
+      provider_id: providerIdFromToken,
+      platform,
+      allow_notis: null,
+      profile_picture: null,
+      is_verified: 1,
+      is_professional: 0,
+    };
+    const tokens = await issueAuthTokens(userId, req);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Usuario creado.',
+      userId,
+      user,
+      ...tokens,
+    });
+  } catch (err) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackErr) {
+        console.error('Error al revertir signup con Apple:', rollbackErr);
+      }
+    }
+
+    if (err?.status === 409 && err.message === 'EMAIL_EXISTS') {
+      const [existingUsers] = await promisePool.query(
+        'SELECT auth_provider FROM user_account WHERE email = ? LIMIT 1',
+        [emailFromApple]
+      );
+      return res.status(409).json({
+        error: 'AUTH_PROVIDER_MISMATCH',
+        auth_provider: existingUsers[0]?.auth_provider || 'email',
+      });
+    }
+
+    if (err?.status === 409 && err.message === 'PROVIDER_ID_EXISTS' && providerIdFromToken) {
+      const [existingUsers] = await promisePool.query(
+        'SELECT * FROM user_account WHERE provider_id = ? LIMIT 1',
+        [providerIdFromToken]
+      );
+      if (existingUsers.length > 0) {
+        const user = sanitizeUserRecord(existingUsers[0]);
+        const tokens = await issueAuthTokens(existingUsers[0].id, req);
+        return res.json({ success: true, message: 'Inicio de sesión exitoso.', user, ...tokens });
+      }
+    }
+
+    console.error('Error al autenticar con Apple:', err);
+    return res.status(401).json({ error: 'APPLE_AUTH_FAILED' });
   } finally {
     if (connection) {
       connection.release();
@@ -4148,7 +4414,7 @@ app.get('/api/suggested_professional', (req, res) => {
       if (!pros || pros.length === 0) return res.status(200).json([]);
 
       // Ponderación: multiplica la influencia de rating y de reservas.
-      // Puedes ajustar α y β según lo que quieras priorizar.
+      // Puedes ajustar a y ß según lo que quieras priorizar.
       const alpha = 2; // peso del rating
       const beta = 1; // peso de reservas
 
@@ -4690,38 +4956,79 @@ app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
   });
 });
 //Ruta para borrar una cuenta
-app.delete('/api/user/:id', (req, res) => {
-  const { id } = req.params; // ID del usuario
+app.delete('/api/user/:id', async (req, res) => {
+  const requestedUserId = parseInt(req.params.id, 10);
+  const authorizationCode = typeof req.body?.authorizationCode === 'string' ? req.body.authorizationCode.trim() : '';
+  const identityToken = typeof req.body?.identityToken === 'string' ? req.body.identityToken.trim() : '';
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+  if (!Number.isInteger(requestedUserId)) {
+    return res.status(400).json({ error: 'invalid_user_id' });
+  }
+
+  if (requestedUserId !== req.user.id) {
+    return res.status(403).json({ error: 'Acceso denegado' });
+  }
+
+  try {
+    const [users] = await promisePool.query(
+      'SELECT id, auth_provider, provider_id FROM user_account WHERE id = ? LIMIT 1',
+      [requestedUserId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
     }
 
-    // Consulta para eliminar el usuario de user_account
-    const query = `
-      DELETE FROM user_account
-      WHERE id = ?;
-    `;
+    const account = users[0];
 
-    connection.query(query, [id], (err, result) => {
-      connection.release(); // Liberar la conexión después de usarla
-
-      if (err) {
-        console.error('Error al eliminar la cuenta del usuario:', err);
-        res.status(500).json({ error: 'Error al eliminar la cuenta del usuario.' });
-        return;
+    if (account.auth_provider === 'apple') {
+      if (!authorizationCode || !identityToken) {
+        return res.status(400).json({ error: 'APPLE_REAUTH_REQUIRED' });
       }
 
-      if (result.affectedRows > 0) {
-        res.status(200).json({ message: 'Cuenta eliminada exitosamente.' });
-      } else {
-        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      const payload = await appleSigninAuth.verifyIdToken(identityToken, {
+        audience: APPLE_CLIENT_ID,
+      });
+      const providerIdFromToken = typeof payload?.sub === 'string' ? payload.sub.trim() : '';
+
+      if (!providerIdFromToken || providerIdFromToken !== String(account.provider_id || '').trim()) {
+        return res.status(403).json({ error: 'APPLE_REAUTH_PROVIDER_MISMATCH' });
       }
-    });
-  });
+
+      await revokeAppleSessionWithAuthorizationCode(authorizationCode);
+    }
+
+    await revokeAllUserSessions(requestedUserId);
+
+    const [result] = await promisePool.query(
+      'DELETE FROM user_account WHERE id = ?',
+      [requestedUserId]
+    );
+
+    if (result.affectedRows > 0) {
+      return res.status(200).json({ message: 'Cuenta eliminada exitosamente.' });
+    }
+
+    return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+  } catch (err) {
+    if (err?.message === 'APPLE_REVOKE_CONFIG_MISSING') {
+      return res.status(500).json({ error: 'APPLE_REVOKE_CONFIG_MISSING' });
+    }
+
+    if (
+      err?.message === 'APPLE_REVOKE_TOKEN_MISSING' ||
+      err?.message === 'invalid_grant' ||
+      err?.code === 'APPLE_TOKEN_EXCHANGE_FAILED' ||
+      err?.code === 'APPLE_TOKEN_REVOKE_FAILED' ||
+      err?.name === 'JsonWebTokenError' ||
+      err?.name === 'TokenExpiredError'
+    ) {
+      return res.status(400).json({ error: 'APPLE_REAUTH_REQUIRED' });
+    }
+
+    console.error('Error al eliminar la cuenta del usuario:', err);
+    return res.status(500).json({ error: 'Error al eliminar la cuenta del usuario.' });
+  }
 });
 
 //Ruta para actualizar allow_notis de un usuario
@@ -7908,6 +8215,9 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
 });
+
+
+
 
 
 
