@@ -306,3 +306,147 @@
 - `user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
 - `not_available_event_start_datetime` (DATETIME, NOT NULL)
 - `not_available_event_end_datetime` (DATETIME, NOT NULL)
+
+
+----------------------------------------------------------
+
+
+## Relaciones y Keys (PK/FK)
+
+### Tabla: `address`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `auth_session`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `booking`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `address_id`: **FK** -> `address`.`id` (Key Name: `fk_booking_address_id_addres_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_booking_user_id_user_account_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_booking_service_id_service_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `recurrent_pattern_id`: **FK** -> `recurrent_pattern`.`id` (Key Name: `fk_booking_recurrent_pattern_id_recurrent_pattern_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `promotion_id`: **FK** -> `promotion`.`id` (Key Name: `fk_booking_promotion_id_promotion_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `payment_method_id`: **FK** -> `payment_method`.`id` (Key Name: `fk_booking_payment_method_id_payment_method_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+
+### Tabla: `collection_method`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_collection_method_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `consult`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `address_id`: **FK** -> `address`.`id` (Key Name: `fk_consult_address_id_address_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_consult_service_id_service_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_consult_user_id_user_account_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+
+### Tabla: `consult_via`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `directions`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `address_id`: **FK** -> `address`.`id` (Key Name: `fk_directions_address_id_address_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_directions_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `experience_place`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_experience_place_service_id_service_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+
+### Tabla: `item_list`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `list_id`: **FK** -> `service_list`.`id` (Key Name: `fk_item_list_list_id_service_list_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_item_list_service_id_service_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `password_reset_codes`
+- `user_id`: **PK** (Key Name: `PRIMARY`)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_user_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `payment_method`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_payment_method_user_id_user_account_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+
+### Tabla: `payments`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_payments_booking_id_booking_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+
+### Tabla: `price`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `promotion`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `recurrent_event_exception`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_recurrent_event_exception_booking_id_booking_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `recurrent_pattern_id`: **FK** -> `recurrent_pattern`.`id` (Key Name: `fk_recurrent_event_exception_recurrent_pattern_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `recurrent_pattern`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `review`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_review_service_id_service_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_review_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `service`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `consult_via_id`: **FK** -> `consult_via`.`id` (Key Name: `fk_service_consult_via_id_consult_via_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `price_id`: **FK** -> `price`.`id` (Key Name: `fk_service_price_id_price_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `service_category_id`: **FK** -> `service_category`.`id` (Key Name: `fk_service_service_category_id_service_category_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_service_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `service_category`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `service_category_type_id`: **FK** -> `service_category_type`.`id` (Key Name: `fk_service_category_service_category_type_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `service_family_id`: **FK** -> `service_family`.`id` (Key Name: `fk_service_category_service_family_id_service_family_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+
+### Tabla: `service_category_type`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `service_family`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `service_image`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_service_image_service_id_service_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `service_language`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_service_language_service_id_service_id`, ON DELETE CASCADE, ON UPDATE RESTRICT)
+
+### Tabla: `service_list`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_service_list_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `service_report`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `handled_by_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_sr_handled_by`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_sr_service`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `reporter_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_sr_reporter`, ON DELETE RESTRICT, ON UPDATE NO ACTION)
+
+### Tabla: `service_report_attachment`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `report_id`: **FK** -> `service_report`.`id` (Key Name: `fk_sra_report`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `service_tags`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_service_tags_service_id_service_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `shared_list`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `list_id`: **FK** -> `service_list`.`id` (Key Name: `fk_shared_list_list_id_service_list_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_shared_list_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `user_account`
+- `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `user_address`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `address_id`: **FK** -> `address`.`id` (Key Name: `fk_user_address_address_id_address_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_user_address_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `user_availability`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_user_availability_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `user_not_available`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_user_not_available_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)

@@ -4960,6 +4960,7 @@ app.delete('/api/user/:id', async (req, res) => {
   const requestedUserId = parseInt(req.params.id, 10);
   const authorizationCode = typeof req.body?.authorizationCode === 'string' ? req.body.authorizationCode.trim() : '';
   const identityToken = typeof req.body?.identityToken === 'string' ? req.body.identityToken.trim() : '';
+  let connection;
 
   if (!Number.isInteger(requestedUserId)) {
     return res.status(400).json({ error: 'invalid_user_id' });
@@ -4998,19 +4999,34 @@ app.delete('/api/user/:id', async (req, res) => {
       await revokeAppleSessionWithAuthorizationCode(authorizationCode);
     }
 
-    await revokeAllUserSessions(requestedUserId);
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
 
-    const [result] = await promisePool.query(
+    await connection.query('DELETE FROM password_reset_codes WHERE user_id = ?', [requestedUserId]);
+    await connection.query('DELETE FROM auth_session WHERE user_id = ?', [requestedUserId]);
+    await connection.query('DELETE FROM collection_method WHERE user_id = ?', [requestedUserId]);
+
+    const [result] = await connection.query(
       'DELETE FROM user_account WHERE id = ?',
       [requestedUserId]
     );
 
-    if (result.affectedRows > 0) {
-      return res.status(200).json({ message: 'Cuenta eliminada exitosamente.' });
+    if (result.affectedRows === 0) {
+      await connection.rollback();
+      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
     }
 
-    return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+    await connection.commit();
+    return res.status(200).json({ message: 'Cuenta eliminada exitosamente.' });
   } catch (err) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Error al hacer rollback al eliminar la cuenta del usuario:', rollbackError);
+      }
+    }
+
     if (err?.message === 'APPLE_REVOKE_CONFIG_MISSING') {
       return res.status(500).json({ error: 'APPLE_REVOKE_CONFIG_MISSING' });
     }
@@ -5026,8 +5042,16 @@ app.delete('/api/user/:id', async (req, res) => {
       return res.status(400).json({ error: 'APPLE_REAUTH_REQUIRED' });
     }
 
+    if (err?.code === 'ER_ROW_IS_REFERENCED_2') {
+      return res.status(409).json({ error: 'user_has_related_records' });
+    }
+
     console.error('Error al eliminar la cuenta del usuario:', err);
     return res.status(500).json({ error: 'Error al eliminar la cuenta del usuario.' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
