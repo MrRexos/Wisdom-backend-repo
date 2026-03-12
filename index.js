@@ -1607,7 +1607,7 @@ app.get('/api/users', (req, res) => {
 // Ruta para verificar si un email ya existe
 app.get('/api/check-email', checkEmailLimiter, (req, res) => {
   const email = normalizeEmail(req.query?.email);
-  const query = 'SELECT id FROM user_account WHERE email = ? LIMIT 1';
+  const query = 'SELECT id, auth_provider FROM user_account WHERE email = ? LIMIT 1';
 
   if (!isValidEmail(email)) {
     return res.status(400).json({ error: 'invalid_email' });
@@ -1632,6 +1632,7 @@ app.get('/api/check-email', checkEmailLimiter, (req, res) => {
       const existingUser = results[0] || null;
       res.json({
         exists: Boolean(existingUser),
+        auth_provider: existingUser?.auth_provider || null,
       });
     });
   });
@@ -2308,7 +2309,10 @@ app.post('/api/forgot-password', forgotPasswordLimiter, async (req, res) => {
 
     const account = results[0];
     if (account.auth_provider && account.auth_provider !== 'email') {
-      return res.json({ message: 'If the account exists, reset instructions were sent.' });
+      return res.status(409).json({
+        error: 'AUTH_PROVIDER_MISMATCH',
+        auth_provider: account.auth_provider,
+      });
     }
 
     const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
@@ -2400,6 +2404,53 @@ app.post('/api/forgot-password', forgotPasswordLimiter, async (req, res) => {
 });
 
 // Restablecer contraseña con token
+app.post('/api/verify-reset-code', resetPasswordLimiter, async (req, res) => {
+  const emailOrUsername = typeof req.body?.emailOrUsername === 'string' ? req.body.emailOrUsername.trim() : '';
+  const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+
+  if (!emailOrUsername || !code) {
+    return res.status(400).json({ error: 'Code and user required' });
+  }
+
+  try {
+    const [userRes] = await promisePool.query(
+      'SELECT id, auth_provider FROM user_account WHERE email = ? OR username = ? LIMIT 1',
+      [emailOrUsername, emailOrUsername]
+    );
+
+    if (userRes.length === 0) {
+      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
+    }
+
+    const account = userRes[0];
+    if (account.auth_provider && account.auth_provider !== 'email') {
+      return res.status(409).json({
+        error: 'AUTH_PROVIDER_MISMATCH',
+        auth_provider: account.auth_provider,
+      });
+    }
+
+    const [codeRes] = await promisePool.query(
+      'SELECT code, expires_at FROM password_reset_codes WHERE user_id = ?',
+      [account.id]
+    );
+
+    if (codeRes.length === 0) {
+      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
+    }
+
+    const record = codeRes[0];
+    if (record.code !== code || new Date(record.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
+    }
+
+    return res.json({ valid: true });
+  } catch (err) {
+    console.error('Error al validar el código de restablecimiento:', err);
+    return res.status(500).json({ error: 'Error al validar el código.' });
+  }
+});
+
 app.post('/api/reset-password', resetPasswordLimiter, async (req, res) => {
   const emailOrUsername = typeof req.body?.emailOrUsername === 'string' ? req.body.emailOrUsername.trim() : '';
   const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
@@ -2425,7 +2476,10 @@ app.post('/api/reset-password', resetPasswordLimiter, async (req, res) => {
 
     const account = userRes[0];
     if (account.auth_provider && account.auth_provider !== 'email') {
-      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
+      return res.status(409).json({
+        error: 'AUTH_PROVIDER_MISMATCH',
+        auth_provider: account.auth_provider,
+      });
     }
 
     const userId = account.id;
