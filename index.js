@@ -1106,6 +1106,16 @@ function isPasswordTooShort(password) {
   return typeof password !== 'string' || password.length < 8;
 }
 
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function normalizeEmail(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isValidEmail(email) {
+  return EMAIL_REGEX.test(normalizeEmail(email));
+}
+
 function resolveGoogleNameParts(payload) {
   let first_name = typeof payload?.given_name === 'string' ? payload.given_name.trim() : '';
   let surname = typeof payload?.family_name === 'string' ? payload.family_name.trim() : '';
@@ -1546,6 +1556,25 @@ const uploadSignLimiter = rateLimit({
   },
 });
 
+function createAuthRateLimiter({ windowMs, max }) {
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => {
+      res.status(429).json({ error: 'AUTH_RATE_LIMIT_EXCEEDED' });
+    },
+  });
+}
+
+const checkEmailLimiter = createAuthRateLimiter({ windowMs: 10 * 60 * 1000, max: 30 });
+const loginLimiter = createAuthRateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
+const signupLimiter = createAuthRateLimiter({ windowMs: 30 * 60 * 1000, max: 5 });
+const socialAuthLimiter = createAuthRateLimiter({ windowMs: 10 * 60 * 1000, max: 15 });
+const forgotPasswordLimiter = createAuthRateLimiter({ windowMs: 15 * 60 * 1000, max: 5 });
+const resetPasswordLimiter = createAuthRateLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
+
 
 
 // Ruta de prueba
@@ -1576,9 +1605,13 @@ app.get('/api/users', (req, res) => {
 });
 
 // Ruta para verificar si un email ya existe
-app.get('/api/check-email', (req, res) => {
-  const { email } = req.query;
-  const query = 'SELECT auth_provider FROM user_account WHERE email = ? LIMIT 1';
+app.get('/api/check-email', checkEmailLimiter, (req, res) => {
+  const email = normalizeEmail(req.query?.email);
+  const query = 'SELECT id FROM user_account WHERE email = ? LIMIT 1';
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: 'invalid_email' });
+  }
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -1599,7 +1632,6 @@ app.get('/api/check-email', (req, res) => {
       const existingUser = results[0] || null;
       res.json({
         exists: Boolean(existingUser),
-        auth_provider: existingUser?.auth_provider || null,
       });
     });
   });
@@ -1660,7 +1692,7 @@ app.get('/api/verify-email', (req, res) => {
 });
 
 // Ruta para hacer login  (Access 15m + Refresh 30d)
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', loginLimiter, async (req, res) => {
   const usernameOrEmail = typeof req.body?.usernameOrEmail === 'string' ? req.body.usernameOrEmail.trim() : '';
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   const query = 'SELECT * FROM user_account WHERE username = ? OR email = ?';
@@ -1669,7 +1701,7 @@ app.post('/api/login', async (req, res) => {
     const [results] = await promisePool.query(query, [usernameOrEmail, usernameOrEmail]);
 
     if (!results.length) {
-      return res.json({ success: null, message: 'Wrong user or password.' });
+      return res.json({ success: false, error: 'INVALID_CREDENTIALS' });
     }
 
     const user = results[0];
@@ -1682,12 +1714,12 @@ app.post('/api/login', async (req, res) => {
     }
 
     if (typeof user.password !== 'string' || !user.password) {
-      return res.json({ success: null, message: 'Wrong user or password.' });
+      return res.json({ success: false, error: 'INVALID_CREDENTIALS' });
     }
 
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
-      return res.json({ success: false, message: 'Password incorrect.' });
+      return res.json({ success: false, error: 'INVALID_CREDENTIALS' });
     }
 
     const tokens = await issueAuthTokens(user.id, req);
@@ -1704,7 +1736,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 // Ruta para crear un nuevo usuario
-app.post('/api/signup', async (req, res) => {
+app.post('/api/signup', signupLimiter, async (req, res) => {
   const rawEmail = typeof req.body?.email === 'string' ? req.body.email : '';
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
   const rawFirstName = typeof req.body?.first_name === 'string' ? req.body.first_name : '';
@@ -1713,7 +1745,7 @@ app.post('/api/signup', async (req, res) => {
   const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
   const rawPhone = typeof req.body?.phone === 'string' ? req.body.phone.trim() : null;
 
-  const email = rawEmail.trim().toLowerCase();
+  const email = normalizeEmail(rawEmail);
   const first_name = rawFirstName.trim();
   const surname = rawSurname.trim();
   const language = rawLanguage.trim() || 'en';
@@ -1722,6 +1754,10 @@ app.post('/api/signup', async (req, res) => {
 
   if (!email || !password || !first_name || !surname) {
     return res.status(400).json({ error: 'MISSING_SIGNUP_FIELDS' });
+  }
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: 'INVALID_EMAIL' });
   }
 
   if (password.length < 8) {
@@ -1771,7 +1807,6 @@ app.post('/api/signup', async (req, res) => {
 
     await connection.commit();
 
-    const tokens = await issueAuthTokens(userId, req);
     const user = (await fetchSanitizedUserById(userId)) || {
       id: userId,
       email,
@@ -1865,7 +1900,15 @@ app.post('/api/signup', async (req, res) => {
       });
     } catch (mailErr) {
       console.error('Error al enviar el correo de verificación:', mailErr);
+      try {
+        await promisePool.query('DELETE FROM user_account WHERE id = ?', [userId]);
+      } catch (cleanupErr) {
+        console.error('Error al limpiar signup tras fallo de correo de verificación:', cleanupErr);
+      }
+      return res.status(503).json({ error: 'SIGNUP_VERIFICATION_EMAIL_FAILED' });
     }
+
+    const tokens = await issueAuthTokens(userId, req);
 
     return res.status(201).json({
       message: 'Usuario creado.',
@@ -1895,7 +1938,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-app.post('/api/auth/google', async (req, res) => {
+app.post('/api/auth/google', socialAuthLimiter, async (req, res) => {
   const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
   const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
   const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
@@ -2055,7 +2098,7 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
-app.post('/api/auth/apple', async (req, res) => {
+app.post('/api/auth/apple', socialAuthLimiter, async (req, res) => {
   const identityToken = typeof req.body?.identityToken === 'string' ? req.body.identityToken.trim() : '';
   const rawEmail = typeof req.body?.email === 'string' ? req.body.email : '';
   const rawFirstName = typeof req.body?.first_name === 'string' ? req.body.first_name : '';
@@ -2247,7 +2290,7 @@ app.post('/api/logout', async (req, res) => {
 });
 
 // Enviar enlace para restablecer contraseña
-app.post('/api/forgot-password', async (req, res) => {
+app.post('/api/forgot-password', forgotPasswordLimiter, async (req, res) => {
   const emailOrUsername = typeof req.body?.emailOrUsername === 'string' ? req.body.emailOrUsername.trim() : '';
   if (!emailOrUsername) {
     return res.status(400).json({ error: 'Email or username required' });
@@ -2260,15 +2303,12 @@ app.post('/api/forgot-password', async (req, res) => {
     );
 
     if (results.length === 0) {
-      return res.status(400).json({ error: 'User not found' });
+      return res.json({ message: 'If the account exists, reset instructions were sent.' });
     }
 
     const account = results[0];
     if (account.auth_provider && account.auth_provider !== 'email') {
-      return res.status(409).json({
-        error: 'PASSWORD_RESET_NOT_AVAILABLE_FOR_PROVIDER',
-        auth_provider: account.auth_provider,
-      });
+      return res.json({ message: 'If the account exists, reset instructions were sent.' });
     }
 
     const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
@@ -2348,9 +2388,11 @@ app.post('/api/forgot-password', async (req, res) => {
       });
     } catch (mailErr) {
       console.error('Error al enviar el correo de restablecimiento:', mailErr);
+      await promisePool.query('DELETE FROM password_reset_codes WHERE user_id = ?', [account.id]);
+      return res.status(503).json({ error: 'PASSWORD_RESET_DELIVERY_FAILED' });
     }
 
-    return res.json({ message: 'Reset code sent' });
+    return res.json({ message: 'If the account exists, reset instructions were sent.' });
   } catch (err) {
     console.error('Error al generar el código de restablecimiento:', err);
     return res.status(500).json({ error: 'Error al generar el código.' });
@@ -2358,13 +2400,17 @@ app.post('/api/forgot-password', async (req, res) => {
 });
 
 // Restablecer contraseña con token
-app.post('/api/reset-password', async (req, res) => {
+app.post('/api/reset-password', resetPasswordLimiter, async (req, res) => {
   const emailOrUsername = typeof req.body?.emailOrUsername === 'string' ? req.body.emailOrUsername.trim() : '';
   const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
   const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
 
   if (!emailOrUsername || !code || !newPassword) {
     return res.status(400).json({ error: 'Code, user and new password required' });
+  }
+
+  if (isPasswordTooShort(newPassword)) {
+    return res.status(400).json({ error: 'PASSWORD_TOO_SHORT' });
   }
 
   try {
@@ -2374,15 +2420,12 @@ app.post('/api/reset-password', async (req, res) => {
     );
 
     if (userRes.length === 0) {
-      return res.status(400).json({ error: 'User not found' });
+      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
     }
 
     const account = userRes[0];
     if (account.auth_provider && account.auth_provider !== 'email') {
-      return res.status(409).json({
-        error: 'PASSWORD_RESET_NOT_AVAILABLE_FOR_PROVIDER',
-        auth_provider: account.auth_provider,
-      });
+      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
     }
 
     const userId = account.id;
@@ -2392,16 +2435,12 @@ app.post('/api/reset-password', async (req, res) => {
     );
 
     if (codeRes.length === 0) {
-      return res.status(400).json({ error: 'Invalid code' });
+      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
     }
 
     const record = codeRes[0];
     if (record.code !== code || new Date(record.expires_at) < new Date()) {
-      return res.status(400).json({ error: 'Invalid or expired code' });
-    }
-
-    if (isPasswordTooShort(newPassword)) {
-      return res.status(400).json({ error: 'PASSWORD_TOO_SHORT' });
+      return res.status(400).json({ error: 'INVALID_OR_EXPIRED_RESET_CODE' });
     }
 
     const hashed = await bcrypt.hash(newPassword, 10);
@@ -4913,9 +4952,9 @@ app.put('/api/user/:id/profile', authenticateToken, async (req, res) => {
 app.put('/api/user/:id/email', authenticateToken, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res);
   if (!requestedUserId) return;
-  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const email = normalizeEmail(req.body?.email);
 
-  if (!email) {
+  if (!email || !isValidEmail(email)) {
     return res.status(400).json({ error: 'invalid_email' });
   }
 
