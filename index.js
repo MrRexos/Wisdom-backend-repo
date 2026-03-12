@@ -3258,7 +3258,7 @@ app.post('/api/service', (req, res) => {
             // 3. Insertar en la tabla 'service'
             const serviceQuery = `
               INSERT INTO service (
-                action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime, is_hidden, last_edit_datetime
+                service_title, user_id, description, service_category_id, price_id, latitude, longitude, action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime, is_hidden, last_edit_datetime
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
             `;
             const serviceValues = [
