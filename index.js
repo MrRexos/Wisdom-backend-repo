@@ -1068,6 +1068,44 @@ function sanitizeUserRecord(user) {
   return sanitizedUser;
 }
 
+function buildPublicUserRecord(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    username: user.username,
+    first_name: user.first_name,
+    surname: user.surname,
+    profile_picture: user.profile_picture,
+    is_professional: user.is_professional,
+    language: user.language,
+    joined_datetime: user.joined_datetime,
+  };
+}
+
+function parseRequestedUserId(rawUserId) {
+  const userId = parseInt(rawUserId, 10);
+  return Number.isInteger(userId) ? userId : null;
+}
+
+function ensureSameUserOrRespond(req, res, rawUserId = req.params?.id) {
+  const requestedUserId = parseRequestedUserId(rawUserId);
+  if (!requestedUserId) {
+    res.status(400).json({ error: 'invalid_user_id' });
+    return null;
+  }
+
+  if (!req.user || Number(req.user.id) !== requestedUserId) {
+    res.status(403).json({ error: 'Acceso denegado' });
+    return null;
+  }
+
+  return requestedUserId;
+}
+
+function isPasswordTooShort(password) {
+  return typeof password !== 'string' || password.length < 8;
+}
+
 function resolveGoogleNameParts(payload) {
   let first_name = typeof payload?.given_name === 'string' ? payload.given_name.trim() : '';
   let surname = typeof payload?.family_name === 'string' ? payload.family_name.trim() : '';
@@ -2362,9 +2400,14 @@ app.post('/api/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Invalid or expired code' });
     }
 
+    if (isPasswordTooShort(newPassword)) {
+      return res.status(400).json({ error: 'PASSWORD_TOO_SHORT' });
+    }
+
     const hashed = await bcrypt.hash(newPassword, 10);
     await promisePool.query('UPDATE user_account SET password = ? WHERE id = ?', [hashed, userId]);
     await promisePool.query('DELETE FROM password_reset_codes WHERE user_id = ?', [userId]);
+    await revokeAllUserSessions(userId);
 
     const [results] = await promisePool.query(
       'SELECT id, email, username, first_name, surname, phone, profile_picture, is_professional, language, auth_provider FROM user_account WHERE id = ? LIMIT 1',
@@ -2572,8 +2615,9 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
 });
 
 //Ruta para obtener las listas de un usuario en favorites
-app.get('/api/user/:userId/lists', (req, res) => {
-  const { userId } = req.params;
+app.get('/api/user/:userId/lists', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res, req.params.userId);
+  if (!requestedUserId) return;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -2592,7 +2636,7 @@ app.get('/api/user/:userId/lists', (req, res) => {
       WHERE shared_list.user_id = ?;
     `;
 
-    connection.query(query, [userId, userId], (err, lists) => {
+    connection.query(query, [requestedUserId, requestedUserId], (err, lists) => {
       if (err) {
         console.error('Error al obtener las listas:', err);
         res.status(500).json({ error: 'Error al obtener las listas.' });
@@ -4439,8 +4483,9 @@ app.get('/api/suggested_professional', (req, res) => {
 });
 
 //Ruta para obtener todas las reservas de un user
-app.get('/api/user/:userId/bookings', (req, res) => {
-  const { userId } = req.params; // ID del usuario
+app.get('/api/user/:userId/bookings', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res, req.params.userId);
+  if (!requestedUserId) return;
   const { status } = req.query;
 
   pool.getConnection((err, connection) => {
@@ -4498,7 +4543,7 @@ app.get('/api/user/:userId/bookings', (req, res) => {
       LEFT JOIN user_account ON service.user_id = user_account.id
       WHERE booking.user_id = ?`;
 
-    const params = [userId];
+    const params = [requestedUserId];
     if (status) {
       query += ' AND booking.booking_status = ?';
       params.push(status);
@@ -4623,8 +4668,9 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
 });
 
 //Ruta para mostrar todos los servicios de un profesional
-app.get('/api/user/:id/services', (req, res) => {
-  const { id } = req.params; // ID del usuario
+app.get('/api/user/:id/services', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -4687,7 +4733,7 @@ app.get('/api/user/:id/services', (req, res) => {
       WHERE service.user_id = ?;
     `;
 
-    connection.query(query, [id], (err, servicesData) => {
+    connection.query(query, [requestedUserId], (err, servicesData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -4706,8 +4752,9 @@ app.get('/api/user/:id/services', (req, res) => {
 });
 
 //Ruta para obtener el dinero en wallet
-app.get('/api/user/:id/wallet', (req, res) => {
-  const { id } = req.params; // ID del usuario
+app.get('/api/user/:id/wallet', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -4723,7 +4770,7 @@ app.get('/api/user/:id/wallet', (req, res) => {
       WHERE id = ?;
     `;
 
-    connection.query(query, [id], (err, walletData) => {
+    connection.query(query, [requestedUserId], (err, walletData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -4743,7 +4790,10 @@ app.get('/api/user/:id/wallet', (req, res) => {
 
 //Ruta para obtener la información de un usuario
 app.get('/api/user/:id', (req, res) => {
-  const { id } = req.params; // ID del usuario
+  const requestedUserId = parseRequestedUserId(req.params.id);
+  if (!requestedUserId) {
+    return res.status(400).json({ error: 'invalid_user_id' });
+  }
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -4759,7 +4809,7 @@ app.get('/api/user/:id', (req, res) => {
       WHERE id = ?;
     `;
 
-    connection.query(query, [id], (err, userData) => {
+    connection.query(query, [requestedUserId], (err, userData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -4769,7 +4819,9 @@ app.get('/api/user/:id', (req, res) => {
       }
 
       if (userData.length > 0) {
-        res.status(200).json(userData[0]);
+        const userRecord = userData[0];
+        const isOwner = req.user && Number(req.user.id) === requestedUserId;
+        res.status(200).json(isOwner ? userRecord : buildPublicUserRecord(userRecord));
       } else {
         res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
       }
@@ -4778,45 +4830,89 @@ app.get('/api/user/:id', (req, res) => {
 });
 
 //Ruta para actualizar el profile
-app.put('/api/user/:id/profile', (req, res) => {
-  const { id } = req.params; // ID del usuario
-  const { profile_picture, username, first_name, surname, phone } = req.body; // Datos a actualizar
+app.put('/api/user/:id/profile', authenticateToken, async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+  const body = req.body || {};
+  const hasField = (field) => Object.prototype.hasOwnProperty.call(body, field);
+
+  try {
+    const [users] = await promisePool.query(
+      'SELECT username, first_name, surname, phone, profile_picture FROM user_account WHERE id = ? LIMIT 1',
+      [requestedUserId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({ notFound: true, message: 'No se encontr\u00f3 el usuario.' });
     }
 
-    // Consulta para actualizar los valores en user_account
-    const query = `
-      UPDATE user_account
-      SET profile_picture = ?, username = ?, first_name = ?, surname = ?, phone = ?
-      WHERE id = ?;
-    `;
+    const currentUser = users[0];
 
-    connection.query(query, [profile_picture, username, first_name, surname, phone, id], (err, result) => {
-      connection.release(); // Liberar la conexión después de usarla
+    const username = hasField('username')
+      ? (typeof body.username === 'string' ? body.username.trim() : '')
+      : currentUser.username;
+    const first_name = hasField('first_name')
+      ? (typeof body.first_name === 'string' ? body.first_name.trim() : '')
+      : currentUser.first_name;
+    const surname = hasField('surname')
+      ? (typeof body.surname === 'string' ? body.surname.trim() : '')
+      : currentUser.surname;
 
-      if (err) {
-        console.error('Error al actualizar el perfil del usuario:', err);
-        res.status(500).json({ error: 'Error al actualizar el perfil del usuario.' });
-        return;
-      }
-
-      if (result.affectedRows > 0) {
-        res.status(200).json({ message: 'Perfil actualizado exitosamente.' });
+    let phone = currentUser.phone;
+    if (hasField('phone')) {
+      if (body.phone === null) {
+        phone = null;
+      } else if (typeof body.phone === 'string') {
+        const trimmedPhone = body.phone.trim();
+        phone = trimmedPhone || null;
       } else {
-        res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+        return res.status(400).json({ error: 'invalid_profile_fields' });
       }
-    });
-  });
-});
+    }
 
+    let profile_picture = currentUser.profile_picture;
+    if (hasField('profile_picture')) {
+      if (body.profile_picture === null) {
+        profile_picture = null;
+      } else if (typeof body.profile_picture === 'string') {
+        const trimmedProfilePicture = body.profile_picture.trim();
+        profile_picture = trimmedProfilePicture || null;
+      } else {
+        return res.status(400).json({ error: 'invalid_profile_fields' });
+      }
+    }
+
+    if (!username || !first_name || !surname) {
+      return res.status(400).json({ error: 'invalid_profile_fields' });
+    }
+
+    const [result] = await promisePool.query(
+      `UPDATE user_account
+       SET profile_picture = ?, username = ?, first_name = ?, surname = ?, phone = ?
+       WHERE id = ?`,
+      [profile_picture, username, first_name, surname, phone, requestedUserId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ notFound: true, message: 'No se encontr\u00f3 el usuario.' });
+    }
+
+    const user = await fetchSanitizedUserById(requestedUserId);
+    return res.status(200).json({ message: 'Perfil actualizado exitosamente.', user });
+  } catch (err) {
+    if (err?.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'USERNAME_EXISTS' });
+    }
+
+    console.error('Error al actualizar el perfil del usuario:', err);
+    return res.status(500).json({ error: 'Error al actualizar el perfil del usuario.' });
+  }
+});
 //Ruta para actualizar account (ahora mismo solo actualiza email)
-app.put('/api/user/:id/email', async (req, res) => {
-  const { id } = req.params;
+app.put('/api/user/:id/email', authenticateToken, async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
 
   if (!email) {
@@ -4826,7 +4922,7 @@ app.put('/api/user/:id/email', async (req, res) => {
   try {
     const [users] = await promisePool.query(
       'SELECT auth_provider FROM user_account WHERE id = ? LIMIT 1',
-      [id]
+      [requestedUserId]
     );
 
     if (users.length === 0) {
@@ -4842,7 +4938,7 @@ app.put('/api/user/:id/email', async (req, res) => {
 
     const [result] = await promisePool.query(
       'UPDATE user_account SET email = ? WHERE id = ?',
-      [email, id]
+      [email, requestedUserId]
     );
 
     if (result.affectedRows > 0) {
@@ -4860,8 +4956,9 @@ app.put('/api/user/:id/email', async (req, res) => {
   }
 });
 // Ruta para actualizar el idioma preferido del usuario
-app.put('/api/user/:id/language', (req, res) => {
-  const { id } = req.params;
+app.put('/api/user/:id/language', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
   const { language } = req.body;
 
   if (typeof language !== 'string' || language.trim() === '') {
@@ -4880,7 +4977,7 @@ app.put('/api/user/:id/language', (req, res) => {
       WHERE id = ?;
     `;
 
-    connection.query(query, [language.trim(), id], (queryErr, result) => {
+    connection.query(query, [language.trim(), requestedUserId], (queryErr, result) => {
       connection.release();
 
       if (queryErr) {
@@ -4899,76 +4996,70 @@ app.put('/api/user/:id/language', (req, res) => {
 
 // Cambiar contraseña
 app.put('/api/user/:id/password', authenticateToken, async (req, res) => {
-  const { id } = req.params;
-  const { currentPassword, newPassword } = req.body;
+  const currentPassword = typeof req.body?.currentPassword === 'string' ? req.body.currentPassword : '';
+  const newPassword = typeof req.body?.newPassword === 'string' ? req.body.newPassword : '';
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
 
-  if (parseInt(id, 10) !== req.user.id) {
-    return res.status(403).json({ error: 'Acceso denegado' });
+  if (!currentPassword) {
+    return res.status(400).json({ error: 'invalid_password' });
   }
 
-  pool.getConnection(async (err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  if (isPasswordTooShort(newPassword)) {
+    return res.status(400).json({ error: 'PASSWORD_TOO_SHORT' });
+  }
+
+  try {
+    const [results] = await promisePool.query(
+      'SELECT password, auth_provider FROM user_account WHERE id = ? LIMIT 1',
+      [requestedUserId]
+    );
+
+    if (results.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado.' });
     }
 
-    connection.query('SELECT password, auth_provider FROM user_account WHERE id = ?', [id], async (err, results) => {
-      if (err) {
-        connection.release();
-        console.error('Error al obtener la contraseña:', err);
-        return res.status(500).json({ error: 'Error al obtener la contraseña.' });
-      }
-
-      if (results.length === 0) {
-        connection.release();
-        return res.status(404).json({ error: 'Usuario no encontrado.' });
-      }
-
-      if (results[0].auth_provider && results[0].auth_provider !== 'email') {
-        connection.release();
-        return res.status(409).json({
-          error: 'PASSWORD_CHANGE_NOT_AVAILABLE_FOR_PROVIDER',
-          auth_provider: results[0].auth_provider,
-        });
-      }
-
-      if (typeof results[0].password !== 'string' || !results[0].password) {
-        connection.release();
-        return res.status(400).json({ error: 'Contraseña actual incorrecta.' });
-      }
-
-      const match = await bcrypt.compare(currentPassword, results[0].password);
-      if (!match) {
-        connection.release();
-        return res.status(400).json({ error: 'Contraseña actual incorrecta.' });
-      }
-
-      const hashed = await bcrypt.hash(newPassword, 10);
-      connection.query('UPDATE user_account SET password = ? WHERE id = ?', [hashed, id], (err) => {
-        connection.release();
-        if (err) {
-          console.error('Error al actualizar la contraseña:', err);
-          return res.status(500).json({ error: 'Error al actualizar la contraseña.' });
-        }
-        res.json({ message: 'Contraseña actualizada con éxito.' });
+    if (results[0].auth_provider && results[0].auth_provider !== 'email') {
+      return res.status(409).json({
+        error: 'PASSWORD_CHANGE_NOT_AVAILABLE_FOR_PROVIDER',
+        auth_provider: results[0].auth_provider,
       });
+    }
+
+    if (typeof results[0].password !== 'string' || !results[0].password) {
+      return res.status(400).json({ error: 'Contrase\u00f1a actual incorrecta.' });
+    }
+
+    const match = await bcrypt.compare(currentPassword, results[0].password);
+    if (!match) {
+      return res.status(400).json({ error: 'Contrase\u00f1a actual incorrecta.' });
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await promisePool.query('UPDATE user_account SET password = ? WHERE id = ?', [hashed, requestedUserId]);
+    await revokeAllUserSessions(requestedUserId);
+
+    const user = await fetchSanitizedUserById(requestedUserId);
+    const tokens = await issueAuthTokens(requestedUserId, req);
+
+    return res.json({
+      message: 'Contrase\u00f1a actualizada con \u00e9xito.',
+      user,
+      ...tokens,
     });
-  });
+  } catch (err) {
+    console.error('Error al actualizar la contrase\u00f1a:', err);
+    return res.status(500).json({ error: 'Error al actualizar la contrase\u00f1a.' });
+  }
 });
 //Ruta para borrar una cuenta
-app.delete('/api/user/:id', async (req, res) => {
-  const requestedUserId = parseInt(req.params.id, 10);
+app.delete('/api/user/:id', authenticateToken, async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
   const authorizationCode = typeof req.body?.authorizationCode === 'string' ? req.body.authorizationCode.trim() : '';
   const identityToken = typeof req.body?.identityToken === 'string' ? req.body.identityToken.trim() : '';
   let connection;
 
-  if (!Number.isInteger(requestedUserId)) {
-    return res.status(400).json({ error: 'invalid_user_id' });
-  }
-
-  if (requestedUserId !== req.user.id) {
-    return res.status(403).json({ error: 'Acceso denegado' });
-  }
+  if (!requestedUserId) return;
 
   try {
     const [users] = await promisePool.query(
@@ -4977,7 +5068,7 @@ app.delete('/api/user/:id', async (req, res) => {
     );
 
     if (users.length === 0) {
-      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      return res.status(404).json({ notFound: true, message: 'No se encontr\u00f3 el usuario.' });
     }
 
     const account = users[0];
@@ -5002,18 +5093,48 @@ app.delete('/api/user/:id', async (req, res) => {
     connection = await promisePool.getConnection();
     await connection.beginTransaction();
 
+    const [ownedAddressRows] = await connection.query(
+      `SELECT address_id
+         FROM directions
+        WHERE user_id = ?
+       UNION
+       SELECT address_id
+         FROM user_address
+        WHERE user_id = ?
+       UNION
+       SELECT address_id
+         FROM collection_method
+        WHERE user_id = ? AND address_id IS NOT NULL`,
+      [requestedUserId, requestedUserId, requestedUserId]
+    );
+
+    const ownedAddressIds = ownedAddressRows
+      .map((row) => Number(row.address_id))
+      .filter((addressId) => Number.isInteger(addressId));
+
     await connection.query('DELETE FROM password_reset_codes WHERE user_id = ?', [requestedUserId]);
     await connection.query('DELETE FROM auth_session WHERE user_id = ?', [requestedUserId]);
+    await connection.query('DELETE FROM service_report WHERE reporter_user_id = ?', [requestedUserId]);
+    await connection.query('DELETE FROM payment_method WHERE user_id = ?', [requestedUserId]);
     await connection.query('DELETE FROM collection_method WHERE user_id = ?', [requestedUserId]);
 
-    const [result] = await connection.query(
-      'DELETE FROM user_account WHERE id = ?',
-      [requestedUserId]
-    );
+    const [result] = await connection.query('DELETE FROM user_account WHERE id = ?', [requestedUserId]);
 
     if (result.affectedRows === 0) {
       await connection.rollback();
-      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+      return res.status(404).json({ notFound: true, message: 'No se encontr\u00f3 el usuario.' });
+    }
+
+    if (ownedAddressIds.length > 0) {
+      const placeholders = ownedAddressIds.map(() => '?').join(', ');
+      await connection.query(
+        `DELETE a FROM address a
+          WHERE a.id IN (${placeholders})
+            AND NOT EXISTS (SELECT 1 FROM directions d WHERE d.address_id = a.id)
+            AND NOT EXISTS (SELECT 1 FROM user_address ua WHERE ua.address_id = a.id)
+            AND NOT EXISTS (SELECT 1 FROM collection_method cm WHERE cm.address_id = a.id)`,
+        ownedAddressIds
+      );
     }
 
     await connection.commit();
@@ -5054,10 +5175,10 @@ app.delete('/api/user/:id', async (req, res) => {
     }
   }
 });
-
 //Ruta para actualizar allow_notis de un usuario
-app.put('/api/user/:id/allow_notis', (req, res) => {
-  const { id } = req.params;  // ID del usuario
+app.put('/api/user/:id/allow_notis', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
   const { allow_notis } = req.body;  // Nuevo valor de `allow_notis`
 
   // Verificar que el valor de `allow_notis` sea válido (booleano)
@@ -5082,7 +5203,7 @@ app.put('/api/user/:id/allow_notis', (req, res) => {
       `;
 
     // Ejecutar la consulta
-    connection.query(query, [allow_notis, id], (err, result) => {
+    connection.query(query, [allow_notis, requestedUserId], (err, result) => {
       connection.release();  // Liberar la conexión después de usarla
 
       if (err) {
@@ -5101,8 +5222,9 @@ app.put('/api/user/:id/allow_notis', (req, res) => {
 });
 
 // Ruta para añadir un strike a un usuario
-app.post('/api/user/:id/strike', (req, res) => {
-  const { id } = req.params; // ID del usuario
+app.post('/api/user/:id/strike', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -5117,7 +5239,7 @@ app.post('/api/user/:id/strike', (req, res) => {
       WHERE id = ?;
     `;
 
-    connection.query(query, [id], (err, result) => {
+    connection.query(query, [requestedUserId], (err, result) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -5683,7 +5805,8 @@ app.patch('/api/bookings/:id/is_paid', (req, res) => {
 
 // Crear método de cobro y cuenta Stripe Connect
 app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
-  const { id } = req.params;
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
   const {
     full_name,
     date_of_birth,
@@ -5727,7 +5850,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
     }
 
     const userQuery = 'SELECT email, first_name, surname FROM user_account WHERE id = ?';
-    connection.query(userQuery, [id], async (userErr, userRes) => {
+    connection.query(userQuery, [requestedUserId], async (userErr, userRes) => {
       if (userErr) {
         connection.release();
         console.error('Error al obtener el usuario:', userErr);
@@ -5811,7 +5934,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
           const last4 = iban.slice(-4);
           connection.query(
             insertMethodQuery,
-            [id, 'iban', bank.id, last4, null, addrRes.insertId, full_name],
+            [requestedUserId, 'iban', bank.id, last4, null, addrRes.insertId, full_name],
             (cmErr) => {
               if (cmErr) {
                 connection.release();
@@ -5821,7 +5944,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
 
               const updateQuery =
                 'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1, professional_started_datetime = IF(is_professional = 1, professional_started_datetime, NOW()) WHERE id = ?';
-              connection.query(updateQuery, [date_of_birth, nif, phone, account.id, id], (updErr) => {
+              connection.query(updateQuery, [date_of_birth, nif, phone, account.id, requestedUserId], (updErr) => {
                 if (updErr) {
                   connection.release();
                   console.error('Error al actualizar el usuario:', updErr);
@@ -5829,7 +5952,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
                 }
 
                 const unhideQuery = 'UPDATE service SET is_hidden = 0 WHERE user_id = ? AND is_hidden = 1';
-                connection.query(unhideQuery, [id], (unhideErr) => {
+                connection.query(unhideQuery, [requestedUserId], (unhideErr) => {
                   connection.release();
                   if (unhideErr) {
                     console.error('Error al actualizar la visibilidad de los servicios del profesional:', unhideErr);
