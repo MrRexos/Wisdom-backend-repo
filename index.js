@@ -4922,6 +4922,132 @@ app.get('/api/user/:id', (req, res) => {
   });
 });
 
+app.get('/api/user/:id/private', authenticateToken, async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
+
+  try {
+    const user = await fetchSanitizedUserById(requestedUserId);
+
+    if (!user) {
+      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+    }
+
+    return res.status(200).json(user);
+  } catch (err) {
+    console.error('Error al obtener la información privada del usuario:', err);
+    return res.status(500).json({ error: 'Error al obtener la información privada del usuario.' });
+  }
+});
+
+app.post('/api/user/:id/resend-verification-email', authenticateToken, async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
+
+  try {
+    const [users] = await promisePool.query(
+      'SELECT email, auth_provider, is_verified FROM user_account WHERE id = ? LIMIT 1',
+      [requestedUserId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+    }
+
+    const user = users[0];
+
+    if (user.auth_provider !== 'email') {
+      return res.status(409).json({
+        error: 'VERIFICATION_NOT_AVAILABLE_FOR_PROVIDER',
+        auth_provider: user.auth_provider,
+      });
+    }
+
+    if (user.is_verified) {
+      return res.status(200).json({ message: 'User already verified.' });
+    }
+
+    const verifyToken = jwt.sign({ id: requestedUserId }, process.env.JWT_SECRET, { expiresIn: '1d' });
+    const url = process.env.BASE_URL + '/api/verify-email?token=' + verifyToken;
+
+    await transporter.sendMail({
+      from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
+      to: user.email,
+      subject: 'Confirm your Wisdom',
+      html: `
+            <!doctype html>
+            <html lang="en" style="background:#ffffff;">
+              <head>
+                <meta charset="utf-8">
+                <meta name="color-scheme" content="light only">
+                <meta name="viewport" content="width=device-width,initial-scale=1">
+                <title>Confirm your Wisdom</title>
+              </head>
+              <body style="margin:0;background:#ffffff;">
+                <div style="max-width:640px;margin:0 auto;padding:48px 24px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111827;">
+          
+                  <div style="font-size:24px;font-weight:600;letter-spacing:.6px;margin-bottom:32px;text-align:center;">
+                    WISDOM<sup style="font-size:12px;vertical-align:top;">Â®</sup>
+                  </div>
+          
+                  <h1 style="font-size:30px;font-weight:500;margin:0 0 16px;text-align:center;">Welcome to Wisdom</h1>
+          
+                  <p style="font-size:16px;line-height:1.55;max-width:420px;margin:0 auto 32px;text-align:center;">
+                    You've successfully sign up on Wisdom. Please confirm your email.
+                  </p>
+          
+                  <div style="text-align:center;margin-bottom:50px;">
+                    <a href="${url}"
+                       style="display:inline-block;padding:22px 100px;background:#111827;border-radius:14px;text-decoration:none;font-size:14px;font-weight:600;color:#ffffff;">
+                      Verify email
+                    </a>
+                  </div>
+          
+                  <hr style="border:none;height:1px;background-color:#f3f4f6;margin:70px 0;width:100%;" />
+          
+                  <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
+                    <tr>
+                      <td style="padding:0 10px;">
+                        <a href="https://wisdom-web.vercel.app/" aria-label="Wisdom web">
+                          <img src="${IMG_WISDOM}" width="37" height="37" alt="Wisdom"
+                               style="display:block;border:0;outline:none;text-decoration:none;" />
+                        </a>
+                      </td>
+                      <td style="padding:0 10px;">
+                        <a href="https://www.instagram.com/wisdom__app/" aria-label="Instagram">
+                          <img src="${IMG_INSTA}" width="37" height="37" alt="Instagram"
+                               style="display:block;border:0;outline:none;text-decoration:none;" />
+                        </a>
+                      </td>
+                      <td style="padding:0 10px;">
+                        <a href="https://x.com/wisdom_entity" aria-label="X">
+                          <img src="${IMG_X}" width="37" height="37" alt="X"
+                               style="display:block;border:0;outline:none;text-decoration:none;" />
+                        </a>
+                      </td>
+                    </tr>
+                  </table>
+          
+                  <div style="font-size:12px;color:#6b7280;line-height:1.4;text-align:center;">
+                    <a href="#" style="color:#6b7280;text-decoration:none;">Privacy Policy</a>
+                    &nbsp;Â·&nbsp;
+                    <a href="#" style="color:#6b7280;text-decoration:none;">Terms of Service</a>
+                    <br /><br />
+                    MatarÃ³, BCN, 08304
+                    <br /><br />
+                    This email was sent to ${user.email}
+                  </div>
+                </div>
+              </body>
+            </html>`
+    });
+
+    return res.status(200).json({ message: 'Verification email resent successfully.' });
+  } catch (err) {
+    console.error('Error al reenviar el correo de verificación:', err);
+    return res.status(503).json({ error: 'VERIFICATION_EMAIL_DELIVERY_FAILED' });
+  }
+});
 //Ruta para actualizar el profile
 app.put('/api/user/:id/profile', authenticateToken, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res);
