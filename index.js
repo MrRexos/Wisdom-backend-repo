@@ -4987,7 +4987,7 @@ app.post('/api/user/:id/resend-verification-email', authenticateToken, async (re
                 <div style="max-width:640px;margin:0 auto;padding:48px 24px;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111827;">
           
                   <div style="font-size:24px;font-weight:600;letter-spacing:.6px;margin-bottom:32px;text-align:center;">
-                    WISDOM<sup style="font-size:12px;vertical-align:top;">Â®</sup>
+                    WISDOM<sup style="font-size:12px;vertical-align:top;">®</sup>
                   </div>
           
                   <h1 style="font-size:30px;font-weight:500;margin:0 0 16px;text-align:center;">Welcome to Wisdom</h1>
@@ -5030,10 +5030,10 @@ app.post('/api/user/:id/resend-verification-email', authenticateToken, async (re
           
                   <div style="font-size:12px;color:#6b7280;line-height:1.4;text-align:center;">
                     <a href="#" style="color:#6b7280;text-decoration:none;">Privacy Policy</a>
-                    &nbsp;Â·&nbsp;
+                    &nbsp;·&nbsp;
                     <a href="#" style="color:#6b7280;text-decoration:none;">Terms of Service</a>
                     <br /><br />
-                    MatarÃ³, BCN, 08304
+                    Mataró, BCN, 08304
                     <br /><br />
                     This email was sent to ${user.email}
                   </div>
