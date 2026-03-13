@@ -109,6 +109,32 @@ transporter.verify().catch(err => {
   console.error('Nodemailer configuration error:', err);
 });
 
+const GUEST_ALLOWED_BROWSE_PATHS = [
+  /^\/api\/suggested_professional$/,
+  /^\/api\/category\/\d+\/services$/,
+  /^\/api\/services$/,
+  /^\/api\/service\/\d+$/,
+  /^\/api\/suggestions$/,
+];
+
+function getRequestPath(req) {
+  return `${req.baseUrl || ''}${req.path || ''}`;
+}
+
+function isGuestTokenPayload(payload) {
+  return payload?.guest === true && payload?.token_type === 'guest';
+}
+
+function isGuestAllowedRequest(req) {
+  const method = (req.method || '').toUpperCase();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    return false;
+  }
+
+  const requestPath = getRequestPath(req);
+  return GUEST_ALLOWED_BROWSE_PATHS.some((pattern) => pattern.test(requestPath));
+}
+
 // Middleware para verificar tokens JWT
 function authenticateToken(req, res, next) {
   const h = req.headers['authorization'] || '';
@@ -131,6 +157,24 @@ function authenticateToken(req, res, next) {
         .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="invalid token"')
         .json({ error: 'invalid_token' });
     }
+
+    if (isGuestTokenPayload(payload)) {
+      if (!isGuestAllowedRequest(req)) {
+        return res.status(403).json({ error: 'guest_not_allowed' });
+      }
+
+      req.user = {
+        id: null,
+        guest: true,
+        token_type: 'guest',
+        scope: payload.scope || 'browse:read',
+        guest_session_id: payload.guest_session_id || null,
+        exp: payload.exp,
+        iat: payload.iat,
+      };
+      return next();
+    }
+
     req.user = { id: payload.id || payload.sub, ...payload };
     next();
   });
@@ -1398,9 +1442,47 @@ async function fetchOwnedService(connection, serviceId, userId, { lock = false, 
 const cron = require('node-cron');
 const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '15m';
 const REFRESH_TOKEN_TTL_DAYS = parseInt(process.env.REFRESH_TOKEN_TTL_DAYS || '30', 10);
+const GUEST_ACCESS_TOKEN_TTL_MINUTES = (() => {
+  const value = Number(process.env.GUEST_ACCESS_TOKEN_TTL_MINUTES || '90');
+  if (Number.isFinite(value) && value > 0) {
+    return Math.min(Math.floor(value), 90);
+  }
+  return 90;
+})();
+const GUEST_ACCESS_TOKEN_TTL_SECONDS = GUEST_ACCESS_TOKEN_TTL_MINUTES * 60;
 
 function signAccessToken(payload) {
   return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+}
+
+function signGuestAccessToken(payload = {}) {
+  return jwt.sign(
+    {
+      ...payload,
+      guest: true,
+      token_type: 'guest',
+      scope: 'browse:read',
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: GUEST_ACCESS_TOKEN_TTL_SECONDS }
+  );
+}
+
+function issueGuestSession() {
+  const guestSessionId = typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : crypto.randomBytes(16).toString('hex');
+  const expiresAt = new Date(Date.now() + GUEST_ACCESS_TOKEN_TTL_SECONDS * 1000);
+  const accessToken = signGuestAccessToken({ guest_session_id: guestSessionId });
+
+  return {
+    guest: true,
+    access_token: accessToken,
+    token: accessToken,
+    expires_at: expiresAt.toISOString(),
+    expires_in_seconds: GUEST_ACCESS_TOKEN_TTL_SECONDS,
+    guest_session_id: guestSessionId,
+  };
 }
 
 function generateRefreshToken() {
@@ -1574,6 +1656,15 @@ const signupLimiter = createAuthRateLimiter({ windowMs: 30 * 60 * 1000, max: 5 }
 const socialAuthLimiter = createAuthRateLimiter({ windowMs: 10 * 60 * 1000, max: 15 });
 const forgotPasswordLimiter = createAuthRateLimiter({ windowMs: 15 * 60 * 1000, max: 5 });
 const resetPasswordLimiter = createAuthRateLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
+const guestSessionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.status(429).json({ error: 'GUEST_SESSION_RATE_LIMIT_EXCEEDED' });
+  },
+});
 
 
 
@@ -2546,6 +2637,15 @@ app.post('/api/token/refresh', async (req, res) => {
   } catch (e) {
     console.error('Error en refresh:', e);
     return res.status(500).json({ error: 'Error al refrescar tokens' });
+  }
+});
+
+app.post('/api/guest/session', guestSessionLimiter, async (req, res) => {
+  try {
+    return res.status(200).json(issueGuestSession());
+  } catch (error) {
+    console.error('Error creating guest session:', error);
+    return res.status(500).json({ error: 'guest_session_failed' });
   }
 });
 
@@ -8581,10 +8681,6 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
 });
-
-
-
-
 
 
 
