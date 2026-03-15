@@ -205,13 +205,11 @@
 
 ## Tabla: `service_category_type`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
-- `service_category_name` (VARCHAR(255), NOT NULL)
-- `description` (TEXT, NULL)
+- `category_key` (VARCHAR(255), NOT NULL)
 
 ## Tabla: `service_family`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
-- `service_family` (VARCHAR(255), NOT NULL)
-- `description` (TEXT, NULL)
+- `family_key` (VARCHAR(255), NOT NULL)
 
 ## Tabla: `service_image`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)

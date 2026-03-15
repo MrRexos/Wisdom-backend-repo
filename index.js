@@ -3180,7 +3180,7 @@ app.get('/api/service-family', (req, res) => {
     }
 
     // Consulta para obtener todos los registros de la tabla 'service_family'
-    const query = 'SELECT * FROM service_family';
+    const query = 'SELECT id, family_key FROM service_family ORDER BY id ASC';
 
     connection.query(query, (err, results) => {
       connection.release(); // Liberar la conexión después de usarla
@@ -3209,10 +3209,11 @@ app.get('/api/service-family/:id/categories', (req, res) => {
 
     // Consulta para obtener las categorías asociadas a un service_family
     const query = `
-      SELECT sc.id AS service_category_id, sct.id AS service_category_type_id, sct.service_category_name, sct.description
+      SELECT sc.id AS service_category_id, sct.id AS service_category_type_id, sct.category_key
       FROM service_category sc
       JOIN service_category_type sct ON sc.service_category_type_id = sct.id
       WHERE sc.service_family_id = ?
+      ORDER BY sc.id ASC
     `;
 
     connection.query(query, [id], (err, results) => {
@@ -3269,8 +3270,10 @@ app.get('/api/category/:id/services', async (req, res) => {
       user_account.language,
       COALESCE(review_data.review_count, 0) AS review_count,
       COALESCE(review_data.average_rating, 0) AS average_rating,
-      category_type.service_category_name,
-      family.service_family,
+      category_type.category_key,
+      family.family_key,
+      category_type.category_key AS service_category_name,
+      family.family_key AS service_family,
       tags_data.tags,
       images_data.images,
       language_data.languages
@@ -3440,6 +3443,16 @@ app.post('/api/service', (req, res) => {
     images,
     hobbies
   } = req.body;
+  const normalizedUserCanAsk = user_can_ask === undefined || user_can_ask === null ? true : Boolean(user_can_ask);
+  const normalizedUserCanConsult = user_can_consult === undefined || user_can_consult === null ? false : Boolean(user_can_consult);
+  const normalizedAllowDiscounts = allow_discounts === undefined || allow_discounts === null ? false : Boolean(allow_discounts);
+  const normalizedDiscountRate = normalizedAllowDiscounts ? discount_rate ?? null : null;
+  const normalizedPriceConsult = normalizedUserCanConsult ? price_consult ?? null : null;
+  const normalizedConsultViaProvide = normalizedUserCanConsult ? consult_via_provide ?? null : null;
+  const normalizedConsultViaUsername = normalizedUserCanConsult ? consult_via_username ?? null : null;
+  const normalizedConsultViaUrl = normalizedUserCanConsult ? consult_via_url ?? null : null;
+  const normalizedIsIndividual = is_individual === undefined || is_individual === null ? true : Boolean(is_individual);
+  const normalizedHobbies = typeof hobbies === 'string' && hobbies.trim().length > 0 ? hobbies : null;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -3500,7 +3513,7 @@ app.post('/api/service', (req, res) => {
             `;
             const serviceValues = [
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, isHiddenValue, null
+              action_rate, normalizedUserCanAsk, normalizedUserCanConsult, normalizedPriceConsult, consult_via_id, normalizedIsIndividual, normalizedAllowDiscounts, normalizedDiscountRate, normalizedHobbies, isHiddenValue, null
             ];
 
             connection.query(serviceQuery, serviceValues, (err, result) => {
@@ -3630,9 +3643,9 @@ app.post('/api/service', (req, res) => {
           };
 
           // 2.1. Insertar consult_via y continuar con insertService
-          if (user_can_consult) {
+          if (normalizedUserCanConsult) {
             const consultViaQuery = 'INSERT INTO consult_via (provider, username, url) VALUES (?, ?, ?)';
-            connection.query(consultViaQuery, [consult_via_provide, consult_via_username, consult_via_url], (err, result) => {
+            connection.query(consultViaQuery, [normalizedConsultViaProvide, normalizedConsultViaUsername, normalizedConsultViaUrl], (err, result) => {
               if (err) {
                 return connection.rollback(() => {
                   console.error('Error al insertar en la tabla consult_via:', err);
@@ -4428,9 +4441,10 @@ app.get('/api/service/:id', (req, res) => {
         END AS consult_via,
         -- Información de la categoría del servicio
         (SELECT JSON_OBJECT('id', sc.id,
-          'name', sct.service_category_name,
-          'description', sct.description,
-          'family', JSON_OBJECT('id', sf.id, 'name', sf.service_family, 'description', sf.description))
+          'service_category_id', sc.id,
+          'category_key', sct.category_key,
+          'name', sct.category_key,
+          'family', JSON_OBJECT('id', sf.id, 'family_key', sf.family_key, 'name', sf.family_key))
          FROM service_category sc
          JOIN service_family sf ON sc.service_family_id = sf.id
          JOIN service_category_type sct ON sc.service_category_type_id = sct.id
@@ -7765,7 +7779,11 @@ app.get('/api/suggestions', (req, res) => {
 
     // Consulta para obtener sugerencias de búsqueda, eliminando duplicados
     const searchQuery = `
-      SELECT s.service_title, ct.service_category_name, f.service_family, t.tag 
+      SELECT
+        s.service_title,
+        ct.category_key AS service_category_name,
+        f.family_key AS service_family,
+        t.tag
       FROM service s 
       LEFT JOIN service_category c ON s.service_category_id = c.id 
       LEFT JOIN service_family f ON c.service_family_id = f.id 
@@ -7775,8 +7793,8 @@ app.get('/api/suggestions', (req, res) => {
         s.is_hidden = 0
         AND (
           s.service_title LIKE ?
-          OR ct.service_category_name LIKE ?
-          OR f.service_family LIKE ?
+          OR ct.category_key LIKE ?
+          OR f.family_key LIKE ?
           OR t.tag LIKE ?
         )
       LIMIT 8
@@ -7875,8 +7893,8 @@ app.get('/api/services', async (req, res) => {
         orderClause = `ORDER BY
         CASE
           WHEN service.service_title LIKE ? THEN 1
-          WHEN category_type.service_category_name LIKE ? THEN 1
-          WHEN family.service_family LIKE ? THEN 1
+          WHEN category_type.category_key LIKE ? THEN 1
+          WHEN family.family_key LIKE ? THEN 1
           WHEN EXISTS (
             SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
           ) THEN 1
@@ -7897,8 +7915,8 @@ app.get('/api/services', async (req, res) => {
       orderClause = `ORDER BY
         CASE
           WHEN service.service_title LIKE ? THEN 1
-          WHEN category_type.service_category_name LIKE ? THEN 1
-          WHEN family.service_family LIKE ? THEN 1
+          WHEN category_type.category_key LIKE ? THEN 1
+          WHEN family.family_key LIKE ? THEN 1
           WHEN EXISTS (
             SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
           ) THEN 1
@@ -7945,8 +7963,10 @@ app.get('/api/services', async (req, res) => {
         user_account.language,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating,
-        category_type.service_category_name,
-        family.service_family,
+        category_type.category_key,
+        family.family_key,
+        category_type.category_key AS service_category_name,
+        family.family_key AS service_family,
         family.id AS service_family_id,
         tags_data.tags,
         images_data.images,
@@ -8008,8 +8028,8 @@ app.get('/api/services', async (req, res) => {
       WHERE service.is_hidden = 0
         AND (
           service.service_title LIKE ?
-          OR category_type.service_category_name LIKE ?
-          OR family.service_family LIKE ?
+          OR category_type.category_key LIKE ?
+          OR family.family_key LIKE ?
           OR EXISTS (
             SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
           )
@@ -8132,8 +8152,8 @@ app.get('/api/services/count', async (req, res) => {
     WHERE service.is_hidden = 0
       AND (
         service.service_title LIKE ?
-        OR category_type.service_category_name LIKE ?
-        OR family.service_family LIKE ?
+        OR category_type.category_key LIKE ?
+        OR family.family_key LIKE ?
         OR EXISTS (
           SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
         )
@@ -8200,8 +8220,10 @@ app.get('/api/services/:id', (req, res) => {
         user_account.language,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating,
-        category_type.service_category_name,
-        family.service_family,
+        category_type.category_key,
+        family.family_key,
+        category_type.category_key AS service_category_name,
+        family.family_key AS service_family,
         (SELECT JSON_ARRAYAGG(tag)
         FROM service_tags
         WHERE service_tags.service_id = service.id) AS tags,
@@ -8681,8 +8703,3 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 app.listen(port, () => {
   console.log(`Servidor escuchando en el puerto ${port}`);
 });
-
-
-
-
-
