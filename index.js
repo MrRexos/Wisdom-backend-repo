@@ -1404,7 +1404,7 @@ function mapOwnershipError(code) {
 }
 
 async function fetchOwnedService(connection, serviceId, userId, { lock = false, includePrice = false, includeConsult = false } = {}) {
-  const selectParts = ['s.*', 'ua.is_professional'];
+  const selectParts = ['s.*', 'ua.is_professional', 'ua.is_verified'];
   const joins = ['JOIN user_account ua ON s.user_id = ua.id'];
 
   if (includePrice) {
@@ -1772,12 +1772,20 @@ app.get('/api/verify-email', (req, res) => {
         return res.status(500).send('Error de conexión');
       }
       connection.query('UPDATE user_account SET is_verified = 1 WHERE id = ?', [userId], (updErr) => {
-        connection.release();
         if (updErr) {
+          connection.release();
           console.error('Error al verificar el usuario:', updErr);
           return res.status(500).send('Error al verificar el usuario');
         }
-        res.sendFile(path.join(__dirname, 'public', 'verify-success.html'));
+
+        connection.query('UPDATE service SET is_hidden = 0 WHERE user_id = ? AND is_hidden = 1', [userId], (serviceErr) => {
+          connection.release();
+          if (serviceErr) {
+            console.error('Error al activar los servicios del usuario verificado:', serviceErr);
+            return res.status(500).send('Error al actualizar los servicios del usuario');
+          }
+          res.sendFile(path.join(__dirname, 'public', 'verify-success.html'));
+        });
       });
     });
   });
@@ -3469,13 +3477,13 @@ app.post('/api/service', (req, res) => {
         return;
       }
 
-      const stripeAccountQuery = 'SELECT stripe_account_id FROM user_account WHERE id = ?';
+      const stripeAccountQuery = 'SELECT is_verified FROM user_account WHERE id = ?';
       connection.query(stripeAccountQuery, [user_id], (accountErr, accountResults) => {
         if (accountErr) {
           return connection.rollback(() => {
-            console.error('Error al consultar el método de cobro del profesional:', accountErr);
+            console.error('Error al consultar el estado del profesional:', accountErr);
             connection.release();
-            res.status(500).json({ error: 'Error al consultar el método de cobro.' });
+            res.status(500).json({ error: 'Error al consultar el estado del profesional.' });
           });
         }
 
@@ -3486,8 +3494,8 @@ app.post('/api/service', (req, res) => {
           });
         }
 
-        const hasStripeAccount = Boolean(accountResults[0]?.stripe_account_id);
-        const isHiddenValue = hasStripeAccount ? 0 : 1;
+        const isVerified = Boolean(accountResults[0]?.is_verified);
+        const isHiddenValue = isVerified ? 0 : 1;
 
         // 1. Insertar en la tabla 'price'
         const priceQuery = 'INSERT INTO price (price, price_type) VALUES (?, ?)';
@@ -3636,7 +3644,14 @@ app.post('/api/service', (req, res) => {
                   }
 
                   connection.release(); // Liberar conexión después del commit exitoso
-                  res.status(201).json({ message: 'Servicio creado con éxito.' });
+                  res.status(201).json({
+                    message: 'Servicio creado con éxito.',
+                    service_id,
+                    is_hidden: isHiddenValue,
+                    is_verified: isVerified,
+                    requires_email_verification: !isVerified,
+                    user_is_professional: true,
+                  });
                 });
               });
             });
@@ -3729,7 +3744,7 @@ app.delete('/api/services/:id', async (req, res) => {
   }
 });
 
-app.patch('/api/services/:id/visibility', async (req, res) => {
+app.patch('/api/services/:id/visibility', authenticateToken, async (req, res) => {
   const serviceId = Number(req.params.id);
   if (!Number.isInteger(serviceId) || serviceId <= 0) {
     return res.status(400).json({ error: 'invalid_service_id' });
@@ -3757,6 +3772,11 @@ app.patch('/api/services/:id/visibility', async (req, res) => {
       await connection.rollback();
       const mapped = mapOwnershipError(ownership.error);
       return res.status(mapped.status).json(mapped.body);
+    }
+
+    if (!isHidden && !ownership.service.is_verified) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'email_not_verified_for_visibility' });
     }
 
     await connection.query(
@@ -6284,16 +6304,8 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
                   return res.status(500).json({ error: 'Error al guardar la cuenta.' });
                 }
 
-                const unhideQuery = 'UPDATE service SET is_hidden = 0 WHERE user_id = ? AND is_hidden = 1';
-                connection.query(unhideQuery, [requestedUserId], (unhideErr) => {
-                  connection.release();
-                  if (unhideErr) {
-                    console.error('Error al actualizar la visibilidad de los servicios del profesional:', unhideErr);
-                    return res.status(500).json({ error: 'Error al actualizar los servicios del profesional.' });
-                  }
-
-                  res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
-                });
+                connection.release();
+                res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
               });
             }
           );
