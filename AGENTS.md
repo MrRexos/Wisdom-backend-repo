@@ -186,6 +186,7 @@
 - `latitude` (DECIMAL(10,8), NULL)
 - `longitude` (DECIMAL(11,8), NULL)
 - `action_rate` (INT, NULL)
+- `experience_years` (INT, NOT NULL, DEFAULLT 1)
 - `user_can_ask` (TINYINT(1), NOT NULL)
 - `user_can_consult` (TINYINT(1), NOT NULL)
 - `price_consult` (DECIMAL(8,2), NULL)

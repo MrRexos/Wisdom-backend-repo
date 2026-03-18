@@ -1383,6 +1383,14 @@ function parseIntegerInput(value, defaultValue, fieldName) {
   return parseNumberInput(value, defaultValue, fieldName, { allowNull: false, integer: true });
 }
 
+function parseExperienceYearsInput(value, defaultValue) {
+  const parsedValue = parseIntegerInput(value, defaultValue, 'experience_years');
+  if (![0, 1, 3, 5, 10].includes(parsedValue)) {
+    throw invalidInputError('invalid_experience_years');
+  }
+  return parsedValue;
+}
+
 function toMySQLDatetime(value) {
   if (!value) return null;
   const date = new Date(value);
@@ -3445,6 +3453,7 @@ app.post('/api/service', (req, res) => {
     is_individual,
     allow_discounts,
     discount_rate,
+    experience_years,
     languages,
     tags,
     experiences,
@@ -3461,6 +3470,12 @@ app.post('/api/service', (req, res) => {
   const normalizedConsultViaUrl = normalizedUserCanConsult ? consult_via_url ?? null : null;
   const normalizedIsIndividual = is_individual === undefined || is_individual === null ? true : Boolean(is_individual);
   const normalizedHobbies = typeof hobbies === 'string' && hobbies.trim().length > 0 ? hobbies : null;
+  let normalizedExperienceYears;
+  try {
+    normalizedExperienceYears = parseExperienceYearsInput(experience_years, 1);
+  } catch (parseError) {
+    return res.status(parseError.status || 400).json({ error: parseError.message || 'invalid_experience_years' });
+  }
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -3516,12 +3531,12 @@ app.post('/api/service', (req, res) => {
             // 3. Insertar en la tabla 'service'
             const serviceQuery = `
               INSERT INTO service (
-                service_title, user_id, description, service_category_id, price_id, latitude, longitude, action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, service_created_datetime, is_hidden, last_edit_datetime
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
+                service_title, user_id, description, service_category_id, price_id, latitude, longitude, action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, experience_years, service_created_datetime, is_hidden, last_edit_datetime
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
             `;
             const serviceValues = [
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, normalizedUserCanAsk, normalizedUserCanConsult, normalizedPriceConsult, consult_via_id, normalizedIsIndividual, normalizedAllowDiscounts, normalizedDiscountRate, normalizedHobbies, isHiddenValue, null
+              action_rate, normalizedUserCanAsk, normalizedUserCanConsult, normalizedPriceConsult, consult_via_id, normalizedIsIndividual, normalizedAllowDiscounts, normalizedDiscountRate, normalizedHobbies, normalizedExperienceYears, isHiddenValue, null
             ];
 
             connection.query(serviceQuery, serviceValues, (err, result) => {
@@ -3957,6 +3972,7 @@ app.put('/api/services/:id', async (req, res) => {
     let isIndividual;
     let allowDiscounts;
     let discountRate;
+    let experienceYears;
     let hobbies;
     let isHidden;
     let consultProvider;
@@ -4014,6 +4030,7 @@ app.put('/api/services/:id', async (req, res) => {
       isIndividual = parseBooleanInput(body.is_individual, Boolean(service.is_individual), 'is_individual');
       allowDiscounts = parseBooleanInput(body.allow_discounts, Boolean(service.allow_discounts), 'allow_discounts');
       discountRate = parseNumberInput(body.discount_rate, service.discount_rate, 'discount_rate');
+      experienceYears = parseExperienceYearsInput(body.experience_years, service.experience_years ?? 1);
       hobbies = body.hobbies !== undefined ? body.hobbies : service.hobbies;
       if (hobbies !== undefined && hobbies !== null) {
         hobbies = String(hobbies);
@@ -4060,6 +4077,7 @@ app.put('/api/services/:id', async (req, res) => {
               is_individual = ?,
               allow_discounts = ?,
               discount_rate = ?,
+              experience_years = ?,
               hobbies = ?,
               is_hidden = ?,
               last_edit_datetime = NOW()
@@ -4078,6 +4096,7 @@ app.put('/api/services/:id', async (req, res) => {
         isIndividual ? 1 : 0,
         allowDiscounts ? 1 : 0,
         discountRate,
+        experienceYears,
         hobbies,
         isHidden ? 1 : 0,
         serviceId
@@ -4377,6 +4396,7 @@ app.get('/api/service/:id', (req, res) => {
         s.allow_discounts,
         s.discount_rate,
         s.hobbies,
+        s.experience_years,
         p.price,
         p.price_type,
         ua.id AS user_id,
@@ -4833,6 +4853,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.experience_years,
         service.is_hidden,
         service.service_created_datetime,
         service.last_edit_datetime,
