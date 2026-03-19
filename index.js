@@ -94,10 +94,11 @@ const instagramLogoCid = 'instagram_logo';
 const twitterLogoCid = 'twitter_logo';
 
 // Configuración de transporte para enviar correos.
+const emailPort = Number(process.env.EMAIL_PORT || 587);
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST,
-  port: process.env.EMAIL_PORT,
-  secure: false,
+  port: emailPort,
+  secure: emailPort === 465,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
