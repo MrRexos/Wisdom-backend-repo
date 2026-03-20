@@ -1748,7 +1748,7 @@ cron.schedule('0 3 * * *', async () => {
       LEFT JOIN payments p
         ON p.booking_id = b.id AND p.type = 'deposit'
       WHERE b.booking_status = 'pending_deposit'
-        AND b.created_at < (NOW() - INTERVAL 24 HOUR)
+        AND b.order_datetime < (NOW() - INTERVAL 24 HOUR)
         AND (p.id IS NULL OR p.status IN ('requires_payment_method','canceled','payment_failed'));
     `);
     console.log('[CRON] Limpieza de reservas pending_deposit ejecutada');
