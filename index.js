@@ -94,21 +94,186 @@ const instagramLogoCid = 'instagram_logo';
 const twitterLogoCid = 'twitter_logo';
 
 // Configuración de transporte para enviar correos.
+const emailProvider = (process.env.EMAIL_PROVIDER || (process.env.BREVO_API_KEY ? 'brevo' : 'smtp'))
+  .trim()
+  .toLowerCase();
+const configuredEmailFrom = (process.env.EMAIL_FROM || '').trim();
+const defaultSmtpEmailFrom = '"Wisdom" <wisdom.helpcontact@gmail.com>';
+const configuredEmailReplyTo = (process.env.EMAIL_REPLY_TO || '').trim();
+const brevoApiKey = (process.env.BREVO_API_KEY || '').trim();
+const brevoApiBaseUrl = (process.env.BREVO_API_BASE_URL || 'https://api.brevo.com/v3').trim().replace(/\/+$/, '');
 const emailPort = Number(process.env.EMAIL_PORT || 587);
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST,
-  port: emailPort,
-  secure: emailPort === 465,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+const smtpTransporter = emailProvider === 'smtp'
+  ? nodemailer.createTransport({
+      host: process.env.EMAIL_HOST,
+      port: emailPort,
+      secure: emailPort === 465,
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+      },
+    })
+  : null;
 
-// Comprobar la configuración del transporte al iniciar la aplicación
-transporter.verify().catch(err => {
-  console.error('Nodemailer configuration error:', err);
-});
+function normalizeEmailRecipients(to) {
+  if (Array.isArray(to)) {
+    return to.map(value => String(value || '').trim()).filter(Boolean);
+  }
+
+  if (typeof to === 'string') {
+    const normalized = to.trim();
+    return normalized ? [normalized] : [];
+  }
+
+  return [];
+}
+
+function buildEmailPayload(message = {}) {
+  const payload = {
+    ...message,
+    from: typeof message.from === 'string' && message.from.trim()
+      ? message.from.trim()
+      : (configuredEmailFrom || defaultSmtpEmailFrom),
+  };
+
+  if (!payload.replyTo && configuredEmailReplyTo) {
+    payload.replyTo = configuredEmailReplyTo;
+  }
+
+  return payload;
+}
+
+function parseMailbox(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) {
+    return { email: '', name: '' };
+  }
+
+  const match = normalized.match(/^(.+?)\s*<([^<>]+)>$/);
+  if (match) {
+    return {
+      name: match[1].trim().replace(/^"|"$/g, ''),
+      email: match[2].trim(),
+    };
+  }
+
+  return { email: normalized, name: '' };
+}
+
+function toBrevoRecipient(value) {
+  const mailbox = parseMailbox(value);
+  if (!mailbox.email) {
+    return null;
+  }
+
+  const recipient = { email: mailbox.email };
+  if (mailbox.name) {
+    recipient.name = mailbox.name;
+  }
+  return recipient;
+}
+
+async function sendEmailWithBrevo(message) {
+  if (!brevoApiKey) {
+    throw new Error('BREVO_API_KEY missing');
+  }
+
+  if (!configuredEmailFrom) {
+    throw new Error('EMAIL_FROM missing');
+  }
+
+  const payload = buildEmailPayload(message);
+  const recipients = normalizeEmailRecipients(payload.to).map(toBrevoRecipient).filter(Boolean);
+  if (recipients.length === 0) {
+    throw new Error('Email recipients missing');
+  }
+
+  const senderMailbox = parseMailbox(payload.from);
+  if (!senderMailbox.email) {
+    throw new Error('EMAIL_FROM invalid');
+  }
+
+  const brevoPayload = {
+    sender: {
+      email: senderMailbox.email,
+    },
+    to: recipients,
+    subject: payload.subject,
+  };
+
+  if (senderMailbox.name) {
+    brevoPayload.sender.name = senderMailbox.name;
+  }
+
+  if (typeof payload.text === 'string' && payload.text.trim()) {
+    brevoPayload.textContent = payload.text;
+  }
+
+  if (typeof payload.html === 'string' && payload.html.trim()) {
+    brevoPayload.htmlContent = payload.html;
+  }
+
+  if (payload.replyTo) {
+    const replyToMailbox = parseMailbox(payload.replyTo);
+    if (replyToMailbox.email) {
+      brevoPayload.replyTo = { email: replyToMailbox.email };
+      if (replyToMailbox.name) {
+        brevoPayload.replyTo.name = replyToMailbox.name;
+      }
+    }
+  }
+
+  if (payload.headers && typeof payload.headers === 'object' && Object.keys(payload.headers).length > 0) {
+    brevoPayload.headers = payload.headers;
+  }
+
+  try {
+    const response = await axios.post(`${brevoApiBaseUrl}/smtp/email`, brevoPayload, {
+      headers: {
+        'accept': 'application/json',
+        'api-key': brevoApiKey,
+        'Content-Type': 'application/json',
+      },
+      timeout: 15000,
+    });
+
+    return response.data;
+  } catch (error) {
+    const details = error?.response?.data || error?.message || error;
+    console.error('Brevo email error:', details);
+    throw error;
+  }
+}
+
+async function sendEmail(message) {
+  const payload = buildEmailPayload(message);
+
+  if (emailProvider === 'brevo') {
+    return sendEmailWithBrevo(payload);
+  }
+
+  if (!smtpTransporter) {
+    throw new Error(`Unsupported email provider: ${emailProvider}`);
+  }
+
+  return smtpTransporter.sendMail(payload);
+}
+
+if (emailProvider === 'smtp') {
+  smtpTransporter.verify().catch(err => {
+    console.error('Nodemailer configuration error:', err);
+  });
+} else if (emailProvider === 'brevo') {
+  const missingBrevoConfig = [];
+  if (!brevoApiKey) missingBrevoConfig.push('BREVO_API_KEY');
+  if (!configuredEmailFrom) missingBrevoConfig.push('EMAIL_FROM');
+
+  if (missingBrevoConfig.length > 0) {
+    console.error(`Brevo configuration error: missing ${missingBrevoConfig.join(', ')}`);
+  }
+} else {
+  console.error(`Unsupported EMAIL_PROVIDER configured: ${emailProvider}`);
+}
 
 const GUEST_ALLOWED_BROWSE_PATHS = [
   /^\/api\/suggested_professional$/,
@@ -1003,7 +1168,7 @@ async function sendEmailToAll(pool, transporter, options = {}) {
 
   for (const email of targetRecipients) {
     try {
-      await transporter.sendMail({
+      await sendEmail({
         from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
         to: email,
         subject,
@@ -1936,7 +2101,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
     try {
       const verifyToken = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1d' });
       const url = process.env.BASE_URL + '/api/verify-email?token=' + verifyToken;
-      await transporter.sendMail({
+      await sendEmail({
         from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
         to: email,
         subject: 'Confirm your Wisdom',
@@ -2432,7 +2597,7 @@ app.post('/api/forgot-password', forgotPasswordLimiter, async (req, res) => {
     );
 
     try {
-      await transporter.sendMail({
+      await sendEmail({
         from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
         to: account.email,
         subject: 'Reset your password for Wisdom',
@@ -5126,7 +5291,7 @@ app.post('/api/user/:id/resend-verification-email', authenticateToken, async (re
     const verifyToken = jwt.sign({ id: requestedUserId }, process.env.JWT_SECRET, { expiresIn: '1d' });
     const url = process.env.BASE_URL + '/api/verify-email?token=' + verifyToken;
 
-    await transporter.sendMail({
+    await sendEmail({
       from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
       to: user.email,
       subject: 'Confirm your Wisdom',
@@ -8653,7 +8818,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         if (depositNotification) {
           try {
             const { subject, text, html } = renderDepositReservationEmail(depositNotification);
-            await transporter.sendMail({
+            await sendEmail({
               from: '"Wisdom" <wisdom.helpcontact@gmail.com>',
               to: 'hernanz.reio@gmail.com',
               subject,
