@@ -503,6 +503,8 @@ function extractServiceFilters(query) {
   const minRating = parseQueryNumber(query.min_rating ?? query.rating_min);
   const requireCompany = parseQueryBoolean(query.require_company ?? query.company_profile ?? query.company_only);
   const requireVerified = parseQueryBoolean(query.require_verified ?? query.verified_only);
+  const inPersonOnly = parseQueryBoolean(query.in_person_only ?? query.presential_only ?? query.onsite_only);
+  const onlineOnly = parseQueryBoolean(query.online_only ?? query.remote_only);
   const languages = parseQueryStringArray(query.languages ?? query.language ?? query.lang);
   const categoryIds = parseQueryStringArray(query.category_ids ?? query.categoryIds ?? query.categories);
   const serviceFamilyId = parseQueryNumber(query.service_family_id ?? query.family_id ?? query.family ?? query.serviceFamilyId);
@@ -518,6 +520,8 @@ function extractServiceFilters(query) {
     minRating,
     requireCompany,
     requireVerified,
+    inPersonOnly,
+    onlineOnly,
     languages,
     categoryIds,
     serviceFamilyId,
@@ -545,6 +549,8 @@ function buildServiceFilterClause(filters, {
     minRating,
     requireCompany,
     requireVerified,
+    inPersonOnly,
+    onlineOnly,
     languages,
     categoryIds,
     serviceFamilyId,
@@ -602,6 +608,17 @@ function buildServiceFilterClause(filters, {
     clauses.push(`${userAlias}.is_verified = 1`);
   }
 
+  if (inPersonOnly && !onlineOnly) {
+    clauses.push(`${serviceAlias}.latitude IS NOT NULL`);
+    clauses.push(`${serviceAlias}.longitude IS NOT NULL`);
+  } else if (onlineOnly && !inPersonOnly) {
+    clauses.push(`(
+      ${serviceAlias}.user_can_consult = 1
+      OR ${serviceAlias}.latitude IS NULL
+      OR ${serviceAlias}.longitude IS NULL
+    )`);
+  }
+
   if (languages && languages.length > 0) {
     const placeholders = languages.map(() => '?').join(', ');
     clauses.push(`EXISTS (SELECT 1 FROM service_language sl WHERE sl.service_id = ${serviceAlias}.id AND sl.language IN (${placeholders}))`);
@@ -631,7 +648,8 @@ function buildServiceFilterClause(filters, {
   }
 
   const hasDistanceContext = Number.isFinite(maxDistanceKm) && distanceExpression && distanceExpression.sql;
-  if (hasDistanceContext) {
+  const shouldApplyDistanceFilter = hasDistanceContext && !(onlineOnly && !inPersonOnly);
+  if (shouldApplyDistanceFilter) {
     clauses.push(`(
       ${serviceAlias}.latitude IS NOT NULL
       AND ${serviceAlias}.longitude IS NOT NULL
@@ -8046,6 +8064,109 @@ app.get('/api/suggestions', (req, res) => {
       }
     );
   });
+});
+
+app.get('/api/services/filter-categories', async (req, res) => {
+  const searchTerm = (req.query.query || '').trim();
+  const hasSearchTerm = searchTerm.length > 0;
+  const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
+  const categoryId = parseQueryNumber(req.query.category_id ?? req.query.categoryId ?? req.query.category);
+  const limitRaw = parseQueryNumber(req.query.limit);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.trunc(limitRaw), 1), 12) : 8;
+
+  try {
+    const filters = extractServiceFilters(req.query);
+    let resolvedFamilyId = Number.isFinite(filters.serviceFamilyId) ? Number(filters.serviceFamilyId) : null;
+
+    if (!Number.isFinite(resolvedFamilyId) && Number.isFinite(categoryId)) {
+      const [[categoryRow]] = await promisePool.query(
+        'SELECT service_family_id FROM service_category WHERE id = ? LIMIT 1',
+        [categoryId]
+      );
+      const familyCandidate = categoryRow?.service_family_id;
+      resolvedFamilyId = Number.isFinite(Number(familyCandidate)) ? Number(familyCandidate) : null;
+    }
+
+    const recommendationFilters = {
+      ...filters,
+      categoryIds: [],
+      serviceFamilyId: Number.isFinite(resolvedFamilyId) ? resolvedFamilyId : filters.serviceFamilyId,
+    };
+
+    const distanceExpression = buildDistanceExpression({
+      latColumn: 'service.latitude',
+      lngColumn: 'service.longitude',
+      originLat: recommendationFilters.originLat,
+      originLng: recommendationFilters.originLng,
+    });
+    const filtersClause = buildServiceFilterClause(recommendationFilters, { distanceExpression });
+
+    const queryRecommendedCategories = `
+      SELECT
+        category.id AS service_category_id,
+        category.service_family_id,
+        category_type.id AS service_category_type_id,
+        category_type.category_key AS service_category_name,
+        family.family_key AS service_family_name,
+        COUNT(DISTINCT service.id) AS matching_services
+      FROM service
+      JOIN price ON service.price_id = price.id
+      JOIN user_account ON service.user_id = user_account.id
+      JOIN service_category category ON service.service_category_id = category.id
+      JOIN service_family family ON category.service_family_id = family.id
+      JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          COUNT(*) AS review_count,
+          AVG(rating) AS average_rating
+        FROM review
+        GROUP BY service_id
+      ) AS review_data ON service.id = review_data.service_id
+      WHERE service.is_hidden = 0
+        AND (
+          service.service_title LIKE ?
+          OR category_type.category_key LIKE ?
+          OR family.family_key LIKE ?
+          OR EXISTS (
+            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+          )
+          OR service.description LIKE ?
+        )
+        ${filtersClause.sql}
+      GROUP BY
+        category.id,
+        category.service_family_id,
+        category_type.id,
+        category_type.category_key,
+        family.family_key
+      ORDER BY
+        CASE
+          WHEN ? <> '' AND category_type.category_key LIKE ? THEN 0
+          WHEN ? <> '' AND family.family_key LIKE ? THEN 1
+          ELSE 2
+        END,
+        matching_services DESC,
+        category_type.category_key ASC
+      LIMIT ?;
+    `;
+
+    const params = [
+      ...new Array(5).fill(searchPattern),
+      ...filtersClause.params,
+      searchTerm,
+      searchPattern,
+      searchTerm,
+      searchPattern,
+      limit,
+    ];
+
+    const [rows] = await promisePool.query(queryRecommendedCategories, params);
+    return res.status(200).json(Array.isArray(rows) ? rows : []);
+  } catch (error) {
+    console.error('Error al obtener las categorías recomendadas:', error);
+    return res.status(500).json({ error: 'Error al obtener las categorías recomendadas.' });
+  }
 });
 
 //Ruta para obtener todos los servicios de una busqueda
