@@ -8077,6 +8077,18 @@ app.get('/api/services/filter-categories', async (req, res) => {
   try {
     const filters = extractServiceFilters(req.query);
     let resolvedFamilyId = Number.isFinite(filters.serviceFamilyId) ? Number(filters.serviceFamilyId) : null;
+    const mergedRows = [];
+    const seenCategoryIds = new Set();
+    const addRows = (rows = []) => {
+      rows.forEach((row) => {
+        const numericId = Number(row?.service_category_id);
+        if (!Number.isFinite(numericId) || seenCategoryIds.has(numericId) || mergedRows.length >= limit) {
+          return;
+        }
+        seenCategoryIds.add(numericId);
+        mergedRows.push(row);
+      });
+    };
 
     if (!Number.isFinite(resolvedFamilyId) && Number.isFinite(categoryId)) {
       const [[categoryRow]] = await promisePool.query(
@@ -8161,8 +8173,120 @@ app.get('/api/services/filter-categories', async (req, res) => {
       limit,
     ];
 
-    const [rows] = await promisePool.query(queryRecommendedCategories, params);
-    return res.status(200).json(Array.isArray(rows) ? rows : []);
+    const [strictRowsRaw] = await promisePool.query(queryRecommendedCategories, params);
+    const strictRows = Array.isArray(strictRowsRaw) ? strictRowsRaw : [];
+    addRows(strictRows);
+
+    const relatedFamilyIds = [];
+    const relatedFamilySet = new Set();
+    const pushFamilyId = (value) => {
+      const numericFamilyId = Number(value);
+      if (!Number.isFinite(numericFamilyId) || relatedFamilySet.has(numericFamilyId)) return;
+      relatedFamilySet.add(numericFamilyId);
+      relatedFamilyIds.push(numericFamilyId);
+    };
+
+    if (Number.isFinite(resolvedFamilyId)) {
+      pushFamilyId(resolvedFamilyId);
+    }
+    strictRows.forEach((row) => pushFamilyId(row?.service_family_id));
+
+    if (mergedRows.length < limit && relatedFamilyIds.length > 0) {
+      const broaderFilters = {
+        ...recommendationFilters,
+        serviceFamilyId: null,
+        categoryIds: [],
+      };
+      const broaderFiltersClause = buildServiceFilterClause(broaderFilters, { distanceExpression });
+      const familyPlaceholders = relatedFamilyIds.map(() => '?').join(', ');
+      const selectedCategoryId = Number.isFinite(categoryId) ? Number(categoryId) : -1;
+      const broaderQuery = `
+        SELECT
+          category.id AS service_category_id,
+          category.service_family_id,
+          category_type.id AS service_category_type_id,
+          category_type.category_key AS service_category_name,
+          family.family_key AS service_family_name,
+          COUNT(DISTINCT service.id) AS matching_services
+        FROM service
+        JOIN price ON service.price_id = price.id
+        JOIN user_account ON service.user_id = user_account.id
+        JOIN service_category category ON service.service_category_id = category.id
+        JOIN service_family family ON category.service_family_id = family.id
+        JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+        LEFT JOIN (
+          SELECT
+            service_id,
+            COUNT(*) AS review_count,
+            AVG(rating) AS average_rating
+          FROM review
+          GROUP BY service_id
+        ) AS review_data ON service.id = review_data.service_id
+        WHERE service.is_hidden = 0
+          AND family.id IN (${familyPlaceholders})
+          ${broaderFiltersClause.sql}
+        GROUP BY
+          category.id,
+          category.service_family_id,
+          category_type.id,
+          category_type.category_key,
+          family.family_key
+        ORDER BY
+          CASE
+            WHEN category.id = ? THEN 0
+            ELSE 1
+          END,
+          matching_services DESC,
+          category_type.category_key ASC
+        LIMIT ?;
+      `;
+
+      const broaderParams = [
+        ...relatedFamilyIds,
+        ...broaderFiltersClause.params,
+        selectedCategoryId,
+        limit,
+      ];
+
+      const [broaderRowsRaw] = await promisePool.query(broaderQuery, broaderParams);
+      addRows(Array.isArray(broaderRowsRaw) ? broaderRowsRaw : []);
+    }
+
+    if (mergedRows.length < limit && relatedFamilyIds.length > 0) {
+      const familyPlaceholders = relatedFamilyIds.map(() => '?').join(', ');
+      const selectedCategoryId = Number.isFinite(categoryId) ? Number(categoryId) : -1;
+      const catalogQuery = `
+        SELECT
+          sc.id AS service_category_id,
+          sc.service_family_id,
+          sct.id AS service_category_type_id,
+          sct.category_key AS service_category_name,
+          sf.family_key AS service_family_name,
+          0 AS matching_services
+        FROM service_category sc
+        JOIN service_category_type sct ON sc.service_category_type_id = sct.id
+        JOIN service_family sf ON sc.service_family_id = sf.id
+        WHERE sc.service_family_id IN (${familyPlaceholders})
+        ORDER BY
+          CASE
+            WHEN sc.id = ? THEN 0
+            ELSE 1
+          END,
+          sct.category_key ASC
+        LIMIT ?;
+      `;
+
+      const catalogParams = [
+        ...relatedFamilyIds,
+        selectedCategoryId,
+        limit * 2,
+      ];
+
+      const [catalogRowsRaw] = await promisePool.query(catalogQuery, catalogParams);
+      addRows(Array.isArray(catalogRowsRaw) ? catalogRowsRaw : []);
+    }
+
+    return res.status(200).json(mergedRows);
   } catch (error) {
     console.error('Error al obtener las categorías recomendadas:', error);
     return res.status(500).json({ error: 'Error al obtener las categorías recomendadas.' });
