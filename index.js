@@ -507,7 +507,8 @@ function extractServiceFilters(query) {
   const onlineOnly = parseQueryBoolean(query.online_only ?? query.remote_only);
   const languages = parseQueryStringArray(query.languages ?? query.language ?? query.lang);
   const categoryIds = parseQueryStringArray(query.category_ids ?? query.categoryIds ?? query.categories);
-  const serviceFamilyId = parseQueryNumber(query.service_family_id ?? query.family_id ?? query.family ?? query.serviceFamilyId);
+  const serviceFamilyIds = parseQueryStringArray(query.family_ids ?? query.familyIds ?? query.families ?? query.service_family_ids ?? query.serviceFamilyIds ?? query.service_family_id ?? query.family_id ?? query.family ?? query.serviceFamilyId);
+  const serviceFamilyId = serviceFamilyIds.length > 0 ? parseQueryNumber(serviceFamilyIds[0]) : null;
   const maxDistanceKm = parseQueryNumber(query.max_distance_km ?? query.distance_km ?? query.distance ?? query.distance_max ?? query.maxDistance);
   const originLat = parseQueryNumber(query.origin_lat ?? query.originLat ?? query.latitude ?? query.lat);
   const originLng = parseQueryNumber(query.origin_lng ?? query.originLng ?? query.longitude ?? query.lng);
@@ -524,6 +525,7 @@ function extractServiceFilters(query) {
     onlineOnly,
     languages,
     categoryIds,
+    serviceFamilyIds,
     serviceFamilyId,
     maxDistanceKm,
     originLat,
@@ -553,6 +555,7 @@ function buildServiceFilterClause(filters, {
     onlineOnly,
     languages,
     categoryIds,
+    serviceFamilyIds,
     serviceFamilyId,
     maxDistanceKm,
     originLat,
@@ -633,18 +636,39 @@ function buildServiceFilterClause(filters, {
       })
       .filter((value) => value !== null)
     : [];
+  const numericFamilyIds = Array.isArray(serviceFamilyIds)
+    ? serviceFamilyIds
+      .map((value) => {
+        const num = Number(value);
+        return Number.isFinite(num) ? num : null;
+      })
+      .filter((value) => value !== null)
+    : [];
 
-  if (numericCategoryIds.length > 0) {
-    const placeholders = numericCategoryIds.map(() => '?').join(', ');
-    clauses.push(`${serviceAlias}.service_category_id IN (${placeholders})`);
-    params.push(...numericCategoryIds);
-  }
+  if (numericCategoryIds.length > 0 || numericFamilyIds.length > 0 || Number.isFinite(serviceFamilyId)) {
+    const taxonomyConditions = [];
 
-  if (Number.isFinite(serviceFamilyId)) {
-    clauses.push(`${serviceAlias}.service_category_id IN (
-      SELECT id FROM service_category WHERE service_family_id = ?
-    )`);
-    params.push(serviceFamilyId);
+    if (numericCategoryIds.length > 0) {
+      const placeholders = numericCategoryIds.map(() => '?').join(', ');
+      taxonomyConditions.push(`${serviceAlias}.service_category_id IN (${placeholders})`);
+      params.push(...numericCategoryIds);
+    }
+
+    const effectiveFamilyIds = numericFamilyIds.length > 0
+      ? numericFamilyIds
+      : (Number.isFinite(serviceFamilyId) ? [serviceFamilyId] : []);
+
+    if (effectiveFamilyIds.length > 0) {
+      const placeholders = effectiveFamilyIds.map(() => '?').join(', ');
+      taxonomyConditions.push(`${serviceAlias}.service_category_id IN (
+        SELECT id FROM service_category WHERE service_family_id IN (${placeholders})
+      )`);
+      params.push(...effectiveFamilyIds);
+    }
+
+    if (taxonomyConditions.length > 0) {
+      clauses.push(`(${taxonomyConditions.join(' OR ')})`);
+    }
   }
 
   const hasDistanceContext = Number.isFinite(maxDistanceKm) && distanceExpression && distanceExpression.sql;
@@ -8076,33 +8100,50 @@ app.get('/api/services/filter-categories', async (req, res) => {
 
   try {
     const filters = extractServiceFilters(req.query);
-    let resolvedFamilyId = Number.isFinite(filters.serviceFamilyId) ? Number(filters.serviceFamilyId) : null;
     const mergedRows = [];
-    const seenCategoryIds = new Set();
-    const addRows = (rows = []) => {
+    const seenSuggestionIds = new Set();
+    const addRows = (rows = [], suggestionType = 'category') => {
       rows.forEach((row) => {
-        const numericId = Number(row?.service_category_id);
-        if (!Number.isFinite(numericId) || seenCategoryIds.has(numericId) || mergedRows.length >= limit) {
+        const numericId = suggestionType === 'family'
+          ? Number(row?.service_family_id)
+          : Number(row?.service_category_id);
+        const uniqueKey = `${suggestionType}:${numericId}`;
+        if (!Number.isFinite(numericId) || seenSuggestionIds.has(uniqueKey) || mergedRows.length >= limit) {
           return;
         }
-        seenCategoryIds.add(numericId);
-        mergedRows.push(row);
+        seenSuggestionIds.add(uniqueKey);
+        mergedRows.push({ ...row, suggestion_type: suggestionType });
       });
     };
 
-    if (!Number.isFinite(resolvedFamilyId) && Number.isFinite(categoryId)) {
+    const relatedFamilyIds = [];
+    const relatedFamilySet = new Set();
+    const pushFamilyId = (value) => {
+      const numericFamilyId = Number(value);
+      if (!Number.isFinite(numericFamilyId) || relatedFamilySet.has(numericFamilyId)) return;
+      relatedFamilySet.add(numericFamilyId);
+      relatedFamilyIds.push(numericFamilyId);
+    };
+
+    const requestedFamilyIds = Array.isArray(filters.serviceFamilyIds)
+      ? filters.serviceFamilyIds.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+      : [];
+    requestedFamilyIds.forEach(pushFamilyId);
+
+    if (!relatedFamilyIds.length && Number.isFinite(categoryId)) {
       const [[categoryRow]] = await promisePool.query(
         'SELECT service_family_id FROM service_category WHERE id = ? LIMIT 1',
         [categoryId]
       );
       const familyCandidate = categoryRow?.service_family_id;
-      resolvedFamilyId = Number.isFinite(Number(familyCandidate)) ? Number(familyCandidate) : null;
+      pushFamilyId(familyCandidate);
     }
 
     const recommendationFilters = {
       ...filters,
       categoryIds: [],
-      serviceFamilyId: Number.isFinite(resolvedFamilyId) ? resolvedFamilyId : filters.serviceFamilyId,
+      serviceFamilyIds: hasSearchTerm ? [] : relatedFamilyIds,
+      serviceFamilyId: hasSearchTerm ? null : (relatedFamilyIds[0] ?? null),
     };
 
     const distanceExpression = buildDistanceExpression({
@@ -8175,27 +8216,80 @@ app.get('/api/services/filter-categories', async (req, res) => {
 
     const [strictRowsRaw] = await promisePool.query(queryRecommendedCategories, params);
     const strictRows = Array.isArray(strictRowsRaw) ? strictRowsRaw : [];
-    addRows(strictRows);
-
-    const relatedFamilyIds = [];
-    const relatedFamilySet = new Set();
-    const pushFamilyId = (value) => {
-      const numericFamilyId = Number(value);
-      if (!Number.isFinite(numericFamilyId) || relatedFamilySet.has(numericFamilyId)) return;
-      relatedFamilySet.add(numericFamilyId);
-      relatedFamilyIds.push(numericFamilyId);
-    };
-
-    if (Number.isFinite(resolvedFamilyId)) {
-      pushFamilyId(resolvedFamilyId);
-    }
+    addRows(strictRows, 'category');
     strictRows.forEach((row) => pushFamilyId(row?.service_family_id));
+
+    const familyFilters = {
+      ...filters,
+      categoryIds: [],
+      serviceFamilyIds: [],
+      serviceFamilyId: null,
+    };
+    const familyFiltersClause = buildServiceFilterClause(familyFilters, { distanceExpression });
+    const restrictedFamilyIds = !hasSearchTerm && relatedFamilyIds.length > 0 ? relatedFamilyIds : [];
+    const familyRestrictionClause = restrictedFamilyIds.length > 0
+      ? `AND family.id IN (${restrictedFamilyIds.map(() => '?').join(', ')})`
+      : '';
+    const familyQuery = `
+      SELECT
+        family.id AS service_family_id,
+        family.family_key AS service_family_name,
+        COUNT(DISTINCT service.id) AS matching_services
+      FROM service
+      JOIN price ON service.price_id = price.id
+      JOIN user_account ON service.user_id = user_account.id
+      JOIN service_category category ON service.service_category_id = category.id
+      JOIN service_family family ON category.service_family_id = family.id
+      JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          COUNT(*) AS review_count,
+          AVG(rating) AS average_rating
+        FROM review
+        GROUP BY service_id
+      ) AS review_data ON service.id = review_data.service_id
+      WHERE service.is_hidden = 0
+        AND (
+          service.service_title LIKE ?
+          OR category_type.category_key LIKE ?
+          OR family.family_key LIKE ?
+          OR EXISTS (
+            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+          )
+          OR service.description LIKE ?
+        )
+        ${familyRestrictionClause}
+        ${familyFiltersClause.sql}
+      GROUP BY family.id, family.family_key
+      ORDER BY
+        CASE
+          WHEN ? <> '' AND family.family_key LIKE ? THEN 0
+          ELSE 1
+        END,
+        matching_services DESC,
+        family.family_key ASC
+      LIMIT ?;
+    `;
+    const familyParams = [
+      ...new Array(5).fill(searchPattern),
+      ...restrictedFamilyIds,
+      ...familyFiltersClause.params,
+      searchTerm,
+      searchPattern,
+      limit,
+    ];
+    const [familyRowsRaw] = await promisePool.query(familyQuery, familyParams);
+    const familyRows = Array.isArray(familyRowsRaw) ? familyRowsRaw : [];
+    addRows(familyRows, 'family');
+    familyRows.forEach((row) => pushFamilyId(row?.service_family_id));
 
     if (mergedRows.length < limit && relatedFamilyIds.length > 0) {
       const broaderFilters = {
         ...recommendationFilters,
-        serviceFamilyId: null,
         categoryIds: [],
+        serviceFamilyIds: [],
+        serviceFamilyId: null,
       };
       const broaderFiltersClause = buildServiceFilterClause(broaderFilters, { distanceExpression });
       const familyPlaceholders = relatedFamilyIds.map(() => '?').join(', ');
@@ -8249,7 +8343,7 @@ app.get('/api/services/filter-categories', async (req, res) => {
       ];
 
       const [broaderRowsRaw] = await promisePool.query(broaderQuery, broaderParams);
-      addRows(Array.isArray(broaderRowsRaw) ? broaderRowsRaw : []);
+      addRows(Array.isArray(broaderRowsRaw) ? broaderRowsRaw : [], 'category');
     }
 
     if (mergedRows.length < limit && relatedFamilyIds.length > 0) {
@@ -8283,7 +8377,7 @@ app.get('/api/services/filter-categories', async (req, res) => {
       ];
 
       const [catalogRowsRaw] = await promisePool.query(catalogQuery, catalogParams);
-      addRows(Array.isArray(catalogRowsRaw) ? catalogRowsRaw : []);
+      addRows(Array.isArray(catalogRowsRaw) ? catalogRowsRaw : [], 'category');
     }
 
     return res.status(200).json(mergedRows);
