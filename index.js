@@ -627,7 +627,7 @@ function buildServiceFilterClause(filters, {
   }
 
   if (requireCompany) {
-    clauses.push(`COALESCE(${serviceAlias}.is_individual, 0) = 0`);
+    clauses.push(`COALESCE(${serviceAlias}.is_individual, 1) = 0`);
   }
 
   if (requireVerified) {
