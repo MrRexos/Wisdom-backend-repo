@@ -8423,11 +8423,28 @@ app.get('/api/services', async (req, res) => {
       orderClause = `ORDER BY price.price DESC, service.service_created_datetime DESC`;
       break;
     case 'bestrated':
-      orderClause = `ORDER BY COALESCE(review_data.average_rating, 0) DESC, COALESCE(review_data.review_count, 0) DESC, service.service_created_datetime DESC`;
+      orderClause = `ORDER BY
+        (
+          (COALESCE(review_data.review_count, 0) / (COALESCE(review_data.review_count, 0) + 5.0)) * COALESCE(review_data.average_rating, 0)
+          + (5.0 / (COALESCE(review_data.review_count, 0) + 5.0)) * 4.0
+        ) DESC,
+        COALESCE(review_data.review_count, 0) DESC,
+        COALESCE(review_data.average_rating, 0) DESC,
+        service.service_created_datetime DESC`;
       break;
     case 'nearest':
       if (includeDistanceColumn) {
-        orderClause = `ORDER BY distance_km ASC, service.service_created_datetime DESC`;
+        orderClause = `ORDER BY
+          CASE
+            WHEN service.latitude IS NOT NULL AND service.longitude IS NOT NULL AND COALESCE(service.user_can_consult, 0) = 0 THEN 0
+            WHEN service.latitude IS NOT NULL AND service.longitude IS NOT NULL THEN 1
+            WHEN COALESCE(service.user_can_consult, 0) = 1 THEN 3
+            ELSE 2
+          END ASC,
+          CASE WHEN distance_km IS NULL THEN 1 ELSE 0 END ASC,
+          distance_km ASC,
+          COALESCE(review_data.average_rating, 0) DESC,
+          service.service_created_datetime DESC`;
       } else {
         orderClause = `ORDER BY
         CASE
