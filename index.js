@@ -640,8 +640,7 @@ function buildServiceFilterClause(filters, {
     clauses.push(`${serviceAlias}.longitude IS NOT NULL`);
   } else if (onlineOnly && !inPersonOnly) {
     clauses.push(`(
-      ${serviceAlias}.user_can_consult = 1
-      OR ${serviceAlias}.latitude IS NULL
+      ${serviceAlias}.latitude IS NULL
       OR ${serviceAlias}.longitude IS NULL
     )`);
   }
