@@ -533,6 +533,39 @@ function extractServiceFilters(query) {
   };
 }
 
+function buildComparablePriceExpression({
+  priceAlias = 'price',
+  durationMinutes = null,
+} = {}) {
+  const safeDurationMinutes = Number.isFinite(durationMinutes) && durationMinutes > 0
+    ? durationMinutes
+    : null;
+  const durationFactor = safeDurationMinutes !== null
+    ? safeDurationMinutes / 60
+    : 1;
+
+  return `
+    CASE
+      WHEN ${priceAlias}.price_type = 'fix' THEN ${priceAlias}.price
+      WHEN ${priceAlias}.price_type = 'hour' THEN ${priceAlias}.price * ${durationFactor}
+      ELSE NULL
+    END
+  `.trim();
+}
+
+function buildBayesianRatingExpression({
+  reviewAlias = 'review_data',
+  priorCount = 5,
+  priorMean = 4.0,
+} = {}) {
+  return `
+    (
+      (COALESCE(${reviewAlias}.review_count, 0) / (COALESCE(${reviewAlias}.review_count, 0) + ${priorCount}.0)) * COALESCE(${reviewAlias}.average_rating, 0)
+      + (${priorCount}.0 / (COALESCE(${reviewAlias}.review_count, 0) + ${priorCount}.0)) * ${priorMean}
+    )
+  `.trim();
+}
+
 function buildServiceFilterClause(filters, {
   serviceAlias = 'service',
   priceAlias = 'price',
@@ -563,33 +596,24 @@ function buildServiceFilterClause(filters, {
   } = filters;
 
   if (minPrice !== null || maxPrice !== null) {
-    const priceConditions = [`${priceAlias}.price_type = 'budget'`];
+    const comparablePriceExpression = buildComparablePriceExpression({ priceAlias, durationMinutes });
+    const knownPriceConditions = [`${priceAlias}.price_type IN ('fix', 'hour')`];
 
-    const fixParts = [`${priceAlias}.price_type = 'fix'`];
     if (minPrice !== null) {
-      fixParts.push(`${priceAlias}.price >= ?`);
+      knownPriceConditions.push(`${comparablePriceExpression} >= ?`);
       params.push(minPrice);
     }
     if (maxPrice !== null) {
-      fixParts.push(`${priceAlias}.price <= ?`);
+      knownPriceConditions.push(`${comparablePriceExpression} <= ?`);
       params.push(maxPrice);
     }
-    priceConditions.push(fixParts.join(' AND '));
 
-    const hourlyParts = [`${priceAlias}.price_type = 'hour'`];
-    if (durationMinutes !== null) {
-      if (minPrice !== null) {
-        hourlyParts.push(`${priceAlias}.price * (? / 60.0) >= ?`);
-        params.push(durationMinutes, minPrice);
-      }
-      if (maxPrice !== null) {
-        hourlyParts.push(`${priceAlias}.price * (? / 60.0) <= ?`);
-        params.push(durationMinutes, maxPrice);
-      }
+    const priceConditions = [`(${knownPriceConditions.join(' AND ')})`];
+    if (maxPrice === null) {
+      priceConditions.push(`${priceAlias}.price_type = 'budget'`);
     }
-    priceConditions.push(hourlyParts.join(' AND '));
 
-    clauses.push(`(${priceConditions.map((condition) => `(${condition})`).join(' OR ')})`);
+    clauses.push(`(${priceConditions.join(' OR ')})`);
   }
 
   if (Number.isFinite(maxActionRate)) {
@@ -8412,22 +8436,84 @@ app.get('/api/services', async (req, res) => {
     : '';
   const distanceSelectParams = includeDistanceColumn ? [...distanceExpression.params] : [];
   const categoryClause = Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : '';
+  const comparablePriceExpression = buildComparablePriceExpression({ priceAlias: 'price', durationMinutes: filters.durationMinutes });
+  const bayesianRatingExpression = buildBayesianRatingExpression({ reviewAlias: 'review_data' });
+  const recommendDistanceBoostExpression = includeDistanceColumn
+    ? `CASE
+        WHEN distance_km IS NULL THEN 0
+        ELSE GREATEST(0, 1 - LEAST(distance_km, 50) / 50) * 14
+      END`
+    : '0';
+  const recommendSearchScoreExpression = `
+    CASE
+      WHEN ? <> '' AND LOWER(service.service_title) = LOWER(?) THEN 60
+      WHEN ? <> '' AND service.service_title LIKE ? THEN 38
+      WHEN ? <> '' AND category_type.category_key LIKE ? THEN 24
+      WHEN ? <> '' AND family.family_key LIKE ? THEN 18
+      WHEN ? <> '' AND EXISTS (
+        SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
+      ) THEN 16
+      WHEN ? <> '' AND service.description LIKE ? THEN 8
+      ELSE 0
+    END
+  `.trim();
+  const recommendQualityScoreExpression = `
+    (
+      ((${bayesianRatingExpression} / 5.0) * 32)
+      + (LEAST(LOG10(COALESCE(review_data.review_count, 0) + 1) / LOG10(31), 1) * 10)
+      + (LEAST(LOG10(COALESCE(booking_data.confirmed_booking_count, 0) + 1) / LOG10(51), 1) * 18)
+      + (LEAST(LOG10(COALESCE(repeat_data.repeated_bookings_count, 0) + 1) / LOG10(11), 1) * 10)
+      + (
+        CASE
+          WHEN service.action_rate IS NULL THEN 6
+          ELSE GREATEST(0, 1 - LEAST(service.action_rate, 1440) / 1440) * 10
+        END
+      )
+      + (CASE WHEN user_account.is_verified = 1 THEN 8 ELSE 0 END)
+      + (LEAST(LOG10(COALESCE(likes_data.likes_count, 0) + 1) / LOG10(21), 1) * 6)
+      + ${recommendDistanceBoostExpression}
+    )
+  `.trim();
+  const noveltyBoostExpression = `
+    CASE
+      WHEN TIMESTAMPDIFF(DAY, service.service_created_datetime, NOW()) BETWEEN 0 AND 21
+        THEN 1 + ((21 - TIMESTAMPDIFF(DAY, service.service_created_datetime, NOW())) / 21.0) * 0.15
+      ELSE 1
+    END
+  `.trim();
+  const recommendOrderParams = [
+    searchTerm,
+    searchTerm,
+    searchTerm,
+    searchPattern,
+    searchTerm,
+    searchPattern,
+    searchTerm,
+    searchPattern,
+    searchTerm,
+    searchPattern,
+    searchTerm,
+    searchPattern,
+  ];
 
   let orderClause = '';
   let orderParams = [];
   switch (orderBy) {
     case 'cheapest':
-      orderClause = `ORDER BY price.price ASC, service.service_created_datetime DESC`;
+      orderClause = `ORDER BY
+        CASE WHEN price.price_type = 'budget' THEN 1 ELSE 0 END ASC,
+        ${comparablePriceExpression} ASC,
+        service.service_created_datetime DESC`;
       break;
     case 'mostexpensive':
-      orderClause = `ORDER BY price.price DESC, service.service_created_datetime DESC`;
+      orderClause = `ORDER BY
+        CASE WHEN price.price_type = 'budget' THEN 1 ELSE 0 END ASC,
+        ${comparablePriceExpression} DESC,
+        service.service_created_datetime DESC`;
       break;
     case 'bestrated':
       orderClause = `ORDER BY
-        (
-          (COALESCE(review_data.review_count, 0) / (COALESCE(review_data.review_count, 0) + 5.0)) * COALESCE(review_data.average_rating, 0)
-          + (5.0 / (COALESCE(review_data.review_count, 0) + 5.0)) * 4.0
-        ) DESC,
+        ${bayesianRatingExpression} DESC,
         COALESCE(review_data.review_count, 0) DESC,
         COALESCE(review_data.average_rating, 0) DESC,
         service.service_created_datetime DESC`;
@@ -8435,11 +8521,12 @@ app.get('/api/services', async (req, res) => {
     case 'nearest':
       if (includeDistanceColumn) {
         orderClause = `ORDER BY 
-          CASE 
-            WHEN service.latitude IS NOT NULL AND service.longitude IS NOT NULL THEN 0 
-            ELSE 1 
-          END ASC,
           CASE WHEN distance_km IS NULL THEN 1 ELSE 0 END ASC,
+          CASE
+            WHEN distance_km IS NULL THEN NULL
+            WHEN COALESCE(service.user_can_consult, 0) = 1 THEN distance_km + 1000
+            ELSE distance_km
+          END ASC,
           distance_km ASC,
           COALESCE(review_data.average_rating, 0) DESC,
           service.service_created_datetime DESC`;
@@ -8465,20 +8552,17 @@ app.get('/api/services', async (req, res) => {
         service.action_rate ASC,
         service.service_created_datetime DESC`;
       break;
+    case 'recommend':
     default:
       orderClause = `ORDER BY
-        CASE
-          WHEN service.service_title LIKE ? THEN 1
-          WHEN category_type.category_key LIKE ? THEN 1
-          WHEN family.family_key LIKE ? THEN 1
-          WHEN EXISTS (
-            SELECT 1 FROM service_tags st WHERE st.service_id = service.id AND st.tag LIKE ?
-          ) THEN 1
-          WHEN service.description LIKE ? THEN 2
-          ELSE 3
-        END,
+        (
+          ((${recommendSearchScoreExpression}) * 1.35)
+          + ${recommendQualityScoreExpression}
+        ) * ${noveltyBoostExpression} DESC,
+        ${bayesianRatingExpression} DESC,
+        COALESCE(booking_data.confirmed_booking_count, 0) DESC,
         service.service_created_datetime DESC`;
-      orderParams = new Array(5).fill(searchPattern);
+      orderParams = [...recommendOrderParams];
       break;
   }
   if (!orderClause) {
@@ -8517,6 +8601,9 @@ app.get('/api/services', async (req, res) => {
         user_account.language,
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating,
+        COALESCE(booking_data.confirmed_booking_count, 0) AS booking_count,
+        COALESCE(repeat_data.repeated_bookings_count, 0) AS repeated_bookings_count,
+        COALESCE(likes_data.likes_count, 0) AS likes_count,
         category_type.category_key,
         family.family_key,
         category_type.category_key AS service_category_name,
@@ -8540,6 +8627,36 @@ app.get('/api/services', async (req, res) => {
         FROM review
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          SUM(CASE WHEN LOWER(booking_status) IN ('accepted', 'confirmed', 'completed') THEN 1 ELSE 0 END) AS confirmed_booking_count
+        FROM booking
+        GROUP BY service_id
+      ) AS booking_data ON service.id = booking_data.service_id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          COALESCE(SUM(completed_count) - COUNT(*), 0) AS repeated_bookings_count
+        FROM (
+          SELECT
+            service_id,
+            user_id,
+            COUNT(*) AS completed_count
+          FROM booking
+          WHERE LOWER(booking_status) = 'completed'
+          GROUP BY service_id, user_id
+        ) AS completed_by_user
+        GROUP BY service_id
+      ) AS repeat_data ON service.id = repeat_data.service_id
+      LEFT JOIN (
+        SELECT
+          il.service_id,
+          COUNT(DISTINCT sl.user_id) AS likes_count
+        FROM item_list il
+        JOIN service_list sl ON il.list_id = sl.id
+        GROUP BY il.service_id
+      ) AS likes_data ON likes_data.service_id = service.id
       LEFT JOIN (
         SELECT
           ordered_tags.service_id,
