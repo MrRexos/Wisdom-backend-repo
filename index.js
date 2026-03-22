@@ -8435,13 +8435,12 @@ app.get('/api/services', async (req, res) => {
     case 'nearest':
       if (includeDistanceColumn) {
         orderClause = `ORDER BY
-          CASE
-            WHEN service.latitude IS NOT NULL AND service.longitude IS NOT NULL AND COALESCE(service.user_can_consult, 0) = 0 THEN 0
-            WHEN service.latitude IS NOT NULL AND service.longitude IS NOT NULL THEN 1
-            WHEN COALESCE(service.user_can_consult, 0) = 1 THEN 3
-            ELSE 2
-          END ASC,
           CASE WHEN distance_km IS NULL THEN 1 ELSE 0 END ASC,
+          CASE
+            WHEN distance_km IS NULL THEN NULL
+            WHEN COALESCE(service.user_can_consult, 0) = 1 THEN distance_km + 1000
+            ELSE distance_km
+          END ASC,
           distance_km ASC,
           COALESCE(review_data.average_rating, 0) DESC,
           service.service_created_datetime DESC`;
