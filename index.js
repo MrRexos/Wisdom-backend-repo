@@ -20,6 +20,7 @@ const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const os = require('os');
 const { computeServiceResponseTime, computeServiceSuccessRate } = require('./src/serviceMetrics');
+const { createVisionIdDetector } = require('./src/visionIdDetection');
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
 const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
 const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
@@ -1829,6 +1830,7 @@ const storage = new Storage({
   projectId: credentials.project_id,
   credentials: credentials,
 });
+const visionIdDetector = createVisionIdDetector(credentials);
 
 const bucketName = process.env.GCLOUD_BUCKET_NAME;
 const bucket = storage.bucket(bucketName);
@@ -6570,6 +6572,25 @@ app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
       }
     });
   });
+});
+
+app.post('/api/user/:id/id-document/detect-number', multerMid.single('file'), async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'file_required' });
+  }
+
+  try {
+    const detectionResult = await visionIdDetector.detectIdNumberFromImageBuffer(req.file.buffer);
+    return res.json({
+      detectedIdNumber: detectionResult.detectedIdNumber || null,
+    });
+  } catch (error) {
+    console.error('Cloud Vision ID detection error:', error?.response?.data || error);
+    return res.status(500).json({ error: 'id_detection_failed' });
+  }
 });
 
 // Marca booking como failed si no se ha pagado el deposit
