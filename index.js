@@ -6584,6 +6584,41 @@ const COLLECTION_METHOD_SUPPORTED_COUNTRIES = new Set([
   'US',
 ]);
 
+const COLLECTION_METHOD_IBAN_COUNTRY_LENGTHS = Object.freeze({
+  AE: 23,
+  AT: 20,
+  BE: 16,
+  BG: 22,
+  CH: 21,
+  CY: 28,
+  CZ: 24,
+  DE: 22,
+  DK: 18,
+  EE: 20,
+  ES: 24,
+  FI: 18,
+  FR: 27,
+  GB: 22,
+  GR: 27,
+  HR: 21,
+  HU: 28,
+  IE: 22,
+  IT: 27,
+  LT: 20,
+  LU: 20,
+  LV: 21,
+  MT: 31,
+  NL: 18,
+  NO: 15,
+  PL: 28,
+  PT: 25,
+  RO: 24,
+  SA: 24,
+  SE: 24,
+  SI: 19,
+  SK: 24,
+});
+
 function normalizeCollectionMethodCountry(value = '') {
   return String(value || '').trim().toUpperCase();
 }
@@ -6594,6 +6629,43 @@ function isCollectionMethodCountrySupported(value = '') {
 
 function normalizeCollectionMethodIban(value = '') {
   return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function collectionMethodIbanToNumericString(value = '') {
+  return [...String(value || '')].map((char) => {
+    const code = char.charCodeAt(0);
+    if (code >= 65 && code <= 90) {
+      return String(code - 55);
+    }
+    return char;
+  }).join('');
+}
+
+function computeCollectionMethodModulo97(value = '') {
+  let remainder = 0;
+
+  for (const char of String(value || '')) {
+    remainder = (remainder * 10 + Number(char)) % 97;
+  }
+
+  return remainder;
+}
+
+function isValidCollectionMethodIban(value = '') {
+  const normalizedIban = normalizeCollectionMethodIban(value);
+
+  if (!/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(normalizedIban)) {
+    return false;
+  }
+
+  const countryCode = normalizedIban.slice(0, 2);
+  const expectedLength = COLLECTION_METHOD_IBAN_COUNTRY_LENGTHS[countryCode];
+  if (expectedLength && normalizedIban.length !== expectedLength) {
+    return false;
+  }
+
+  const rearrangedValue = `${normalizedIban.slice(4)}${normalizedIban.slice(0, 4)}`;
+  return computeCollectionMethodModulo97(collectionMethodIbanToNumericString(rearrangedValue)) === 1;
 }
 
 function normalizeCollectionMethodRoutingNumber(value = '') {
@@ -6744,6 +6816,7 @@ app.get('/api/user/:id/collection-method', authenticateToken, async (req, res) =
   try {
     const [rows] = await promisePool.query(
       `SELECT cm.id,
+              cm.type,
               cm.external_account_id,
               cm.last4,
               cm.brand,
@@ -6773,7 +6846,7 @@ app.get('/api/user/:id/collection-method', authenticateToken, async (req, res) =
 
     return res.status(200).json({
       ...collectionMethod,
-      method_kind: collectionMethod.brand === 'us_bank_account' || collectionMethod.country === 'US'
+      method_kind: collectionMethod.type === 'us_bank_account' || collectionMethod.brand === 'us_bank_account' || collectionMethod.country === 'US'
         ? 'us_bank_account'
         : 'iban',
     });
@@ -6819,7 +6892,8 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
   const stripeAddressLine1 = buildCollectionMethodStreetLine1(address1, streetNumber);
   const hasValidBankDetails = usesUsBankAccount
     ? isValidCollectionMethodRoutingNumber(normalizedRoutingNumber) && isValidCollectionMethodUsAccountNumber(normalizedAccountNumber)
-    : Boolean(normalizedIban);
+    : isValidCollectionMethodIban(normalizedIban);
+  const collectionMethodType = usesUsBankAccount ? 'us_bank_account' : 'iban';
 
   if (
     !fullName ||
@@ -7008,12 +7082,12 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
     if (existingCollectionMethod) {
       await connection.query(
         'UPDATE collection_method SET type = ?, external_account_id = ?, last4 = ?, brand = ?, currency = ?, address_id = ?, full_name = ? WHERE id = ?',
-        ['iban', stripeExternalAccountId, last4, collectionMethodBrand, bankCurrency, addressId, fullName, existingCollectionMethod.id]
+        [collectionMethodType, stripeExternalAccountId, last4, collectionMethodBrand, bankCurrency, addressId, fullName, existingCollectionMethod.id]
       );
     } else {
       await connection.query(
         'INSERT INTO collection_method (user_id, type, external_account_id, last4, brand, currency, address_id, full_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [requestedUserId, 'iban', stripeExternalAccountId, last4, collectionMethodBrand, bankCurrency, addressId, fullName]
+        [requestedUserId, collectionMethodType, stripeExternalAccountId, last4, collectionMethodBrand, bankCurrency, addressId, fullName]
       );
     }
 
