@@ -273,6 +273,7 @@
 - `auth_provider` (ENUM('email', 'google', 'apple'), NOT NULL, DEFAULT 'email'): Indica el método de autenticación.
 - `provider_id` (VARCHAR(255), UNIQUE, NULL): Almacena el ID único de Google/Apple si aplica.
 - `language` (VARCHAR(2), NOT NULL, DEFAULT en)
+- `country` (CHAR(2), DEFAULT NULL)
 - `allow_notis` (TINYINT(1), NULL, DEFAULT 1)
 - `currency` (CHAR(3), NOT NULL, DEFAULT EUR)
 - `money_in_wallet` (DECIMAL(10,2) UNSIGNED, NOT NULL, DEFAULT 0.00)

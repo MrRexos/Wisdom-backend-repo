@@ -1389,6 +1389,24 @@ function normalizeEmail(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
+function normalizeCountryCode(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(normalized) ? normalized : null;
+}
+
+function normalizeCurrencyCode(value, fallback = null) {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+
+  const normalized = value.trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(normalized) ? normalized : fallback;
+}
+
 function isValidEmail(email) {
   return EMAIL_REGEX.test(normalizeEmail(email));
 }
@@ -1506,6 +1524,8 @@ async function createUserAccountWithDefaults(connection, {
   surname,
   phone = null,
   language = 'en',
+  country = null,
+  currency = 'EUR',
   allow_notis = null,
   profile_picture = null,
   is_verified = 0,
@@ -1517,14 +1537,16 @@ async function createUserAccountWithDefaults(connection, {
   let userId;
   let username;
   let inserted = false;
+  const normalizedCountry = normalizeCountryCode(country);
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     username = await generateUniqueUsername(connection, first_name, surname);
 
     try {
       const [result] = await connection.query(
-        'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, allow_notis, profile_picture, is_verified, is_professional, auth_provider, provider_id, platform) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?)',
-        [email, username, password, first_name, surname, phone, language, allow_notis, profile_picture, is_verified, is_professional, auth_provider, provider_id, platform]
+        'INSERT INTO user_account (email, username, password, first_name, surname, phone, joined_datetime, language, country, allow_notis, currency, profile_picture, is_verified, is_professional, auth_provider, provider_id, platform) VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [email, username, password, first_name, surname, phone, language, normalizedCountry, allow_notis, normalizedCurrency, profile_picture, is_verified, is_professional, auth_provider, provider_id, platform]
       );
 
       userId = result.insertId;
@@ -2084,6 +2106,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
   const rawFirstName = typeof req.body?.first_name === 'string' ? req.body.first_name : '';
   const rawSurname = typeof req.body?.surname === 'string' ? req.body.surname : '';
   const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
+  const rawCountry = typeof req.body?.country === 'string' ? req.body.country : null;
+  const rawCurrency = typeof req.body?.currency === 'string' ? req.body.currency : null;
   const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
   const rawPhone = typeof req.body?.phone === 'string' ? req.body.phone.trim() : null;
 
@@ -2091,6 +2115,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
   const first_name = rawFirstName.trim();
   const surname = rawSurname.trim();
   const language = rawLanguage.trim() || 'en';
+  const country = normalizeCountryCode(rawCountry);
+  const currency = normalizeCurrencyCode(rawCurrency, 'EUR');
   const platform = rawPlatform.trim().toLowerCase() === 'android' ? 'android' : 'ios';
   const phone = rawPhone || null;
 
@@ -2138,6 +2164,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       surname,
       phone,
       language,
+      country,
+      currency,
       allow_notis: null,
       profile_picture: null,
       is_verified: 0,
@@ -2157,6 +2185,8 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
       surname,
       phone,
       language,
+      country,
+      currency,
       auth_provider: 'email',
       provider_id: null,
       platform,
@@ -2283,8 +2313,12 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
 app.post('/api/auth/google', socialAuthLimiter, async (req, res) => {
   const idToken = typeof req.body?.idToken === 'string' ? req.body.idToken.trim() : '';
   const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
+  const rawCountry = typeof req.body?.country === 'string' ? req.body.country : null;
+  const rawCurrency = typeof req.body?.currency === 'string' ? req.body.currency : null;
   const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
   const language = rawLanguage.trim() || 'en';
+  const country = normalizeCountryCode(rawCountry);
+  const currency = normalizeCurrencyCode(rawCurrency, 'EUR');
   const platform = rawPlatform.trim().toLowerCase() === 'android' ? 'android' : 'ios';
 
   if (!idToken) {
@@ -2363,6 +2397,8 @@ app.post('/api/auth/google', socialAuthLimiter, async (req, res) => {
       surname,
       phone: null,
       language,
+      country,
+      currency,
       allow_notis: null,
       profile_picture,
       is_verified: 1,
@@ -2382,6 +2418,8 @@ app.post('/api/auth/google', socialAuthLimiter, async (req, res) => {
       surname,
       phone: null,
       language,
+      country,
+      currency,
       auth_provider: 'google',
       provider_id: providerIdFromToken,
       platform,
@@ -2446,8 +2484,12 @@ app.post('/api/auth/apple', socialAuthLimiter, async (req, res) => {
   const rawFirstName = typeof req.body?.first_name === 'string' ? req.body.first_name : '';
   const rawSurname = typeof req.body?.surname === 'string' ? req.body.surname : '';
   const rawLanguage = typeof req.body?.language === 'string' ? req.body.language : 'en';
+  const rawCountry = typeof req.body?.country === 'string' ? req.body.country : null;
+  const rawCurrency = typeof req.body?.currency === 'string' ? req.body.currency : null;
   const rawPlatform = typeof req.body?.platform === 'string' ? req.body.platform : 'ios';
   const language = rawLanguage.trim() || 'en';
+  const country = normalizeCountryCode(rawCountry);
+  const currency = normalizeCurrencyCode(rawCurrency, 'EUR');
   const platform = rawPlatform.trim().toLowerCase() === 'android' ? 'android' : 'ios';
 
   if (!identityToken) {
@@ -2540,6 +2582,8 @@ app.post('/api/auth/apple', socialAuthLimiter, async (req, res) => {
       surname,
       phone: null,
       language,
+      country,
+      currency,
       allow_notis: null,
       profile_picture: null,
       is_verified: 1,
@@ -2559,6 +2603,8 @@ app.post('/api/auth/apple', socialAuthLimiter, async (req, res) => {
       surname,
       phone: null,
       language,
+      country,
+      currency,
       auth_provider: 'apple',
       provider_id: providerIdFromToken,
       platform,
@@ -5595,6 +5641,44 @@ app.put('/api/user/:id/language', authenticateToken, (req, res) => {
 
       if (result.affectedRows > 0) {
         return res.status(200).json({ message: 'Idioma actualizado exitosamente.' });
+      }
+
+      return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
+    });
+  });
+});
+
+app.put('/api/user/:id/currency', authenticateToken, (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
+
+  const currency = normalizeCurrencyCode(req.body?.currency, null);
+  if (!currency) {
+    return res.status(400).json({ error: 'invalid_currency' });
+  }
+
+  pool.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error al obtener la conexión:', err);
+      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    }
+
+    const query = `
+      UPDATE user_account
+      SET currency = ?
+      WHERE id = ?;
+    `;
+
+    connection.query(query, [currency, requestedUserId], (queryErr, result) => {
+      connection.release();
+
+      if (queryErr) {
+        console.error('Error al actualizar la moneda del usuario:', queryErr);
+        return res.status(500).json({ error: 'Error al actualizar la moneda del usuario.' });
+      }
+
+      if (result.affectedRows > 0) {
+        return res.status(200).json({ message: 'Moneda actualizada exitosamente.' });
       }
 
       return res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
