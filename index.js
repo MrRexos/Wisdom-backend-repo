@@ -6495,167 +6495,569 @@ app.patch('/api/bookings/:id/is_paid', (req, res) => {
   });
 });
 
-// Crear método de cobro y cuenta Stripe Connect
-app.post('/api/user/:id/collection-method', authenticateToken, (req, res) => {
+const COLLECTION_METHOD_BANK_COUNTRY_TO_CURRENCY = Object.freeze({
+  AR: 'ars',
+  AT: 'eur',
+  AU: 'aud',
+  BE: 'eur',
+  BG: 'bgn',
+  BR: 'brl',
+  CA: 'cad',
+  CH: 'chf',
+  CY: 'eur',
+  CZ: 'czk',
+  DE: 'eur',
+  DK: 'dkk',
+  EE: 'eur',
+  ES: 'eur',
+  FI: 'eur',
+  FR: 'eur',
+  GB: 'gbp',
+  GR: 'eur',
+  HK: 'hkd',
+  HR: 'eur',
+  HU: 'huf',
+  ID: 'idr',
+  IE: 'eur',
+  IL: 'ils',
+  IN: 'inr',
+  IT: 'eur',
+  JP: 'jpy',
+  KR: 'krw',
+  LT: 'eur',
+  LU: 'eur',
+  LV: 'eur',
+  MT: 'eur',
+  MX: 'mxn',
+  MY: 'myr',
+  NL: 'eur',
+  NO: 'nok',
+  NZ: 'nzd',
+  PH: 'php',
+  PL: 'pln',
+  PT: 'eur',
+  RO: 'ron',
+  SA: 'sar',
+  SE: 'sek',
+  SG: 'sgd',
+  SI: 'eur',
+  SK: 'eur',
+  TH: 'thb',
+  US: 'usd',
+  VN: 'vnd',
+  AE: 'aed',
+});
+
+const COLLECTION_METHOD_SUPPORTED_COUNTRIES = new Set([
+  'AE',
+  'AT',
+  'BE',
+  'BG',
+  'CH',
+  'CY',
+  'CZ',
+  'DE',
+  'DK',
+  'EE',
+  'ES',
+  'FI',
+  'FR',
+  'GB',
+  'GR',
+  'HR',
+  'HU',
+  'IE',
+  'IT',
+  'LT',
+  'LU',
+  'LV',
+  'MT',
+  'NL',
+  'NO',
+  'PL',
+  'PT',
+  'RO',
+  'SA',
+  'SE',
+  'SI',
+  'SK',
+  'US',
+]);
+
+function normalizeCollectionMethodCountry(value = '') {
+  return String(value || '').trim().toUpperCase();
+}
+
+function isCollectionMethodCountrySupported(value = '') {
+  return COLLECTION_METHOD_SUPPORTED_COUNTRIES.has(normalizeCollectionMethodCountry(value));
+}
+
+function normalizeCollectionMethodIban(value = '') {
+  return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function normalizeCollectionMethodRoutingNumber(value = '') {
+  return String(value || '').replace(/[^\d]/g, '').slice(0, 9);
+}
+
+function normalizeCollectionMethodUsAccountNumber(value = '') {
+  return String(value || '').replace(/[^\d]/g, '').slice(0, 17);
+}
+
+function isValidCollectionMethodRoutingNumber(value = '') {
+  const digits = normalizeCollectionMethodRoutingNumber(value);
+  if (!/^\d{9}$/.test(digits)) {
+    return false;
+  }
+
+  const numbers = digits.split('').map(Number);
+  const checksum = (
+    3 * (numbers[0] + numbers[3] + numbers[6]) +
+    7 * (numbers[1] + numbers[4] + numbers[7]) +
+    (numbers[2] + numbers[5] + numbers[8])
+  ) % 10;
+
+  return checksum === 0;
+}
+
+function isValidCollectionMethodUsAccountNumber(value = '') {
+  return /^\d{4,17}$/.test(normalizeCollectionMethodUsAccountNumber(value));
+}
+
+function getCollectionMethodBankCountry({ iban = '', fallbackCountry = '' } = {}) {
+  const normalizedIban = normalizeCollectionMethodIban(iban);
+  if (/^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/.test(normalizedIban)) {
+    return normalizedIban.slice(0, 2);
+  }
+
+  return normalizeCollectionMethodCountry(fallbackCountry);
+}
+
+function getCollectionMethodBankCurrency(countryCode = '') {
+  return COLLECTION_METHOD_BANK_COUNTRY_TO_CURRENCY[normalizeCollectionMethodCountry(countryCode)] || null;
+}
+
+function splitCollectionMethodFullName(fullName = '') {
+  const parts = String(fullName || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    return { firstName: '', lastName: '' };
+  }
+
+  if (parts.length === 1) {
+    return { firstName: parts[0], lastName: parts[0] };
+  }
+
+  return {
+    firstName: parts[0],
+    lastName: parts.slice(1).join(' '),
+  };
+}
+
+function buildCollectionMethodStreetLine1(address1 = '', streetNumber = '') {
+  return [String(address1 || '').trim(), String(streetNumber || '').trim()].filter(Boolean).join(' ').trim();
+}
+
+function parseCollectionMethodDateOfBirth(value = '') {
+  const match = String(value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+
+  const parsedDate = new Date(Date.UTC(year, month - 1, day));
+  if (
+    Number.isNaN(parsedDate.getTime()) ||
+    parsedDate.getUTCFullYear() !== year ||
+    parsedDate.getUTCMonth() !== month - 1 ||
+    parsedDate.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return {
+    year,
+    month,
+    day,
+    canonical: `${match[1]}-${match[2]}-${match[3]}`,
+  };
+}
+
+function getCollectionMethodRequestIp(req) {
+  return (req.headers['x-forwarded-for'] || req.ip || '')
+    .toString()
+    .split(',')[0]
+    .trim()
+    .substring(0, 45) || undefined;
+}
+
+async function acquireCollectionMethodCreationLock(connection, userId) {
+  const lockName = `collection-method:${userId}`;
+  const [[row]] = await connection.query('SELECT GET_LOCK(?, 0) AS acquired', [lockName]);
+
+  return {
+    lockName,
+    acquired: Number(row?.acquired) === 1,
+  };
+}
+
+async function releaseCollectionMethodCreationLock(connection, lockName) {
+  if (!lockName) {
+    return;
+  }
+
+  try {
+    await connection.query('SELECT RELEASE_LOCK(?) AS released', [lockName]);
+  } catch (lockError) {
+    console.error('Error al liberar el lock de collection method:', lockError);
+  }
+}
+
+async function rollbackCollectionMethodStripeArtifacts({
+  accountId = null,
+  externalAccountId = null,
+  createdAccount = false,
+} = {}) {
+  if (externalAccountId && accountId) {
+    try {
+      await stripe.accounts.removeExternalAccount(accountId, externalAccountId);
+    } catch (removeExternalAccountError) {
+      console.error('Error al revertir la cuenta bancaria externa de Stripe:', removeExternalAccountError);
+    }
+  }
+
+  if (createdAccount && accountId) {
+    try {
+      await stripe.accounts.del(accountId);
+    } catch (deleteAccountError) {
+      console.error('Error al revertir la cuenta Connect de Stripe:', deleteAccountError);
+    }
+  }
+}
+
+app.get('/api/user/:id/collection-method', authenticateToken, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res);
   if (!requestedUserId) return;
-  const {
-    full_name,
-    date_of_birth,
-    nif,
-    iban,
-    address_type,
-    street_number,
-    address_1,
-    address_2,
-    postal_code,
-    city,
-    state,
-    country,
-    phone,
-    fileTokenAnverso,
-    fileTokenReverso
-  } = req.body;
+
+  try {
+    const [rows] = await promisePool.query(
+      `SELECT cm.id,
+              cm.external_account_id,
+              cm.last4,
+              cm.brand,
+              cm.currency,
+              cm.created_at,
+              cm.updated_at,
+              cm.full_name,
+              a.country,
+              a.state,
+              a.city,
+              a.address_1,
+              a.address_2,
+              a.street_number,
+              a.postal_code
+         FROM collection_method cm
+         LEFT JOIN address a ON a.id = cm.address_id
+        WHERE cm.user_id = ?
+        ORDER BY cm.id DESC
+        LIMIT 1`,
+      [requestedUserId]
+    );
+
+    const collectionMethod = rows[0];
+    if (!collectionMethod) {
+      return res.status(404).json({ error: 'collection_method_not_found' });
+    }
+
+    return res.status(200).json({
+      ...collectionMethod,
+      method_kind: collectionMethod.brand === 'us_bank_account' || collectionMethod.country === 'US'
+        ? 'us_bank_account'
+        : 'iban',
+    });
+  } catch (error) {
+    console.error('Error al obtener el método de cobro:', error);
+    return res.status(500).json({ error: 'collection_method_fetch_failed' });
+  }
+});
+
+// Crear método de cobro y cuenta Stripe Connect
+app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res);
+  if (!requestedUserId) return;
+
+  const fullName = typeof req.body?.full_name === 'string' ? req.body.full_name.trim() : '';
+  const rawDateOfBirth = typeof req.body?.date_of_birth === 'string' ? req.body.date_of_birth.trim() : '';
+  const nif = typeof req.body?.nif === 'string' ? req.body.nif.trim().toUpperCase() : '';
+  const rawIban = typeof req.body?.iban === 'string' ? req.body.iban : '';
+  const rawRoutingNumber = typeof req.body?.routing_number === 'string' ? req.body.routing_number : '';
+  const rawAccountNumber = typeof req.body?.account_number === 'string' ? req.body.account_number : '';
+  const addressType = typeof req.body?.address_type === 'string' ? req.body.address_type.trim() : '';
+  const streetNumber = req.body?.street_number == null ? '' : String(req.body.street_number).trim();
+  const address1 = typeof req.body?.address_1 === 'string' ? req.body.address_1.trim() : '';
+  const address2 = typeof req.body?.address_2 === 'string' ? req.body.address_2.trim() : '';
+  const postalCode = req.body?.postal_code == null ? '' : String(req.body.postal_code).trim();
+  const city = typeof req.body?.city === 'string' ? req.body.city.trim() : '';
+  const state = typeof req.body?.state === 'string' ? req.body.state.trim() : '';
+  const country = normalizeCollectionMethodCountry(req.body?.country);
+  const phone = typeof req.body?.phone === 'string' ? req.body.phone.trim() : '';
+  const fileTokenAnverso = typeof req.body?.fileTokenAnverso === 'string' ? req.body.fileTokenAnverso.trim() : '';
+  const fileTokenReverso = typeof req.body?.fileTokenReverso === 'string' ? req.body.fileTokenReverso.trim() : '';
+
+  const normalizedIban = normalizeCollectionMethodIban(rawIban);
+  const normalizedRoutingNumber = normalizeCollectionMethodRoutingNumber(rawRoutingNumber);
+  const normalizedAccountNumber = normalizeCollectionMethodUsAccountNumber(rawAccountNumber);
+  const usesUsBankAccount = country === 'US';
+  const dateOfBirth = parseCollectionMethodDateOfBirth(rawDateOfBirth);
+  const bankCountry = usesUsBankAccount
+    ? 'US'
+    : getCollectionMethodBankCountry({ iban: normalizedIban, fallbackCountry: country });
+  const bankCurrency = getCollectionMethodBankCurrency(bankCountry);
+  const { firstName, lastName } = splitCollectionMethodFullName(fullName);
+  const stripeAddressLine1 = buildCollectionMethodStreetLine1(address1, streetNumber);
+  const hasValidBankDetails = usesUsBankAccount
+    ? isValidCollectionMethodRoutingNumber(normalizedRoutingNumber) && isValidCollectionMethodUsAccountNumber(normalizedAccountNumber)
+    : Boolean(normalizedIban);
 
   if (
-    !full_name ||
-    !date_of_birth ||
+    !fullName ||
+    !dateOfBirth ||
     !nif ||
-    !iban ||
-    !address_type ||
-    !address_1 ||
-    !postal_code ||
+    !hasValidBankDetails ||
+    !addressType ||
+    !address1 ||
+    !postalCode ||
     !city ||
     !state ||
     !country ||
+    !isCollectionMethodCountrySupported(country) ||
     !phone ||
     !fileTokenAnverso ||
-    !fileTokenReverso
+    !fileTokenReverso ||
+    !firstName ||
+    !lastName ||
+    !stripeAddressLine1
   ) {
-    return res.status(400).json({ error: 'Campos requeridos faltantes' });
+    return res.status(400).json({ error: 'Campos requeridos faltantes o inválidos' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  if (!bankCurrency) {
+    return res.status(400).json({
+      error: 'No se pudo determinar una moneda válida para la cuenta bancaria.',
+      bankCountry,
+    });
+  }
+
+  const connection = await pool.promise().getConnection();
+  let transactionStarted = false;
+  let lockName = null;
+  let stripeAccountId = null;
+  let stripeExternalAccountId = null;
+  let createdStripeAccount = false;
+
+  try {
+    const lockState = await acquireCollectionMethodCreationLock(connection, requestedUserId);
+    lockName = lockState.lockName;
+
+    if (!lockState.acquired) {
+      return res.status(409).json({
+        error: 'La creación del método de cobro ya está en curso.',
+        code: 'COLLECTION_METHOD_IN_PROGRESS',
+      });
     }
 
-    const userQuery = 'SELECT email, first_name, surname FROM user_account WHERE id = ?';
-    connection.query(userQuery, [requestedUserId], async (userErr, userRes) => {
-      if (userErr) {
-        connection.release();
-        console.error('Error al obtener el usuario:', userErr);
-        return res.status(500).json({ error: 'Error al obtener el usuario.' });
-      }
+    await connection.beginTransaction();
+    transactionStarted = true;
 
-      if (userRes.length === 0) {
-        connection.release();
-        return res.status(404).json({ message: 'Usuario no encontrado' });
-      }
+    const [[user]] = await connection.query(
+      'SELECT id, email, stripe_account_id FROM user_account WHERE id = ? FOR UPDATE',
+      [requestedUserId]
+    );
 
-      const user = userRes[0];
-      const [year, month, day] = date_of_birth.split('-').map(Number);
+    if (!user) {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(404).json({ message: 'Usuario no encontrado' });
+    }
 
+    const [[existingCollectionMethod]] = await connection.query(
+      'SELECT id, external_account_id, address_id FROM collection_method WHERE user_id = ? ORDER BY id DESC LIMIT 1 FOR UPDATE',
+      [requestedUserId]
+    );
+
+    const hasStripeAccount = typeof user.stripe_account_id === 'string' && user.stripe_account_id.startsWith('acct_');
+
+    if (hasStripeAccount && existingCollectionMethod) {
+      await connection.commit();
+      transactionStarted = false;
+      return res.status(200).json({
+        message: 'Método de cobro ya configurado',
+        stripe_account_id: user.stripe_account_id,
+        alreadyExists: true,
+      });
+    }
+
+    const accountPayload = {
+      email: user.email,
+      business_type: 'individual',
+      individual: {
+        first_name: firstName,
+        last_name: lastName,
+        id_number: nif,
+        dob: {
+          day: dateOfBirth.day,
+          month: dateOfBirth.month,
+          year: dateOfBirth.year,
+        },
+        address: {
+          line1: stripeAddressLine1,
+          line2: address2 || undefined,
+          postal_code: postalCode,
+          city,
+          state,
+          country,
+        },
+        email: user.email,
+        phone,
+        verification: {
+          document: {
+            front: fileTokenAnverso,
+            back: fileTokenReverso,
+          },
+        },
+      },
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+      business_profile: {
+        mcc: '7299',
+        product_description: 'Servicios profesionales',
+      },
+      tos_acceptance: {
+        date: Math.floor(Date.now() / 1000),
+        ip: getCollectionMethodRequestIp(req),
+      },
+    };
+
+    if (hasStripeAccount) {
+      stripeAccountId = user.stripe_account_id;
       try {
-        const account = await stripe.accounts.create({
-          type: 'custom',
-          country: country.toUpperCase(),
-          email: user.email,
-          business_type: 'individual',
-          individual: {
-            first_name: user.first_name,
-            last_name: user.surname,
-            id_number: nif,
-            dob: { day, month, year },
-            address: {
-              line1: address_1,
-              line2: address_2 || undefined,
-              postal_code,
-              city,
-              state,
-              country: country.toUpperCase()
-            },
-            email: user.email,
-            phone,
-            verification: {
-              document: {
-                front: fileTokenAnverso,
-                back: fileTokenReverso
-              }
-            }
-          },
-          capabilities: {
-            card_payments: { requested: true },
-            transfers: { requested: true }
-          },
-          business_profile: {
-            mcc: '7299',                      // Servicios varios (cambia si procede)
-            product_description: 'Servicios profesionales'
-          },
-          tos_acceptance: {
-            date: Math.floor(Date.now() / 1000), // fecha en segundos
-            ip: req.ip                           // IP real del usuario que acepta
-          }
-        });
-
-        const bank = await stripe.accounts.createExternalAccount(account.id, {
-          external_account: {
-            object: 'bank_account',
-            country: country.toUpperCase(),
-            currency: 'eur',
-            account_holder_name: full_name,
-            account_number: iban
-          }
-        });
-
-        const addressQuery =
-          'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-        const streetNumberValue = street_number || null;
-        const address2Value = address_2 || null;
-        const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country];
-        connection.query(addressQuery, addressValues, (addrErr, addrRes) => {
-          if (addrErr) {
-            connection.release();
-            console.error('Error al guardar la dirección:', addrErr);
-            return res.status(500).json({ error: 'Error al guardar la dirección.' });
-          }
-
-          const insertMethodQuery =
-            'INSERT INTO collection_method (user_id, type, external_account_id, last4, brand, address_id, full_name) VALUES (?, ?, ?, ?, ?, ?, ?)';
-          const last4 = iban.slice(-4);
-          connection.query(
-            insertMethodQuery,
-            [requestedUserId, 'iban', bank.id, last4, null, addrRes.insertId, full_name],
-            (cmErr) => {
-              if (cmErr) {
-                connection.release();
-                console.error('Error al guardar el método de cobro:', cmErr);
-                return res.status(500).json({ error: 'Error al guardar el método de cobro.' });
-              }
-
-              const updateQuery =
-                'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1, professional_started_datetime = IF(is_professional = 1, professional_started_datetime, NOW()) WHERE id = ?';
-              connection.query(updateQuery, [date_of_birth, nif, phone, account.id, requestedUserId], (updErr) => {
-                if (updErr) {
-                  connection.release();
-                  console.error('Error al actualizar el usuario:', updErr);
-                  return res.status(500).json({ error: 'Error al guardar la cuenta.' });
-                }
-
-                connection.release();
-                res.status(201).json({ message: 'Método de cobro creado', stripe_account_id: account.id });
-              });
-            }
-          );
-        });
-      } catch (stripeErr) {
-        connection.release();
-        console.error('Error al crear la cuenta de Stripe:', stripeErr);
-        res.status(500).json({ error: 'Error al crear la cuenta de cobro.' });
+        await stripe.accounts.update(stripeAccountId, accountPayload);
+      } catch (updateStripeAccountError) {
+        if (updateStripeAccountError?.code === 'resource_missing' || updateStripeAccountError?.statusCode === 404) {
+          const createdAccount = await stripe.accounts.create({
+            type: 'custom',
+            country,
+            ...accountPayload,
+          });
+          stripeAccountId = createdAccount.id;
+          createdStripeAccount = true;
+        } else {
+          throw updateStripeAccountError;
+        }
       }
+    } else {
+      const createdAccount = await stripe.accounts.create({
+        type: 'custom',
+        country,
+        ...accountPayload,
+      });
+      stripeAccountId = createdAccount.id;
+      createdStripeAccount = true;
+    }
+
+    const externalAccountPayload = {
+      object: 'bank_account',
+      country: bankCountry,
+      currency: bankCurrency,
+      account_holder_name: fullName,
+      account_number: usesUsBankAccount ? normalizedAccountNumber : normalizedIban,
+    };
+
+    if (usesUsBankAccount) {
+      externalAccountPayload.routing_number = normalizedRoutingNumber;
+    }
+
+    const bank = await stripe.accounts.createExternalAccount(stripeAccountId, {
+      external_account: externalAccountPayload,
     });
-  });
+    stripeExternalAccountId = bank.id;
+
+    let addressId = existingCollectionMethod?.address_id || null;
+    const streetNumberValue = streetNumber || null;
+    const address2Value = address2 || null;
+
+    if (addressId) {
+      await connection.query(
+        'UPDATE address SET address_type = ?, street_number = ?, address_1 = ?, address_2 = ?, postal_code = ?, city = ?, state = ?, country = ? WHERE id = ?',
+        [addressType, streetNumberValue, address1, address2Value, postalCode, city, state, country, addressId]
+      );
+    } else {
+      const [addressResult] = await connection.query(
+        'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [addressType, streetNumberValue, address1, address2Value, postalCode, city, state, country]
+      );
+      addressId = addressResult.insertId;
+    }
+
+    const last4 = (usesUsBankAccount ? normalizedAccountNumber : normalizedIban).slice(-4);
+    const collectionMethodBrand = usesUsBankAccount ? 'us_bank_account' : null;
+    if (existingCollectionMethod) {
+      await connection.query(
+        'UPDATE collection_method SET type = ?, external_account_id = ?, last4 = ?, brand = ?, currency = ?, address_id = ?, full_name = ? WHERE id = ?',
+        ['iban', stripeExternalAccountId, last4, collectionMethodBrand, bankCurrency, addressId, fullName, existingCollectionMethod.id]
+      );
+    } else {
+      await connection.query(
+        'INSERT INTO collection_method (user_id, type, external_account_id, last4, brand, currency, address_id, full_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [requestedUserId, 'iban', stripeExternalAccountId, last4, collectionMethodBrand, bankCurrency, addressId, fullName]
+      );
+    }
+
+    await connection.query(
+      'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1, professional_started_datetime = IF(is_professional = 1, professional_started_datetime, NOW()) WHERE id = ?',
+      [dateOfBirth.canonical, nif, phone, stripeAccountId, requestedUserId]
+    );
+
+    await connection.commit();
+    transactionStarted = false;
+
+    return res.status(201).json({
+      message: 'Método de cobro creado',
+      stripe_account_id: stripeAccountId,
+      alreadyExists: false,
+      bank_country: bankCountry,
+      bank_currency: bankCurrency,
+    });
+  } catch (stripeErr) {
+    if (transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch { }
+    }
+
+    await rollbackCollectionMethodStripeArtifacts({
+      accountId: stripeAccountId,
+      externalAccountId: stripeExternalAccountId,
+      createdAccount: createdStripeAccount,
+    });
+
+    console.error('Error al crear la cuenta de Stripe:', stripeErr);
+    const stripeMessage = typeof stripeErr?.message === 'string' ? stripeErr.message : null;
+    const statusCode = stripeErr?.type === 'StripeInvalidRequestError' ? 400 : 500;
+
+    return res.status(statusCode).json({
+      error: 'Error al crear la cuenta de cobro.',
+      stripeCode: stripeErr?.code || null,
+      stripeMessage,
+    });
+  } finally {
+    await releaseCollectionMethodCreationLock(connection, lockName);
+    connection.release();
+  }
 });
 
 app.post('/api/user/:id/id-document/detect-number', multerMid.single('file'), async (req, res) => {
