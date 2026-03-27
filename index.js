@@ -4687,6 +4687,11 @@ app.get('/api/service/:id', (req, res) => {
         ua.surname,
         ua.profile_picture,
         ua.is_professional,
+        ua.is_verified,
+        CASE
+          WHEN ua.stripe_account_id IS NOT NULL AND ua.stripe_account_id LIKE 'acct_%' THEN 1
+          ELSE 0
+        END AS has_payout_method,
         ua.language,
         -- Subconsulta para obtener los tags del servicio
         (SELECT JSON_ARRAYAGG(tag) 
