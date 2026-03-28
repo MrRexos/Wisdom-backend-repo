@@ -21,6 +21,13 @@ const fs = require('fs');
 const os = require('os');
 const { computeServiceResponseTime, computeServiceSuccessRate } = require('./src/serviceMetrics');
 const { createVisionIdDetector } = require('./src/visionIdDetection');
+const {
+  buildServiceSearchCandidateClause,
+  buildServiceSearchPlan,
+  buildServiceSearchRecommendedTaxonomy,
+  buildServiceSearchSuggestions,
+  rankServiceSearchCandidates,
+} = require('./src/serviceSearchEngine');
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
 const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
 const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
@@ -6139,6 +6146,7 @@ app.delete('/api/address/:id', (req, res) => {
 app.post('/api/bookings', (req, res) => {
   const {
     user_id,
+    address_id,
     address_type,
     street_number,
     address_1,
@@ -6158,6 +6166,11 @@ app.post('/api/bookings', (req, res) => {
     description // Nueva propiedad para la descripción
   } = req.body;
 
+  let normalizedAddressId = address_id;
+  if (normalizedAddressId === 'null' || normalizedAddressId === '') {
+    normalizedAddressId = null;
+  }
+
   // Verificación de campos requeridos para el usuario
   if (!user_id) {
     return res.status(400).json({ error: 'El campo user_id es requerido.' });
@@ -6176,6 +6189,28 @@ app.post('/api/bookings', (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
+    const continueWithBookingAddress = (nextAddressId) => {
+      createBooking(connection, user_id, service_id, nextAddressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res);
+    };
+
+    if (normalizedAddressId !== null && typeof normalizedAddressId !== 'undefined') {
+      connection.query('SELECT id FROM address WHERE id = ?', [normalizedAddressId], (validateError, rows) => {
+        if (validateError) {
+          connection.release();
+          console.error('Error al validar address_id:', validateError);
+          return res.status(500).json({ error: 'Error al validar address_id.' });
+        }
+
+        if (!rows || rows.length === 0) {
+          connection.release();
+          return res.status(400).json({ error: 'address_id no existe.' });
+        }
+
+        continueWithBookingAddress(Number(normalizedAddressId));
+      });
+      return;
+    }
+
     // Paso 1: Verificar si se necesita insertar la dirección
     if (address_type && address_1 && postal_code && city && state && country) {
       // Insertar la dirección en `address`
@@ -6192,11 +6227,11 @@ app.post('/api/bookings', (req, res) => {
         addressId = result.insertId; // ID de la dirección recién insertada
 
         // Paso 2: Insertar en la tabla `booking`
-        createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res);
+        continueWithBookingAddress(addressId);
       });
     } else {
       // Si no se necesita una dirección, se usa NULL para address_id
-      createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res);
+      continueWithBookingAddress(addressId);
     }
   });
 });
@@ -8627,109 +8662,57 @@ app.delete('/api/delete_booking/:id', (req, res) => {
 });
 
 //Ruta para obtener las sugerencias de busqueda de servicios
-app.get('/api/suggestions', (req, res) => {
-  const { query } = req.query;
+app.get('/api/suggestions', async (req, res) => {
+  const query = typeof req.query.query === 'string' ? req.query.query.trim() : '';
 
-  // Validar que se reciba el término de búsqueda
-  if (!query || typeof query !== 'string' || query.trim() === '') {
+  if (!query) {
     return res.status(400).json({ error: 'La consulta de búsqueda es requerida.' });
   }
 
-  // Conectar a la base de datos
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    // Definir el patrón de búsqueda
-    const searchPattern = `%${query}%`;
-
-    // Consulta para obtener sugerencias de búsqueda, eliminando duplicados
-    const searchQuery = `
+  try {
+    const searchPlan = buildServiceSearchPlan(query);
+    const searchClause = buildServiceSearchCandidateClause(searchPlan);
+    const suggestionQuery = `
       SELECT
-        s.service_title,
-        c.id AS service_category_id,
-        ct.category_key AS service_category_name,
-        f.id AS service_family_id,
-        f.family_key AS service_family,
-        t.tag
-      FROM service s 
-      LEFT JOIN service_category c ON s.service_category_id = c.id 
-      LEFT JOIN service_family f ON c.service_family_id = f.id 
-      LEFT JOIN service_category_type ct ON c.service_category_type_id = ct.id 
-      LEFT JOIN service_tags t ON s.id = t.service_id 
-      WHERE
-        s.is_hidden = 0
-        AND (
-          s.service_title LIKE ?
-          OR ct.category_key LIKE ?
-          OR f.family_key LIKE ?
-          OR t.tag LIKE ?
-        )
-      LIMIT 8
+        service.id AS service_id,
+        service.service_title,
+        service.description,
+        category.id AS service_category_id,
+        family.id AS service_family_id,
+        category_type.category_key,
+        family.family_key,
+        user_account.username,
+        user_account.first_name,
+        user_account.surname,
+        (
+          SELECT JSON_ARRAYAGG(st.tag)
+          FROM service_tags st
+          WHERE st.service_id = service.id
+        ) AS tags
+      FROM service
+      JOIN user_account ON service.user_id = user_account.id
+      JOIN service_category category ON service.service_category_id = category.id
+      JOIN service_family family ON category.service_family_id = family.id
+      JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+      WHERE service.is_hidden = 0
+        ${searchClause.sql}
+      ORDER BY service.service_created_datetime DESC
+      LIMIT 80;
     `;
 
-    // Ejecutar la consulta
-    connection.query(searchQuery,
-      [searchPattern, searchPattern, searchPattern, searchPattern],
-      (err, results) => {
-        connection.release(); // Liberar la conexión después de usarla
+    const [candidateRows] = await promisePool.query(suggestionQuery, searchClause.params);
+    const rankedRows = rankServiceSearchCandidates(searchPlan, candidateRows, { orderBy: 'recommend' });
+    const suggestions = buildServiceSearchSuggestions(searchPlan, rankedRows, 8);
 
-        if (err) {
-          console.error('Error al obtener las sugerencias:', err);
-          return res.status(500).json({ error: 'Error al obtener las sugerencias.' });
-        }
+    if (!suggestions.length) {
+      return res.status(200).json({ message: 'No se encontraron sugerencias.', notFound: true });
+    }
 
-        // Crear un array para almacenar las sugerencias únicas
-        const suggestions = [];
-        const uniqueKeys = new Set(); // Usamos un Set para asegurarnos de que no haya duplicados
-
-        results.forEach(result => {
-          // Agregar un solo valor por cada tipo de sugerencia si aún no ha sido agregado
-          // y asegurarse de que contenga la palabra de búsqueda
-          if (result.service_title && !uniqueKeys.has(result.service_title) && result.service_title.toLowerCase().includes(query.toLowerCase())) {
-            suggestions.push({ service_title: result.service_title });
-            uniqueKeys.add(result.service_title);
-          }
-          if (result.service_category_name && !uniqueKeys.has(result.service_category_name) && result.service_category_name.toLowerCase().includes(query.toLowerCase())) {
-            suggestions.push({
-              suggestion_type: 'category',
-              service_category_name: result.service_category_name,
-              category_key: result.service_category_name,
-              service_category_id: result.service_category_id,
-              service_family_id: result.service_family_id,
-              service_family_name: result.service_family,
-              family_key: result.service_family,
-            });
-            uniqueKeys.add(result.service_category_name);
-          }
-          if (result.service_family && !uniqueKeys.has(result.service_family) && result.service_family.toLowerCase().includes(query.toLowerCase())) {
-            suggestions.push({
-              suggestion_type: 'family',
-              service_family: result.service_family,
-              service_family_name: result.service_family,
-              family_key: result.service_family,
-              service_family_id: result.service_family_id,
-            });
-            uniqueKeys.add(result.service_family);
-          }
-          if (result.tag && !uniqueKeys.has(result.tag) && result.tag.toLowerCase().includes(query.toLowerCase())) {
-            suggestions.push({ tag: result.tag });
-            uniqueKeys.add(result.tag);
-          }
-        });
-
-        // Verificar si se encontraron resultados
-        if (suggestions.length === 0) {
-          return res.status(200).json({ message: 'No se encontraron sugerencias.', notFound: true });
-        }
-
-        // Devolver las sugerencias encontradas
-        res.status(200).json({ suggestions });
-      }
-    );
-  });
+    return res.status(200).json({ suggestions });
+  } catch (error) {
+    console.error('Error al obtener las sugerencias:', error);
+    return res.status(500).json({ error: 'Error al obtener las sugerencias.' });
+  }
 });
 
 app.get('/api/services/filter-categories', async (req, res) => {
@@ -8742,6 +8725,71 @@ app.get('/api/services/filter-categories', async (req, res) => {
 
   try {
     const filters = extractServiceFilters(req.query);
+
+    if (hasSearchTerm) {
+      const searchPlan = buildServiceSearchPlan(searchTerm);
+      const searchDistanceExpression = buildDistanceExpression({
+        latColumn: 'service.latitude',
+        lngColumn: 'service.longitude',
+        originLat: filters.originLat,
+        originLng: filters.originLng,
+      });
+      const searchFiltersClause = buildServiceFilterClause(filters, { distanceExpression: searchDistanceExpression });
+      const searchClause = buildServiceSearchCandidateClause(searchPlan);
+      const candidateQuery = `
+        SELECT
+          service.id AS service_id,
+          service.service_title,
+          service.description,
+          category.id AS service_category_id,
+          family.id AS service_family_id,
+          category_type.category_key,
+          family.family_key,
+          user_account.username,
+          user_account.first_name,
+          user_account.surname,
+          (
+            SELECT JSON_ARRAYAGG(st.tag)
+            FROM service_tags st
+            WHERE st.service_id = service.id
+          ) AS tags
+        FROM service
+        JOIN price ON service.price_id = price.id
+        JOIN user_account ON service.user_id = user_account.id
+        JOIN service_category category ON service.service_category_id = category.id
+        JOIN service_family family ON category.service_family_id = family.id
+        JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+        LEFT JOIN (
+          SELECT
+            service_id,
+            COUNT(*) AS review_count,
+            AVG(rating) AS average_rating
+          FROM review
+          GROUP BY service_id
+        ) AS review_data ON service.id = review_data.service_id
+        WHERE service.is_hidden = 0
+          ${searchClause.sql}
+          ${searchFiltersClause.sql}
+        ORDER BY service.service_created_datetime DESC
+        LIMIT 250;
+      `;
+
+      const [candidateRows] = await promisePool.query(candidateQuery, [
+        ...searchClause.params,
+        ...searchFiltersClause.params,
+      ]);
+      const rankedRows = rankServiceSearchCandidates(searchPlan, candidateRows, {
+        orderBy: 'recommend',
+        durationMinutes: filters.durationMinutes,
+      });
+      const recommendations = buildServiceSearchRecommendedTaxonomy(rankedRows, {
+        limit,
+        selectedCategoryId: categoryId,
+      });
+
+      return res.status(200).json(recommendations);
+    }
+
     const mergedRows = [];
     const seenSuggestionIds = new Set();
     const addRows = (rows = [], suggestionType = 'category') => {
@@ -9054,6 +9102,226 @@ app.get('/api/services', async (req, res) => {
     : '';
   const distanceSelectParams = includeDistanceColumn ? [...distanceExpression.params] : [];
   const categoryClause = Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : '';
+
+  if (hasSearchTerm) {
+    const searchPlan = buildServiceSearchPlan(searchTerm);
+    const searchClause = buildServiceSearchCandidateClause(searchPlan);
+    const candidateQuery = `
+      SELECT
+        service.id AS service_id,
+        service.service_title,
+        service.description,
+        service.service_category_id,
+        service.price_id,
+        service.latitude,
+        service.longitude,
+        service.action_rate,
+        service.user_can_ask,
+        service.user_can_consult,
+        service.price_consult,
+        service.consult_via_id,
+        service.is_individual,
+        service.is_hidden,
+        service.service_created_datetime,
+        service.last_edit_datetime,
+        price.price,
+        price.price_type,
+        user_account.id AS user_id,
+        user_account.email,
+        user_account.phone,
+        user_account.username,
+        user_account.first_name,
+        user_account.surname,
+        user_account.profile_picture,
+        user_account.is_professional,
+        user_account.is_verified,
+        user_account.language,
+        COALESCE(review_data.review_count, 0) AS review_count,
+        COALESCE(review_data.average_rating, 0) AS average_rating,
+        COALESCE(booking_data.confirmed_booking_count, 0) AS booking_count,
+        COALESCE(repeat_data.repeated_bookings_count, 0) AS repeated_bookings_count,
+        COALESCE(likes_data.likes_count, 0) AS likes_count,
+        category_type.category_key,
+        family.family_key,
+        category_type.category_key AS service_category_name,
+        family.family_key AS service_family,
+        family.id AS service_family_id,
+        tags_data.tags,
+        images_data.images,
+        language_data.languages
+        ${distanceSelect}
+      FROM service
+      JOIN price ON service.price_id = price.id
+      JOIN user_account ON service.user_id = user_account.id
+      JOIN service_category category ON service.service_category_id = category.id
+      JOIN service_family family ON category.service_family_id = family.id
+      JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          COUNT(*) AS review_count,
+          AVG(rating) AS average_rating
+        FROM review
+        GROUP BY service_id
+      ) AS review_data ON service.id = review_data.service_id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          SUM(CASE WHEN LOWER(booking_status) IN ('accepted', 'confirmed', 'completed') THEN 1 ELSE 0 END) AS confirmed_booking_count
+        FROM booking
+        GROUP BY service_id
+      ) AS booking_data ON service.id = booking_data.service_id
+      LEFT JOIN (
+        SELECT
+          service_id,
+          COALESCE(SUM(completed_count) - COUNT(*), 0) AS repeated_bookings_count
+        FROM (
+          SELECT
+            service_id,
+            user_id,
+            COUNT(*) AS completed_count
+          FROM booking
+          WHERE LOWER(booking_status) = 'completed'
+          GROUP BY service_id, user_id
+        ) AS completed_by_user
+        GROUP BY service_id
+      ) AS repeat_data ON service.id = repeat_data.service_id
+      LEFT JOIN (
+        SELECT
+          il.service_id,
+          COUNT(DISTINCT sl.user_id) AS likes_count
+        FROM item_list il
+        JOIN service_list sl ON il.list_id = sl.id
+        GROUP BY il.service_id
+      ) AS likes_data ON likes_data.service_id = service.id
+      LEFT JOIN (
+        SELECT
+          ordered_tags.service_id,
+          JSON_ARRAYAGG(ordered_tags.tag) AS tags
+        FROM (
+          SELECT service_id, tag
+          FROM service_tags
+          ORDER BY service_id, tag
+        ) AS ordered_tags
+        GROUP BY ordered_tags.service_id
+      ) AS tags_data ON tags_data.service_id = service.id
+      LEFT JOIN (
+        SELECT
+          ordered_images.service_id,
+          JSON_ARRAYAGG(
+            JSON_OBJECT(
+              'id', ordered_images.id,
+              'image_url', ordered_images.image_url,
+              'object_name', ordered_images.object_name,
+              'order', ordered_images.\`order\`
+            )
+          ) AS images
+        FROM (
+          SELECT
+            si.service_id,
+            si.id,
+            si.image_url,
+            si.object_name,
+            si.\`order\`
+          FROM service_image si
+          ORDER BY si.service_id, si.\`order\`
+        ) AS ordered_images
+        GROUP BY ordered_images.service_id
+      ) AS images_data ON images_data.service_id = service.id
+      LEFT JOIN (
+        SELECT service_id, JSON_ARRAYAGG(language) AS languages
+        FROM service_language
+        GROUP BY service_id
+      ) AS language_data ON language_data.service_id = service.id
+      WHERE service.is_hidden = 0
+        ${searchClause.sql}
+        ${categoryClause}
+        ${filtersClause.sql}
+      ORDER BY service.service_created_datetime DESC;
+    `;
+
+    try {
+      const params = [
+        ...distanceSelectParams,
+        ...searchClause.params,
+      ];
+      if (Number.isFinite(categoryId)) {
+        params.push(categoryId);
+      }
+      params.push(...filtersClause.params);
+
+      const [candidateRows] = await promisePool.query(candidateQuery, params);
+      const rankedRows = rankServiceSearchCandidates(searchPlan, candidateRows, {
+        orderBy,
+        durationMinutes: filters.durationMinutes,
+      });
+
+      if (!rankedRows.length) {
+        return res.status(200).json({
+          notFound: true,
+          message: 'No se encontraron servicios que coincidan con la búsqueda.'
+        });
+      }
+
+      let likedServiceIds = new Set();
+      if (Number.isFinite(viewerId)) {
+        const serviceIds = rankedRows
+          .map((service) => service.service_id)
+          .filter((serviceId) => serviceId !== null && serviceId !== undefined);
+
+        if (serviceIds.length > 0) {
+          const placeholders = serviceIds.map(() => '?').join(', ');
+          const likedQuery = `
+            SELECT DISTINCT il.service_id
+            FROM item_list il
+            JOIN service_list sl ON il.list_id = sl.id
+            LEFT JOIN shared_list sh ON sh.list_id = il.list_id
+            WHERE (sl.user_id = ? OR sh.user_id = ?)
+              AND il.service_id IN (${placeholders})
+          `;
+
+          try {
+            const [likedRows] = await promisePool.query(
+              likedQuery,
+              [viewerId, viewerId, ...serviceIds]
+            );
+            likedServiceIds = new Set(likedRows.map((row) => Number(row.service_id)));
+          } catch (likeError) {
+            console.error('Error consultando liked services:', likeError);
+          }
+        }
+      }
+
+      const parseJsonSafe = (value, fallback) => {
+        if (Array.isArray(value)) return value;
+        if (value === null || value === undefined) return fallback;
+        if (typeof value === 'string') {
+          try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) ? parsed : parsed ?? fallback;
+          } catch (error) {
+            return fallback;
+          }
+        }
+        return value ?? fallback;
+      };
+
+      const services = rankedRows.map((service) => ({
+        ...service,
+        tags: parseJsonSafe(service.tags, []),
+        images: parseJsonSafe(service.images, []),
+        languages: parseJsonSafe(service.languages, []),
+        distance_km: service.distance_km !== undefined && service.distance_km !== null ? Number(service.distance_km) : null,
+        is_liked: likedServiceIds.has(Number(service.service_id)) ? 1 : 0,
+      }));
+
+      return res.status(200).json(services);
+    } catch (error) {
+      console.error('Error al obtener la información de los servicios:', error);
+      return res.status(500).json({ error: 'Error al obtener la información de los servicios.' });
+    }
+  }
+
   const comparablePriceExpression = buildComparablePriceExpression({ priceAlias: 'price', durationMinutes: filters.durationMinutes });
   const bayesianRatingExpression = buildBayesianRatingExpression({ reviewAlias: 'review_data' });
   const recommendDistanceBoostExpression = includeDistanceColumn
@@ -9424,6 +9692,63 @@ app.get('/api/services/count', async (req, res) => {
   });
   const filtersClause = buildServiceFilterClause(filters, { distanceExpression });
   const categoryClause = Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : '';
+
+  if (hasSearchTerm) {
+    try {
+      const searchPlan = buildServiceSearchPlan(searchTerm);
+      const searchClause = buildServiceSearchCandidateClause(searchPlan);
+      const candidateQuery = `
+        SELECT
+          service.id AS service_id,
+          service.service_title,
+          service.description,
+          category.id AS service_category_id,
+          family.id AS service_family_id,
+          category_type.category_key,
+          family.family_key,
+          user_account.username,
+          user_account.first_name,
+          user_account.surname,
+          (
+            SELECT JSON_ARRAYAGG(st.tag)
+            FROM service_tags st
+            WHERE st.service_id = service.id
+          ) AS tags
+        FROM service
+        JOIN price ON service.price_id = price.id
+        JOIN user_account ON service.user_id = user_account.id
+        JOIN service_category category ON service.service_category_id = category.id
+        JOIN service_family family ON category.service_family_id = family.id
+        JOIN service_category_type category_type ON category.service_category_type_id = category_type.id
+        LEFT JOIN (
+          SELECT service_id, COUNT(*) AS review_count, AVG(rating) AS average_rating
+          FROM review
+          GROUP BY service_id
+        ) AS review_data ON service.id = review_data.service_id
+        WHERE service.is_hidden = 0
+          ${searchClause.sql}
+          ${categoryClause}
+          ${filtersClause.sql};
+      `;
+
+      const params = [
+        ...searchClause.params,
+      ];
+      if (Number.isFinite(categoryId)) params.push(categoryId);
+      params.push(...filtersClause.params);
+
+      const [candidateRows] = await promisePool.query(candidateQuery, params);
+      const rankedRows = rankServiceSearchCandidates(searchPlan, candidateRows, {
+        orderBy: 'recommend',
+        durationMinutes: filters.durationMinutes,
+      });
+
+      return res.status(200).json({ count: rankedRows.length });
+    } catch (error) {
+      console.error('Error al contar servicios:', error);
+      return res.status(500).json({ error: 'Error al contar los servicios.' });
+    }
+  }
 
   const countQuery = `
     SELECT COUNT(DISTINCT service.id) AS total
