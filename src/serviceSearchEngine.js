@@ -156,6 +156,39 @@ const FIELD_WEIGHTS = Object.freeze({
   },
 });
 
+const CONTROLLED_TERM_GROUPS = Object.freeze([
+  ['paseador', 'walker', 'walking'],
+  ['paseador de perros', 'dog walker'],
+  ['cuidador', 'cuidadora', 'caregiver', 'caretaker', 'carer', 'sitter'],
+  ['cuidador de mascotas', 'pet sitter', 'pet care'],
+  ['niñera', 'babysitter', 'nanny', 'childcare'],
+  ['limpieza', 'cleaning', 'cleaner', 'housekeeping'],
+  ['limpieza del hogar', 'home cleaning', 'house cleaning'],
+  ['chef', 'cook', 'private chef'],
+  ['fontanero', 'plumber', 'plumbing'],
+  ['electricista', 'electrician', 'electrical'],
+  ['cerrajero', 'locksmith'],
+  ['jardinero', 'gardener', 'gardening'],
+  ['peluquero', 'peluquera', 'hairdresser', 'hairstylist'],
+  ['barbero', 'barber', 'barbershop'],
+  ['maquillador', 'maquilladora', 'makeup artist', 'makeup'],
+  ['masajista', 'massage therapist', 'massage'],
+  ['fisioterapeuta', 'physiotherapist', 'physical therapist', 'physio'],
+  ['psicologo', 'psicologa', 'psychologist', 'therapist', 'therapy'],
+  ['entrenador', 'entrenadora', 'trainer', 'coach'],
+  ['profesor', 'profesora', 'teacher', 'tutor', 'lessons'],
+  ['fotografo', 'fotografa', 'photographer', 'photography'],
+  ['videografo', 'videografa', 'videographer', 'videography'],
+  ['abogado', 'abogada', 'lawyer', 'attorney', 'legal'],
+  ['traductor', 'traductora', 'translator', 'translation'],
+  ['conductor', 'conductora', 'driver', 'chauffeur'],
+  ['mecanico', 'mecanica', 'mechanic'],
+  ['mudanza', 'moving', 'mover'],
+  ['disenador', 'disenadora', 'designer', 'design'],
+  ['desarrollador', 'desarrolladora', 'developer', 'development'],
+  ['programador', 'programadora', 'programmer', 'software'],
+]);
+
 function decodeHtmlEntities(value) {
   return String(value || '')
     .replace(/&amp;/gi, '&')
@@ -286,6 +319,75 @@ function buildConceptStore(scope) {
 const CATEGORY_CONCEPTS = buildConceptStore('categories');
 const FAMILY_CONCEPTS = buildConceptStore('families');
 
+function buildControlledTermIndex(groups) {
+  const index = new Map();
+
+  groups.forEach((group) => {
+    const normalizedGroup = uniqueValues(group.map((value) => normalizeServiceSearchText(value)).filter(Boolean));
+    normalizedGroup.forEach((term) => {
+      index.set(term, normalizedGroup);
+    });
+  });
+
+  return index;
+}
+
+const CONTROLLED_TERM_INDEX = buildControlledTermIndex(CONTROLLED_TERM_GROUPS);
+
+function buildTokenNgrams(tokens, maxSize = 3) {
+  const list = Array.isArray(tokens) ? tokens.filter(Boolean) : [];
+  const ngrams = [];
+
+  for (let size = 1; size <= maxSize; size += 1) {
+    for (let start = 0; start <= list.length - size; start += 1) {
+      ngrams.push(list.slice(start, start + size).join(' '));
+    }
+  }
+
+  return uniqueValues(ngrams);
+}
+
+function resolveControlledEquivalentTerms(values, maxTerms = 12) {
+  const equivalents = [];
+  const seen = new Set();
+
+  (Array.isArray(values) ? values : [values]).forEach((value) => {
+    const normalizedValue = normalizeServiceSearchText(value);
+    if (!normalizedValue) return;
+
+    const group = CONTROLLED_TERM_INDEX.get(normalizedValue);
+    if (!group) return;
+
+    group.forEach((candidate) => {
+      if (!candidate || candidate === normalizedValue || seen.has(candidate)) {
+        return;
+      }
+      seen.add(candidate);
+      equivalents.push(candidate);
+    });
+  });
+
+  return equivalents.slice(0, maxTerms);
+}
+
+function createTokenProfile(token, equivalentTokens = []) {
+  const normalizedToken = normalizeServiceSearchText(token);
+  const normalizedEquivalentTokens = uniqueValues(
+    (equivalentTokens || [])
+      .map((value) => normalizeServiceSearchText(value))
+      .filter((value) => value && value !== normalizedToken)
+  );
+
+  return {
+    token: normalizedToken,
+    roots: deriveRoots(normalizedToken),
+    equivalentProfiles: normalizedEquivalentTokens.map((value) => ({
+      token: value,
+      roots: deriveRoots(value),
+    })),
+  };
+}
+
 function commonPrefixLength(left, right) {
   const a = String(left || '');
   const b = String(right || '');
@@ -344,8 +446,11 @@ function boundedLevenshtein(left, right, maxDistance = 2) {
   return previous[bLength] <= maxDistance ? previous[bLength] : null;
 }
 
-function compareQueryTokenToFieldToken(tokenProfile, fieldToken) {
-  const queryToken = tokenProfile?.token || '';
+function compareTokenVariantToFieldToken(tokenVariant, fieldToken, {
+  scoreMultiplier = 1,
+  allowFuzzy = true,
+} = {}) {
+  const queryToken = tokenVariant?.token || '';
   const candidateToken = normalizeServiceSearchText(fieldToken);
 
   if (!queryToken || !candidateToken) {
@@ -353,41 +458,60 @@ function compareQueryTokenToFieldToken(tokenProfile, fieldToken) {
   }
 
   if (queryToken === candidateToken) {
-    return { type: 'exact', score: 1 };
+    return { type: 'exact', score: 1 * scoreMultiplier };
   }
 
   if (
     queryToken.length >= 4 &&
     (candidateToken.startsWith(queryToken) || queryToken.startsWith(candidateToken))
   ) {
-    return { type: 'prefix', score: 0.86 };
+    return { type: 'prefix', score: 0.86 * scoreMultiplier };
   }
 
   const sharedPrefix = commonPrefixLength(queryToken, candidateToken);
   if (sharedPrefix >= 5 && Math.min(queryToken.length, candidateToken.length) >= 5) {
-    return { type: 'root', score: 0.72 };
+    return { type: 'root', score: 0.72 * scoreMultiplier };
   }
 
   const candidateRoots = deriveRoots(candidateToken);
-  const hasSharedRoot = tokenProfile.roots.some((root) => (
+  const hasSharedRoot = (tokenVariant?.roots || []).some((root) => (
     root.length >= 4 && candidateRoots.includes(root)
   ));
   if (hasSharedRoot) {
-    return { type: 'root', score: 0.74 };
+    return { type: 'root', score: 0.74 * scoreMultiplier };
   }
 
-  if (Math.min(queryToken.length, candidateToken.length) >= 5) {
+  if (allowFuzzy && Math.min(queryToken.length, candidateToken.length) >= 5) {
     const maxDistance = queryToken.length >= 8 && candidateToken.length >= 8 ? 2 : 1;
     const distance = boundedLevenshtein(queryToken, candidateToken, maxDistance);
     if (distance !== null) {
       return {
         type: 'fuzzy',
-        score: distance === 1 ? 0.64 : 0.54,
+        score: (distance === 1 ? 0.64 : 0.54) * scoreMultiplier,
       };
     }
   }
 
   return null;
+}
+
+function compareQueryTokenToFieldToken(tokenProfile, fieldToken) {
+  const originalMatch = compareTokenVariantToFieldToken(tokenProfile, fieldToken);
+  let bestMatch = originalMatch;
+
+  (tokenProfile?.equivalentProfiles || []).forEach((equivalentProfile) => {
+    const candidateMatch = compareTokenVariantToFieldToken(equivalentProfile, fieldToken, {
+      scoreMultiplier: 0.78,
+      allowFuzzy: false,
+    });
+    if (!candidateMatch) return;
+
+    if (!bestMatch || candidateMatch.score > bestMatch.score) {
+      bestMatch = candidateMatch;
+    }
+  });
+
+  return bestMatch;
 }
 
 function getFieldWeightByMatchType(weights, type) {
@@ -412,26 +536,40 @@ function scorePlanAgainstField(searchPlan, fieldIndex, weights) {
   let score = 0;
   let hasPhraseMatch = false;
 
-  if (searchPlan.normalizedQuery.length >= 2) {
+  let bestPhraseScore = 0;
+  (searchPlan.phraseProfiles || []).forEach((phraseProfile) => {
+    const phrase = phraseProfile?.phrase || '';
+    const compactPhrase = phraseProfile?.compactPhrase || '';
+    const multiplier = Number.isFinite(Number(phraseProfile?.multiplier))
+      ? Number(phraseProfile.multiplier)
+      : 1;
+
+    if (phrase.length < 2) return;
+
+    let phraseScore = 0;
     if (
-      fieldIndex.phraseSet.has(searchPlan.normalizedQuery)
-      || fieldIndex.compactPhraseSet.has(searchPlan.compactQuery)
+      fieldIndex.phraseSet.has(phrase)
+      || (compactPhrase && fieldIndex.compactPhraseSet.has(compactPhrase))
     ) {
-      score += weights.exactPhrase || 0;
-      hasPhraseMatch = true;
+      phraseScore = (weights.exactPhrase || 0) * multiplier;
     } else {
-      const containsQuery = fieldIndex.phrases.some((phrase) => (
-        phrase.includes(searchPlan.normalizedQuery)
+      const containsQuery = fieldIndex.phrases.some((candidatePhrase) => (
+        candidatePhrase.includes(phrase)
       ));
-      const containsCompactQuery = searchPlan.compactQuery.length >= 4
-        && fieldIndex.compactPhrases.some((phrase) => phrase.includes(searchPlan.compactQuery));
+      const containsCompactQuery = compactPhrase.length >= 4
+        && fieldIndex.compactPhrases.some((candidatePhrase) => candidatePhrase.includes(compactPhrase));
 
       if (containsQuery || containsCompactQuery) {
-        score += weights.containsPhrase || 0;
-        hasPhraseMatch = true;
+        phraseScore = (weights.containsPhrase || 0) * multiplier;
       }
     }
-  }
+
+    if (phraseScore > bestPhraseScore) {
+      bestPhraseScore = phraseScore;
+      hasPhraseMatch = true;
+    }
+  });
+  score += bestPhraseScore;
 
   const matchedTokenIndexes = new Set();
   searchPlan.tokenProfiles.forEach((tokenProfile, tokenIndex) => {
@@ -493,17 +631,52 @@ function buildServiceSearchPlan(query) {
   const primaryTokens = rawTokens.filter((token) => token.length >= 2 && !STOP_WORDS.has(token));
   const fallbackTokens = rawTokens.filter((token) => token.length >= 2);
   const significantTokens = uniqueValues(primaryTokens.length > 0 ? primaryTokens : fallbackTokens).slice(0, 8);
-  const tokenProfiles = significantTokens.map((token) => ({
-    token,
-    roots: deriveRoots(token),
-  }));
+  const ngramCandidates = buildTokenNgrams(rawTokens, 3);
+  const controlledEquivalentTerms = resolveControlledEquivalentTerms([
+    normalizedQuery,
+    ...ngramCandidates,
+    ...significantTokens,
+  ], 14);
+  const equivalentSingleTokens = uniqueValues(
+    controlledEquivalentTerms
+      .filter((term) => !term.includes(' '))
+      .filter((term) => term.length >= 3)
+  ).slice(0, 10);
+  const equivalentPhrases = uniqueValues(
+    controlledEquivalentTerms
+      .filter((term) => term.includes(' '))
+      .filter((term) => term.length >= 4)
+  ).slice(0, 8);
+  const tokenProfiles = significantTokens.map((token) => (
+    createTokenProfile(
+      token,
+      resolveControlledEquivalentTerms([token], 6)
+        .filter((candidate) => !candidate.includes(' '))
+    )
+  ));
+  const phraseProfiles = [
+    ...(normalizedQuery ? [{
+      phrase: normalizedQuery,
+      compactPhrase: normalizedQuery.replace(/\s+/g, ''),
+      multiplier: 1,
+      isExpanded: false,
+    }] : []),
+    ...equivalentPhrases.map((phrase) => ({
+      phrase,
+      compactPhrase: phrase.replace(/\s+/g, ''),
+      multiplier: 0.78,
+      isExpanded: true,
+    })),
+  ];
 
   const searchPlan = {
     rawQuery,
     normalizedQuery,
     compactQuery: normalizedQuery.replace(/\s+/g, ''),
+    phraseProfiles,
     tokenProfiles,
     hasMeaningfulSearch: normalizedQuery.length > 0,
+    controlledEquivalentTerms,
   };
 
   const matchedCategories = getConceptMatches(searchPlan, CATEGORY_CONCEPTS, FIELD_WEIGHTS.category, 34, 8);
@@ -511,7 +684,11 @@ function buildServiceSearchPlan(query) {
 
   return {
     ...searchPlan,
-    sqlTokenPatterns: uniqueValues(tokenProfiles.map((profile) => profile.token).filter((token) => token.length >= 3)).slice(0, 6),
+    sqlTokenPatterns: uniqueValues([
+      ...tokenProfiles.map((profile) => profile.token),
+      ...equivalentSingleTokens,
+    ].filter((token) => token.length >= 3)).slice(0, 10),
+    sqlExpandedPhrasePatterns: equivalentPhrases.slice(0, 6),
     matchedCategories,
     matchedFamilies,
     matchedCategoryKeys: matchedCategories.map((item) => item.key),
@@ -556,6 +733,23 @@ function buildServiceSearchCandidateClause(searchPlan, {
   if (searchPlan.normalizedQuery.length >= 4) {
     pushClause(`LOWER(${serviceAlias}.description) LIKE LOWER(?)`, [rawPattern]);
   }
+
+  (searchPlan.sqlExpandedPhrasePatterns || []).forEach((phrase) => {
+    const phrasePattern = `%${phrase}%`;
+    pushClause(`LOWER(${serviceAlias}.service_title) LIKE LOWER(?)`, [phrasePattern]);
+    pushClause(
+      `EXISTS (
+        SELECT 1
+        FROM service_tags st
+        WHERE st.service_id = ${serviceAlias}.id
+          AND LOWER(st.tag) LIKE LOWER(?)
+      )`,
+      [phrasePattern]
+    );
+    if (phrase.length >= 5) {
+      pushClause(`LOWER(${serviceAlias}.description) LIKE LOWER(?)`, [phrasePattern]);
+    }
+  });
 
   if (searchPlan.matchedCategoryKeys.length > 0) {
     pushClause(
@@ -717,6 +911,10 @@ function annotateServiceSearchCandidate(searchPlan, row) {
 
   if (strongFieldHits >= 2) {
     totalScore += Math.min(18, (strongFieldHits - 1) * 5);
+  }
+
+  if (tokenCount >= 2 && matchedTokensCount === 1 && !hasPhraseMatch) {
+    totalScore *= 0.58;
   }
 
   const minimumScore = tokenCount <= 1 ? 24 : 36;
