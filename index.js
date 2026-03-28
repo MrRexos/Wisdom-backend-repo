@@ -373,14 +373,6 @@ function formatDateTimeEs(date) {
   });
 }
 
-function formatCurrencyEUR(amount) {
-  if (!Number.isFinite(amount)) return 'No disponible';
-  return new Intl.NumberFormat('es-ES', {
-    style: 'currency',
-    currency: 'EUR'
-  }).format(amount);
-}
-
 function composeDisplayName({ firstName, surname, username, email }) {
   const fullName = [firstName, surname].filter(Boolean).join(' ').trim();
   if (fullName) return fullName;
@@ -435,6 +427,121 @@ const round2 = (n) => {
   if (!Number.isFinite(x)) return 0;
   return Math.round(x * 100) / 100;
 };
+
+const CURRENCY_ALIASES = Object.freeze({
+  RMB: 'CNY',
+});
+
+// Base EUR reference rates snapshot (ECB reference rates for 27 March 2026 where available).
+// AED and SAR are inferred from their long-standing USD pegs, and MAD uses an approximate
+// late-March 2026 market reference because the ECB table does not publish MAD on that page.
+const EUR_BASE_EXCHANGE_RATES = Object.freeze({
+  EUR: 1,
+  USD: 1.1517,
+  GBP: 0.8672,
+  JPY: 184.16,
+  CAD: 1.5974,
+  MXN: 20.7971,
+  BRL: 6.0535,
+  CNY: 7.9626,
+  INR: 109.1945,
+  AUD: 1.6731,
+  SGD: 1.4831,
+  HKD: 9.0223,
+  NZD: 2.0019,
+  KRW: 1740.79,
+  PHP: 69.752,
+  CHF: 0.9178,
+  AED: 4.2291,
+  SAR: 4.3189,
+  TRY: 51.2001,
+  ZAR: 19.7984,
+  MAD: 10.82,
+});
+
+const STRIPE_ZERO_DECIMAL_CURRENCIES = new Set(['JPY', 'KRW']);
+
+function getExchangeRatePerEuro(currency) {
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const rate = EUR_BASE_EXCHANGE_RATES[normalizedCurrency];
+  return Number.isFinite(rate) && rate > 0 ? rate : 1;
+}
+
+function convertAmount(amount, fromCurrency = 'EUR', toCurrency = 'EUR') {
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount)) {
+    return 0;
+  }
+
+  const normalizedFrom = normalizeCurrencyCode(fromCurrency, 'EUR');
+  const normalizedTo = normalizeCurrencyCode(toCurrency, 'EUR');
+  if (normalizedFrom === normalizedTo) {
+    return round2(numericAmount);
+  }
+
+  const fromRate = getExchangeRatePerEuro(normalizedFrom);
+  const toRate = getExchangeRatePerEuro(normalizedTo);
+  return round2((numericAmount / fromRate) * toRate);
+}
+
+function getMinimumCommissionAmount(currency) {
+  return round1(convertAmount(1, 'EUR', currency));
+}
+
+function getStripeMinorUnitFactor(currency) {
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  return STRIPE_ZERO_DECIMAL_CURRENCIES.has(normalizedCurrency) ? 1 : 100;
+}
+
+function toMinorUnits(amount, currency = 'EUR') {
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount)) {
+    return 0;
+  }
+
+  return Math.round(numericAmount * getStripeMinorUnitFactor(currency));
+}
+
+function fromMinorUnits(amountMinorUnits, currency = 'EUR') {
+  const numericAmount = Number(amountMinorUnits);
+  if (!Number.isFinite(numericAmount)) {
+    return 0;
+  }
+
+  return round2(numericAmount / getStripeMinorUnitFactor(currency));
+}
+
+function toStripeCurrencyCode(currency) {
+  return normalizeCurrencyCode(currency, 'EUR').toLowerCase();
+}
+
+function formatCurrencyAmount(amount, currency = 'EUR', locale = 'es-ES') {
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount)) {
+    return 'No disponible';
+  }
+
+  return new Intl.NumberFormat(locale, {
+    style: 'currency',
+    currency: normalizeCurrencyCode(currency, 'EUR'),
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(numericAmount);
+}
+
+function buildCurrencyRateCaseExpression(currencyExpression) {
+  const whenClauses = Object.entries(EUR_BASE_EXCHANGE_RATES)
+    .map(([currencyCode, rate]) => `WHEN '${currencyCode}' THEN ${rate}`)
+    .join(' ');
+
+  return `
+    CASE UPPER(COALESCE(${currencyExpression}, 'EUR'))
+      WHEN 'RMB' THEN ${EUR_BASE_EXCHANGE_RATES.CNY}
+      ${whenClauses}
+      ELSE 1
+    END
+  `.trim();
+}
 
 function parseQueryNumber(value) {
   if (value === undefined || value === null || value === '') return null;
@@ -546,6 +653,7 @@ function extractServiceFilters(query) {
 function buildComparablePriceExpression({
   priceAlias = 'price',
   durationMinutes = null,
+  targetCurrency = 'EUR',
 } = {}) {
   const safeDurationMinutes = Number.isFinite(durationMinutes) && durationMinutes > 0
     ? durationMinutes
@@ -553,11 +661,20 @@ function buildComparablePriceExpression({
   const durationFactor = safeDurationMinutes !== null
     ? safeDurationMinutes / 60
     : 1;
-
-  return `
+  const targetRate = getExchangeRatePerEuro(targetCurrency);
+  const sourceRateExpression = buildCurrencyRateCaseExpression(`${priceAlias}.currency`);
+  const sourceAmountExpression = `
     CASE
       WHEN ${priceAlias}.price_type = 'fix' THEN ${priceAlias}.price
       WHEN ${priceAlias}.price_type = 'hour' THEN ${priceAlias}.price * ${durationFactor}
+      ELSE NULL
+    END
+  `.trim();
+
+  return `
+    CASE
+      WHEN ${priceAlias}.price_type IN ('fix', 'hour')
+        THEN ((${sourceAmountExpression}) / NULLIF(${sourceRateExpression}, 0)) * ${targetRate}
       ELSE NULL
     END
   `.trim();
@@ -582,6 +699,7 @@ function buildServiceFilterClause(filters, {
   userAlias = 'user_account',
   reviewAlias = 'review_data',
   distanceExpression = null,
+  targetCurrency = 'EUR',
 } = {}) {
   const clauses = [];
   const params = [];
@@ -607,7 +725,7 @@ function buildServiceFilterClause(filters, {
   } = filters;
 
   if (minPrice !== null || maxPrice !== null) {
-    const comparablePriceExpression = buildComparablePriceExpression({ priceAlias, durationMinutes });
+    const comparablePriceExpression = buildComparablePriceExpression({ priceAlias, durationMinutes, targetCurrency });
     const knownPriceConditions = [`${priceAlias}.price_type IN ('fix', 'hour')`];
 
     if (minPrice !== null) {
@@ -904,19 +1022,20 @@ function resolveImageUrl(image) {
 }
 
 // Recalcula base, comisión y total como en BookingScreen.pricing
-function computePricing({ priceType, unitPrice, durationMinutes }) {
+function computePricing({ priceType, unitPrice, durationMinutes, currency = 'EUR' }) {
   const type = String(priceType || '').toLowerCase();
   const unit = Number.parseFloat(unitPrice) || 0;
   const minutes = Math.max(0, Math.round(Number(durationMinutes) || 0));
   const hours = minutes / 60;
+  const pricingCurrency = normalizeCurrencyCode(currency, 'EUR');
 
   let base = 0;
   if (type === 'hour') base = unit * hours;
   else base = unit;
   base = round2(base);
 
-  let commission;
-  commission = Math.max(1, round1(base * 0.1));
+  const minimumCommission = getMinimumCommissionAmount(pricingCurrency);
+  const commission = Math.max(minimumCommission, round1(base * 0.1));
 
   const shouldNullFinal = (type === 'hour' || type === 'budget') && minutes <= 0;
   const final = round2(base + commission);
@@ -945,7 +1064,7 @@ async function ensureStripeCustomerId(conn, { userId, email }) {
 
 async function getPaymentRow(conn, bookingId, type) {
   const [rows] = await conn.query(
-    `SELECT id, booking_id, type, payment_intent_id, amount_cents, status,
+    `SELECT id, booking_id, type, payment_intent_id, amount_cents, status, currency,
             payment_method_id, payment_method_last4
      FROM payments
      WHERE booking_id = ? AND type = ?
@@ -957,32 +1076,33 @@ async function getPaymentRow(conn, bookingId, type) {
   return rows[0] || null;
 }
 
-async function upsertPaymentRow(conn, { bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status }) {
+async function upsertPaymentRow(conn, { bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, currency }) {
   await conn.query(
-    `INSERT INTO payments (booking_id, type, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status)
-     VALUES (?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE amount_cents = VALUES(amount_cents), commission_snapshot_cents = VALUES(commission_snapshot_cents), final_price_snapshot_cents = VALUES(final_price_snapshot_cents), status = VALUES(status)`,
-    [bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status]
+    `INSERT INTO payments (booking_id, type, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, currency)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE amount_cents = VALUES(amount_cents), commission_snapshot_cents = VALUES(commission_snapshot_cents), final_price_snapshot_cents = VALUES(final_price_snapshot_cents), status = VALUES(status), currency = COALESCE(VALUES(currency), currency)`,
+    [bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, normalizeCurrencyCode(currency, 'EUR')]
   );
 }
 
 // UPSERT helper para la tabla payments
-async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, transferGroup, paymentMethodId, paymentMethodLast4, lastErrorCode, lastErrorMessage }) {
+async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, currency, transferGroup, paymentMethodId, paymentMethodLast4, lastErrorCode, lastErrorMessage }) {
   await conn.query(`
-    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, transfer_group, payment_method_id, payment_method_last4, last_error_code, last_error_message, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, currency, transfer_group, payment_method_id, payment_method_last4, last_error_code, last_error_message, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ON DUPLICATE KEY UPDATE
       payment_intent_id = VALUES(payment_intent_id),
       amount_cents = VALUES(amount_cents),
       commission_snapshot_cents = COALESCE(VALUES(commission_snapshot_cents), commission_snapshot_cents),
       final_price_snapshot_cents = COALESCE(VALUES(final_price_snapshot_cents), final_price_snapshot_cents),
       status       = VALUES(status),
+      currency = COALESCE(VALUES(currency), currency),
       transfer_group = COALESCE(VALUES(transfer_group), transfer_group),
       payment_method_id = COALESCE(VALUES(payment_method_id), payment_method_id),
       payment_method_last4 = COALESCE(VALUES(payment_method_last4), payment_method_last4),
       last_error_code = VALUES(last_error_code),
       last_error_message = VALUES(last_error_message)
-  `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null, lastErrorCode ?? null, lastErrorMessage ?? null]);
+  `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, normalizeCurrencyCode(currency, 'EUR'), transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null, lastErrorCode ?? null, lastErrorMessage ?? null]);
 }
 
 // Muestreo ponderado SIN reemplazo (ruleta recalculando pesos)
@@ -1095,7 +1215,7 @@ The ${productName} Team`;
   return { subject, text, html };
 }
 
-function renderDepositReservationEmail({ booking, depositAmountCents }) {
+function renderDepositReservationEmail({ booking, depositAmountCents, currency = 'EUR', finalPriceSnapshotCents = null }) {
   if (!booking) {
     return {
       subject: 'Se ha confirmado una reserva',
@@ -1104,11 +1224,14 @@ function renderDepositReservationEmail({ booking, depositAmountCents }) {
     };
   }
 
-  const depositEuros = (typeof depositAmountCents === 'number' ? depositAmountCents : 0) / 100;
-  const depositFormatted = formatCurrencyEUR(depositEuros);
-  const finalPriceNumber = booking.finalPrice != null ? Number(booking.finalPrice) : null;
+  const notificationCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const depositAmount = fromMinorUnits(depositAmountCents, notificationCurrency);
+  const depositFormatted = formatCurrencyAmount(depositAmount, notificationCurrency);
+  const finalPriceNumber = Number.isFinite(Number(finalPriceSnapshotCents))
+    ? fromMinorUnits(finalPriceSnapshotCents, notificationCurrency)
+    : (booking.finalPrice != null ? Number(booking.finalPrice) : null);
   const finalPriceFormatted = finalPriceNumber != null && Number.isFinite(finalPriceNumber)
-    ? formatCurrencyEUR(finalPriceNumber)
+    ? formatCurrencyAmount(finalPriceNumber, notificationCurrency)
     : 'No disponible';
 
   const professionalName = composeDisplayName(booking.professional || {});
@@ -1428,7 +1551,26 @@ function normalizeCurrencyCode(value, fallback = null) {
   }
 
   const normalized = value.trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(normalized) ? normalized : fallback;
+  const aliased = CURRENCY_ALIASES[normalized] || normalized;
+  return /^[A-Z]{3}$/.test(aliased) ? aliased : fallback;
+}
+
+async function resolveUserCurrency(userId, fallback = 'EUR', connection = promisePool) {
+  const numericUserId = Number(userId);
+  if (!Number.isFinite(numericUserId) || numericUserId <= 0) {
+    return normalizeCurrencyCode(fallback, 'EUR');
+  }
+
+  try {
+    const [rows] = await connection.query(
+      'SELECT currency FROM user_account WHERE id = ? LIMIT 1',
+      [numericUserId]
+    );
+    return normalizeCurrencyCode(rows?.[0]?.currency, fallback);
+  } catch (error) {
+    console.error('Error resolving user currency:', error);
+    return normalizeCurrencyCode(fallback, 'EUR');
+  }
 }
 
 function isValidEmail(email) {
@@ -1695,7 +1837,7 @@ async function fetchOwnedService(connection, serviceId, userId, { lock = false, 
   const joins = ['JOIN user_account ua ON s.user_id = ua.id'];
 
   if (includePrice) {
-    selectParts.push('p.price AS current_price', 'p.price_type AS current_price_type');
+    selectParts.push('p.price AS current_price', 'p.price_type AS current_price_type', 'p.currency AS current_price_currency');
     joins.push('JOIN price p ON s.price_id = p.id');
   }
 
@@ -3368,6 +3510,7 @@ app.get('/api/lists/:id/items', (req, res) => {
         service.service_created_datetime,
         service.last_edit_datetime,
         price.price,
+        price.currency AS currency,
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
@@ -3381,7 +3524,7 @@ app.get('/api/lists/:id/items', (req, res) => {
         user_account.is_professional,
         user_account.language,
         user_account.allow_notis,
-        user_account.currency,
+        user_account.currency AS user_currency,
         user_account.money_in_wallet,
         user_account.professional_started_datetime,
         user_account.is_expert,
@@ -3554,9 +3697,10 @@ app.get('/api/service-family/:id/categories', (req, res) => {
 app.get('/api/category/:id/services', async (req, res) => {
   const categoryId = Number(req.params.id);
   const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
+  const viewerCurrency = await resolveUserCurrency(viewerId, 'EUR');
 
   const filters = extractServiceFilters(req.query);
-  const filtersClause = buildServiceFilterClause(filters);
+  const filtersClause = buildServiceFilterClause(filters, { targetCurrency: viewerCurrency });
 
   const query = `
     SELECT
@@ -3577,6 +3721,7 @@ app.get('/api/category/:id/services', async (req, res) => {
       service.service_created_datetime,
       service.last_edit_datetime,
       price.price,
+      price.currency AS currency,
       price.price_type,
       user_account.id AS user_id,
       user_account.email,
@@ -3796,7 +3941,7 @@ app.post('/api/service', (req, res) => {
         return;
       }
 
-      const stripeAccountQuery = 'SELECT is_verified FROM user_account WHERE id = ?';
+      const stripeAccountQuery = 'SELECT is_verified, currency FROM user_account WHERE id = ?';
       connection.query(stripeAccountQuery, [user_id], (accountErr, accountResults) => {
         if (accountErr) {
           return connection.rollback(() => {
@@ -3814,11 +3959,12 @@ app.post('/api/service', (req, res) => {
         }
 
         const isVerified = Boolean(accountResults[0]?.is_verified);
+        const priceCurrency = normalizeCurrencyCode(accountResults[0]?.currency, 'EUR');
         const isHiddenValue = isVerified ? 0 : 1;
 
         // 1. Insertar en la tabla 'price'
-        const priceQuery = 'INSERT INTO price (price, price_type) VALUES (?, ?)';
-        connection.query(priceQuery, [price, price_type], (err, result) => {
+        const priceQuery = 'INSERT INTO price (price, currency, price_type) VALUES (?, ?, ?)';
+        connection.query(priceQuery, [price, priceCurrency, price_type], (err, result) => {
           if (err) {
             return connection.rollback(() => {
               console.error('Error al insertar en la tabla price:', err);
@@ -4702,6 +4848,7 @@ app.get('/api/service/:id', (req, res) => {
         s.hobbies,
         s.experience_years,
         p.price,
+        p.currency AS currency,
         p.price_type,
         ua.id AS user_id,
         ua.email,
@@ -5080,6 +5227,7 @@ app.get('/api/user/:userId/bookings', authenticateToken, (req, res) => {
           service.service_created_datetime,
           service.last_edit_datetime,
           price.price,
+          price.currency AS currency,
           price.price_type,
           user_account.id AS service_user_id,
           user_account.email,
@@ -5167,6 +5315,7 @@ app.get('/api/service-user/:userId/bookings', (req, res) => {
         service.service_created_datetime,
         service.last_edit_datetime,
         price.price,
+        price.currency AS currency,
         price.price_type,
         -- Información del usuario que presta el servicio
         service_user.id AS service_user_id,
@@ -5256,6 +5405,7 @@ app.get('/api/user/:id/services', authenticateToken, (req, res) => {
         service.service_created_datetime,
         service.last_edit_datetime,
         price.price,
+        price.currency AS currency,
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
@@ -5322,7 +5472,7 @@ app.get('/api/user/:id/wallet', authenticateToken, (req, res) => {
 
     // Consulta para obtener el valor de money_in_wallet
     const query = `
-      SELECT money_in_wallet
+      SELECT money_in_wallet, currency
       FROM user_account
       WHERE id = ?;
     `;
@@ -5337,7 +5487,15 @@ app.get('/api/user/:id/wallet', authenticateToken, (req, res) => {
       }
 
       if (walletData.length > 0) {
-        res.status(200).json({ money_in_wallet: walletData[0].money_in_wallet });
+        const userCurrency = normalizeCurrencyCode(walletData[0]?.currency, 'EUR');
+        const rawWalletAmount = Number(walletData[0]?.money_in_wallet || 0);
+        const convertedWalletAmount = convertAmount(rawWalletAmount, 'EUR', userCurrency);
+        res.status(200).json({
+          money_in_wallet: convertedWalletAmount,
+          currency: userCurrency,
+          base_currency: 'EUR',
+          original_money_in_wallet: round2(rawWalletAmount),
+        });
       } else {
         res.status(404).json({ notFound: true, message: 'No se encontró el usuario.' });
       }
@@ -6311,6 +6469,7 @@ app.get('/api/bookings/:id', (req, res) => {
         b.order_datetime,
         b.description,
         pr.price,
+        pr.currency AS currency,
         pr.price_type,
         pm.provider,
         pm.card_number,
@@ -7255,6 +7414,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   let booking;
   let payment;
   let commissionCents;
+  let chargeCurrency = 'EUR';
 
   const connection = await pool.promise().getConnection();
   try {
@@ -7265,8 +7425,8 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status,
              b.service_duration, b.booking_start_datetime, b.booking_end_datetime,
              s.id AS service_id,
-             p.price AS unit_price, p.price_type,
-             u.email AS customer_email, u.stripe_customer_id
+             p.price AS unit_price, p.price_type, p.currency AS service_currency,
+             u.email AS customer_email, u.stripe_customer_id, u.currency AS customer_currency
       FROM booking b
       JOIN service s ON b.service_id = s.id
       JOIN price   p ON s.price_id = p.id
@@ -7318,32 +7478,28 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     } catch { }
     const effectiveMinutes = storedDurationMin ?? derivedMinutes ?? 0;
 
-    // Pricing server-side
-    const priceType = String(booking.price_type || '').toLowerCase();
-    const unit = Number(booking.unit_price || 0);
-    const hours = effectiveMinutes / 60;
-    let base = 0;
-    if (priceType === 'hour') base = unit * hours;
-    else if (priceType === 'fix') base = unit;
-    base = round2(base);
-
-    const commissionEuros = (priceType === 'budget')
-      ? 1
-      : Math.max(1, round1(base * 0.1));
-
-    const finalEuros =
-      (priceType === 'budget' || (priceType === 'hour' && effectiveMinutes <= 0))
-        ? null
-        : round2(base + commissionEuros);
-
-    commissionCents = Math.max(100, toCents(commissionEuros || 0));
-    const finalCentsSnapshot = toCents(finalEuros || 0);
-
     // Garantiza Customer y persiste si no existe
     const customerId = await ensureStripeCustomerId(connection, {
       userId: booking.user_id,
       email: booking.customer_email,
     });
+
+    const existingDepositPayment = await getPaymentRow(connection, id, 'deposit');
+    chargeCurrency = normalizeCurrencyCode(
+      existingDepositPayment?.currency,
+      normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
+    );
+
+    const convertedUnitPrice = convertAmount(booking.unit_price || 0, booking.service_currency, chargeCurrency);
+    const pricing = computePricing({
+      priceType: booking.price_type,
+      unitPrice: convertedUnitPrice,
+      durationMinutes: effectiveMinutes,
+      currency: chargeCurrency,
+    });
+
+    commissionCents = toMinorUnits(pricing.commission || 0, chargeCurrency);
+    const finalCentsSnapshot = pricing.final == null ? 0 : toMinorUnits(pricing.final, chargeCurrency);
 
     // Congelar importes creando fila de pago (para poder atar idempotencia a payment.id)
     await upsertPaymentRow(connection, {
@@ -7353,6 +7509,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       commissionSnapshotCents: commissionCents,
       finalPriceSnapshotCents: finalCentsSnapshot,
       status: 'creating',
+      currency: chargeCurrency,
     });
 
     payment = await getPaymentRow(connection, id, 'deposit');
@@ -7398,7 +7555,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
           intent = await stripe.paymentIntents.create(
             {
               amount: commissionCents,
-              currency: 'eur',
+              currency: toStripeCurrencyCode(chargeCurrency),
               customer: customerId,
               payment_method: payment_method_id,
               confirm: true,
@@ -7415,7 +7572,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
           intent = await stripe.paymentIntents.create(
             {
               amount: commissionCents,
-              currency: 'eur',
+              currency: toStripeCurrencyCode(chargeCurrency),
               customer: customerId,
               setup_future_usage: 'off_session',
               receipt_email: booking.customer_email || undefined,
@@ -7475,6 +7632,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
             commissionSnapshotCents: commissionCents,
             finalPriceSnapshotCents: finalCentsSnapshot,
             status: mapStatus(pi.status),
+            currency: chargeCurrency,
             transferGroup,
             paymentMethodId: payment_method_id || pi?.payment_method || null,
             paymentMethodLast4: last4Err || null,
@@ -7534,6 +7692,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         commissionSnapshotCents: commissionCents,
         finalPriceSnapshotCents: finalCentsSnapshot,
         status: mapStatus(intent.status),
+        currency: chargeCurrency,
         transferGroup,
         paymentMethodId: pmIdPersist,
         paymentMethodLast4: last4Persist,
@@ -7652,6 +7811,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
   let finalCalcCents;      // recalculado
   let commissionChosenCents; // usada para cobrar
   let finalChosenCents;      // usado para cobrar
+  let chargeCurrency = 'EUR';
+  let depositPayment = null;
 
   const connection = await pool.promise().getConnection();
   try {
@@ -7662,9 +7823,9 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       `
       SELECT b.id, b.user_id, b.final_price, b.commission, b.is_paid,
              b.service_duration, b.booking_start_datetime, b.booking_end_datetime,
-             cust.email AS customer_email, cust.stripe_customer_id AS customer_id,
+             cust.email AS customer_email, cust.stripe_customer_id AS customer_id, cust.currency AS customer_currency,
              provider.stripe_account_id,
-             p.price AS unit_price, p.price_type
+             p.price AS unit_price, p.price_type, p.currency AS service_currency
       FROM booking b
       JOIN service s ON b.service_id = s.id
       JOIN price p ON s.price_id = p.id
@@ -7707,17 +7868,25 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
 
     // Verificar depósito succeeded
     const [dep] = await connection.query(
-      `SELECT id FROM payments WHERE booking_id = ? AND type = 'deposit' AND status = 'succeeded' LIMIT 1 FOR UPDATE`,
+      `SELECT id, amount_cents, currency
+       FROM payments
+       WHERE booking_id = ? AND type = 'deposit' AND status = 'succeeded'
+       LIMIT 1 FOR UPDATE`,
       [id]
     );
     if (dep.length === 0) {
       await connection.rollback();
       return res.status(412).json({ error: 'Depósito no confirmado (requerido).' });
     }
+    depositPayment = dep[0];
+    chargeCurrency = normalizeCurrencyCode(
+      depositPayment?.currency,
+      normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
+    );
 
     // Comprobar si ya hay cobro final existente en curso o realizado y devolver la info útil en vez de 409
     const [existingFinal] = await connection.query(
-      `SELECT id, status, payment_intent_id
+      `SELECT id, status, payment_intent_id, currency
       FROM payments
       WHERE booking_id = ? AND type = 'final'
         AND status IN ('requires_payment_method','requires_action','processing','succeeded')
@@ -7741,7 +7910,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         if (!intent) {
           // Obtener snapshots ya guardados para este pago final
           const [paySnapRows] = await connection.query(
-            `SELECT id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, transfer_group
+            `SELECT id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, currency, transfer_group
              FROM payments
              WHERE id = ? AND booking_id = ? AND type = 'final'
              LIMIT 1`,
@@ -7750,6 +7919,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           const paySnap = paySnapRows && paySnapRows[0];
           const amountEnsure = paySnap?.amount_cents || 0;
           const transferGroupEnsure = paySnap?.transfer_group || `booking-${id}`;
+          const ensureCurrency = normalizeCurrencyCode(paySnap?.currency, chargeCurrency);
 
           if (amountEnsure > 0) {
             const pmIdBody = req.body?.payment_method_id || null;
@@ -7774,7 +7944,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
               intent = await stripe.paymentIntents.create(
                 {
                   amount: amountEnsure,
-                  currency: 'eur',
+                  currency: toStripeCurrencyCode(ensureCurrency),
                   customer: customerId,
                   payment_method: pmIdBody,
                   confirm: true,
@@ -7793,7 +7963,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
               intent = await stripe.paymentIntents.create(
                 {
                   amount: amountEnsure,
-                  currency: 'eur',
+                  currency: toStripeCurrencyCode(ensureCurrency),
                   customer: customerId,
                   receipt_email: booking.customer_email || undefined,
                   automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
@@ -7822,6 +7992,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
                 commissionSnapshotCents: paySnap?.commission_snapshot_cents ?? null,
                 finalPriceSnapshotCents: paySnap?.final_price_snapshot_cents ?? null,
                 status: mapStatus(intent.status),
+                currency: ensureCurrency,
                 transferGroup: transferGroupEnsure,
                 paymentMethodId: req.body?.payment_method_id || null,
                 paymentMethodLast4: last4Ensure || null,
@@ -7874,6 +8045,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
                 commissionSnapshotCents: null,
                 finalPriceSnapshotCents: null,
                 status: mapStatus(intent.status),
+                currency: normalizeCurrencyCode(row.currency, chargeCurrency),
                 transferGroup: intent.transfer_group || null,
                 paymentMethodId: pmId,
                 paymentMethodLast4: last4 || null,
@@ -7936,7 +8108,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       }
     }
 
-    // Recalcular pricing como en BookingScreen
+    // Recalcular el total pendiente en la moneda congelada del depósito
     // Determinar minutos: usar service_duration si existe; si no, derivar de start/end
     const storedDurationMin = Number.isFinite(Number(booking.service_duration)) ? Number(booking.service_duration) : null;
     let derivedMinutes = null;
@@ -7952,41 +8124,32 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     } catch (_) { /* noop safe derive */ }
 
     const effectiveMinutes = storedDurationMin ?? derivedMinutes ?? 0;
-    const pricing = computePricing({ priceType: booking.price_type, unitPrice: booking.unit_price, durationMinutes: effectiveMinutes });
-
-    // Convertir a céntimos para comparar en entero
-    finalCents = toCents(booking.final_price || 0);
-    commissionCents = Math.max(100, toCents(booking.commission || 0));
-    finalCalcCents = toCents(pricing.final || 0);
-    commissionCalcCents = Math.max(100, toCents(pricing.commission || 0));
-
-    // Elegir final y comisión a usar
-    const commissionMatches = commissionCents === commissionCalcCents;
     const isBudget = String(booking.price_type || '').toLowerCase() === 'budget';
-    if (isBudget) {
-      // Para budget exclusivamente: el final_price de DB es el precio base y calcular comisión sobre esa base (10% mín 1€)
-      finalChosenCents = finalCents;
-      const commissionFromFinalEuros = Math.max(1, round1((finalCents / 100) * 0.1));
-      commissionChosenCents = toCents(commissionFromFinalEuros);
-    } else {
-      // Resto: mantener final de DB y elegir comisión recalculada si difiere
-      finalChosenCents = finalCents;
-      commissionChosenCents = commissionMatches ? commissionCents : commissionCalcCents;
-    }
+    const convertedUnitPrice = convertAmount(booking.unit_price || 0, booking.service_currency, chargeCurrency);
+    const convertedFinalBase = convertAmount(booking.final_price || 0, booking.service_currency, chargeCurrency);
 
-    // Validar precondición con los elegidos
-    if (!(commissionChosenCents > 0)) {
-      await connection.rollback();
-      return res.status(412).json({ error: 'Precondición: commission > 0 no cumplida.' });
-    }
+    const pricing = isBudget
+      ? computePricing({
+        priceType: 'fix',
+        unitPrice: convertedFinalBase,
+        durationMinutes: 0,
+        currency: chargeCurrency,
+      })
+      : computePricing({
+        priceType: booking.price_type,
+        unitPrice: convertedUnitPrice,
+        durationMinutes: effectiveMinutes,
+        currency: chargeCurrency,
+      });
 
-    //!ESTO EN UN FUTURO SE DEBE CAMBIAR POR UNA COMISION EXTRA DE WISDOM O DEBULUCION DE PARTE DE LA COMISION (amountToCharge incluira diferencia entre new comision y old comision)
-    amountToCharge = isBudget ? finalChosenCents : (finalChosenCents - commissionChosenCents);
+    finalChosenCents = toMinorUnits(pricing.final || 0, chargeCurrency);
+    commissionChosenCents = toMinorUnits(pricing.commission || 0, chargeCurrency);
+    finalCents = toMinorUnits(booking.final_price || 0, booking.service_currency);
+    commissionCents = toMinorUnits(booking.commission || 0, booking.service_currency);
+    finalCalcCents = finalChosenCents;
+    commissionCalcCents = commissionChosenCents;
 
-    if (amountToCharge <= 0) {
-      await connection.rollback();
-      return res.status(400).json({ error: 'Importe inválido para el pago final.' });
-    }
+    amountToCharge = Math.max(0, finalChosenCents - Number(depositPayment?.amount_cents || 0));
 
     // Congelar snapshots en la fila del pago final (para idempotencia por payment.id)
     await upsertPaymentRow(connection, {
@@ -7996,10 +8159,46 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       commissionSnapshotCents: commissionChosenCents,
       finalPriceSnapshotCents: finalChosenCents,
       status: 'creating',
+      currency: chargeCurrency,
     });
     payment = await getPaymentRow(connection, id, 'final');
 
     await connection.commit();
+
+    if (amountToCharge <= 0) {
+      const connNoCharge = await pool.promise().getConnection();
+      try {
+        await connNoCharge.beginTransaction();
+        await upsertPayment(connNoCharge, {
+          bookingId: id,
+          type: 'final',
+          paymentIntentId: payment?.payment_intent_id || null,
+          amountCents: 0,
+          commissionSnapshotCents: commissionChosenCents,
+          finalPriceSnapshotCents: finalChosenCents,
+          status: 'succeeded',
+          currency: chargeCurrency,
+          transferGroup: `booking-${id}`,
+        });
+        await connNoCharge.query(
+          'UPDATE booking SET is_paid = 1 WHERE id = ?',
+          [id]
+        );
+        await connNoCharge.commit();
+      } catch (noChargeError) {
+        try { await connNoCharge.rollback(); } catch { }
+        console.error('Error marking zero final payment as settled:', noChargeError);
+        return res.status(500).json({ error: 'No se pudo cerrar el pago final.' });
+      } finally {
+        connNoCharge.release();
+      }
+
+      return res.status(200).json({
+        message: 'Pago final ya cubierto por el depósito.',
+        amount_cents: 0,
+        currency: chargeCurrency,
+      });
+    }
 
     // Validar capacidades de la conectada antes de crear el Intent
     const acct = await stripe.accounts.retrieve(booking.stripe_account_id);
@@ -8054,7 +8253,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         intent = await stripe.paymentIntents.create(
           {
             amount: amountToCharge,
-            currency: 'eur',
+            currency: toStripeCurrencyCode(chargeCurrency),
             customer: customerId,
             payment_method: pmToUse,
             confirm: true,
@@ -8115,6 +8314,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
             commissionSnapshotCents: commissionChosenCents,
             finalPriceSnapshotCents: finalChosenCents,
             status: mapStatus(pi.status),
+            currency: chargeCurrency,
             transferGroup,
             paymentMethodId: pmToUse,
             paymentMethodLast4: last4Err || null,
@@ -8177,6 +8377,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         commissionSnapshotCents: commissionChosenCents,
         finalPriceSnapshotCents: finalChosenCents,
         status: mapStatus(intent.status),
+        currency: chargeCurrency,
         transferGroup,
         paymentMethodId: pmToUse,
         paymentMethodLast4: last4Persist,
@@ -8242,7 +8443,13 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const query = 'SELECT final_price, commission FROM booking WHERE id = ?';
+    const query = `
+      SELECT b.final_price, b.commission, p.currency AS service_currency
+      FROM booking b
+      JOIN service s ON b.service_id = s.id
+      JOIN price p ON s.price_id = p.id
+      WHERE b.id = ?
+    `;
     connection.query(query, [id], async (err, results) => {
       connection.release();
       if (err) {
@@ -8256,6 +8463,7 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
 
       const finalPrice = parseFloat(results[0].final_price || 0);
       const commission = parseFloat(results[0].commission || 0);
+      const serviceCurrency = normalizeCurrencyCode(results[0].service_currency, 'EUR');
       const amountToPay = Number((finalPrice - commission).toFixed(2));
       if (amountToPay <= 0) {
         return res.status(400).json({ error: 'El importe final es cero o negativo.' });
@@ -8263,8 +8471,8 @@ app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
 
       try {
         const intent = await stripe.paymentIntents.create({
-          amount: Math.round(amountToPay * 100),
-          currency: 'eur',
+          amount: toMinorUnits(amountToPay, serviceCurrency),
+          currency: toStripeCurrencyCode(serviceCurrency),
           metadata: { booking_id: id, type: 'final' }
         });
         res.status(200).json({ clientSecret: intent.client_secret });
@@ -8286,9 +8494,10 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
       return res.status(500).json({ error: 'Error al obtener la conexión.' });
     }
 
-    const query = `SELECT b.final_price, b.commission, s.user_id, u.stripe_account_id
+    const query = `SELECT b.final_price, b.commission, s.user_id, u.stripe_account_id, p.currency AS service_currency
                    FROM booking b
                    JOIN service s ON b.service_id = s.id
+                   JOIN price p ON s.price_id = p.id
                    JOIN user_account u ON s.user_id = u.id
                    WHERE b.id = ?`;
 
@@ -8304,6 +8513,7 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
       }
 
       const { final_price, commission, stripe_account_id } = results[0];
+      const serviceCurrency = normalizeCurrencyCode(results[0].service_currency, 'EUR');
 
       if (!stripe_account_id) {
         return res.status(400).json({ error: 'El profesional no tiene cuenta Stripe.' });
@@ -8318,8 +8528,8 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
 
       try {
         await stripe.transfers.create({
-          amount: Math.round(amount * 100),
-          currency: 'eur',
+          amount: toMinorUnits(amount, serviceCurrency),
+          currency: toStripeCurrencyCode(serviceCurrency),
           destination: stripe_account_id,
           metadata: { booking_id: id }
         });
@@ -8353,6 +8563,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         b.description AS booking_description,
         s.service_title,
         s.description AS service_description,
+        p.currency AS service_currency,
         cu.email AS customer_email,
         cu.phone AS customer_phone,
         cu.first_name AS customer_first_name,
@@ -8373,6 +8584,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       FROM booking b
       JOIN user_account cu ON b.user_id = cu.id
       JOIN service s ON b.service_id = s.id
+      JOIN price p ON s.price_id = p.id
       JOIN user_account sp ON s.user_id = sp.id
       LEFT JOIN (
         SELECT cm1.* FROM collection_method cm1
@@ -8387,7 +8599,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       LIMIT 1;
     `;
 
-    connection.query(query, [id], (err, results) => {
+    connection.query(query, [id], async (err, results) => {
       connection.release();
       if (err) {
         console.error('Error fetching booking:', err);
@@ -8399,6 +8611,30 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       }
 
       const data = results[0];
+      let depositPayment = null;
+      let finalPayment = null;
+
+      try {
+        const [paymentRows] = await promisePool.query(
+          `SELECT type, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, currency, status
+           FROM payments
+           WHERE booking_id = ?
+           ORDER BY id DESC`,
+          [id]
+        );
+
+        const pickPayment = (type) => (
+          paymentRows.find((row) => row.type === type && row.status === 'succeeded')
+          || paymentRows.find((row) => row.type === type)
+          || null
+        );
+
+        depositPayment = pickPayment('deposit');
+        finalPayment = pickPayment('final');
+      } catch (paymentLookupError) {
+        console.error('Error fetching payment snapshots for invoice:', paymentLookupError);
+      }
+
       const doc = new PDFDocument({ margins: { top: 64, left: 64, right: 64, bottom: 64 } });
 
       // Resource paths
@@ -8431,13 +8667,18 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
           return '';
         }
       };
-      const toCurrency = (amount) => `€${Number(amount || 0).toFixed(2)}`;
-
       // Decide invoice type
       const typeParam = String(req.query.type || '').toLowerCase();
       const invoiceType = (typeParam === 'deposit' || typeParam === 'final')
         ? typeParam
         : (data.is_paid ? 'final' : 'deposit');
+      const invoiceCurrency = normalizeCurrencyCode(
+        invoiceType === 'deposit'
+          ? depositPayment?.currency
+          : (finalPayment?.currency || depositPayment?.currency),
+        data.service_currency || 'EUR'
+      );
+      const toCurrency = (amount) => formatCurrencyAmount(amount, invoiceCurrency);
 
       // VAT configuration (only used for provider invoice)
       const vatRateParam = req.query.vat_rate;
@@ -8578,12 +8819,23 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       let invoiceTotal = 0;
 
       if (invoiceType === 'deposit') {
-        invoiceTotal = Number(data.commission || 0);
+        invoiceTotal = depositPayment?.amount_cents != null
+          ? fromMinorUnits(depositPayment.amount_cents, invoiceCurrency)
+          : Number(data.commission || 0);
         vatRate = 21;
         taxableBase = Number((invoiceTotal / (1 + vatRate / 100)).toFixed(2));
         vatAmount = Number((invoiceTotal - taxableBase).toFixed(2));
       } else {
-        invoiceTotal = Number((Number(data.final_price || 0) - Number(data.commission || 0)).toFixed(2));
+        if (
+          finalPayment?.final_price_snapshot_cents != null
+          && finalPayment?.commission_snapshot_cents != null
+        ) {
+          const finalPriceSnapshot = fromMinorUnits(finalPayment.final_price_snapshot_cents, invoiceCurrency);
+          const commissionSnapshot = fromMinorUnits(finalPayment.commission_snapshot_cents, invoiceCurrency);
+          invoiceTotal = Number((finalPriceSnapshot - commissionSnapshot).toFixed(2));
+        } else {
+          invoiceTotal = Number((Number(data.final_price || 0) - Number(data.commission || 0)).toFixed(2));
+        }
         vatRate = isExempt || isReverseCharge ? 0 : vatRateProvider;
         if (vatRate > 0) {
           taxableBase = Number((invoiceTotal / (1 + vatRate / 100)).toFixed(2));
@@ -8719,12 +8971,14 @@ app.get('/api/services/filter-categories', async (req, res) => {
   const searchTerm = (req.query.query || '').trim();
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
+  const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
   const categoryId = parseQueryNumber(req.query.category_id ?? req.query.categoryId ?? req.query.category);
   const limitRaw = parseQueryNumber(req.query.limit);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.trunc(limitRaw), 1), 12) : 8;
 
   try {
     const filters = extractServiceFilters(req.query);
+    const viewerCurrency = await resolveUserCurrency(viewerId, 'EUR');
 
     if (hasSearchTerm) {
       const searchPlan = buildServiceSearchPlan(searchTerm);
@@ -8734,7 +8988,10 @@ app.get('/api/services/filter-categories', async (req, res) => {
         originLat: filters.originLat,
         originLng: filters.originLng,
       });
-      const searchFiltersClause = buildServiceFilterClause(filters, { distanceExpression: searchDistanceExpression });
+      const searchFiltersClause = buildServiceFilterClause(filters, {
+        distanceExpression: searchDistanceExpression,
+        targetCurrency: viewerCurrency,
+      });
       const searchClause = buildServiceSearchCandidateClause(searchPlan);
       const candidateQuery = `
         SELECT
@@ -8842,7 +9099,10 @@ app.get('/api/services/filter-categories', async (req, res) => {
       originLat: recommendationFilters.originLat,
       originLng: recommendationFilters.originLng,
     });
-    const filtersClause = buildServiceFilterClause(recommendationFilters, { distanceExpression });
+    const filtersClause = buildServiceFilterClause(recommendationFilters, {
+      distanceExpression,
+      targetCurrency: viewerCurrency,
+    });
 
     const queryRecommendedCategories = `
       SELECT
@@ -8915,7 +9175,10 @@ app.get('/api/services/filter-categories', async (req, res) => {
       serviceFamilyIds: [],
       serviceFamilyId: null,
     };
-    const familyFiltersClause = buildServiceFilterClause(familyFilters, { distanceExpression });
+    const familyFiltersClause = buildServiceFilterClause(familyFilters, {
+      distanceExpression,
+      targetCurrency: viewerCurrency,
+    });
     const restrictedFamilyIds = !hasSearchTerm && relatedFamilyIds.length > 0 ? relatedFamilyIds : [];
     const familyRestrictionClause = restrictedFamilyIds.length > 0
       ? `AND family.id IN (${restrictedFamilyIds.map(() => '?').join(', ')})`
@@ -8981,7 +9244,10 @@ app.get('/api/services/filter-categories', async (req, res) => {
         serviceFamilyIds: [],
         serviceFamilyId: null,
       };
-      const broaderFiltersClause = buildServiceFilterClause(broaderFilters, { distanceExpression });
+      const broaderFiltersClause = buildServiceFilterClause(broaderFilters, {
+        distanceExpression,
+        targetCurrency: viewerCurrency,
+      });
       const familyPlaceholders = relatedFamilyIds.map(() => '?').join(', ');
       const selectedCategoryId = Number.isFinite(categoryId) ? Number(categoryId) : -1;
       const broaderQuery = `
@@ -9083,6 +9349,7 @@ app.get('/api/services', async (req, res) => {
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
   const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
+  const viewerCurrency = await resolveUserCurrency(viewerId, 'EUR');
   const orderByRaw = req.query.order_by ?? req.query.orderBy ?? '';
   const orderBy = typeof orderByRaw === 'string' ? orderByRaw.toLowerCase() : '';
   const categoryId = parseQueryNumber(req.query.category_id ?? req.query.categoryId ?? req.query.category);
@@ -9094,7 +9361,10 @@ app.get('/api/services', async (req, res) => {
     originLat: filters.originLat,
     originLng: filters.originLng,
   });
-  const filtersClause = buildServiceFilterClause(filters, { distanceExpression });
+  const filtersClause = buildServiceFilterClause(filters, {
+    distanceExpression,
+    targetCurrency: viewerCurrency,
+  });
   const includeDistanceColumn = Boolean(distanceExpression && distanceExpression.sql);
   const distanceSelect = includeDistanceColumn
     ? `,
@@ -9125,6 +9395,7 @@ app.get('/api/services', async (req, res) => {
         service.service_created_datetime,
         service.last_edit_datetime,
         price.price,
+        price.currency AS currency,
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
@@ -9322,7 +9593,11 @@ app.get('/api/services', async (req, res) => {
     }
   }
 
-  const comparablePriceExpression = buildComparablePriceExpression({ priceAlias: 'price', durationMinutes: filters.durationMinutes });
+  const comparablePriceExpression = buildComparablePriceExpression({
+    priceAlias: 'price',
+    durationMinutes: filters.durationMinutes,
+    targetCurrency: viewerCurrency,
+  });
   const bayesianRatingExpression = buildBayesianRatingExpression({ reviewAlias: 'review_data' });
   const recommendDistanceBoostExpression = includeDistanceColumn
     ? `CASE
@@ -9474,6 +9749,7 @@ app.get('/api/services', async (req, res) => {
         service.service_created_datetime,
         service.last_edit_datetime,
         price.price,
+        price.currency AS currency,
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
@@ -9682,15 +9958,20 @@ app.get('/api/services/count', async (req, res) => {
   const searchTerm = (req.query.query || '').trim();
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
+  const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
   const categoryId = parseQueryNumber(req.query.category_id ?? req.query.categoryId ?? req.query.category);
   const filters = extractServiceFilters(req.query);
+  const viewerCurrency = await resolveUserCurrency(viewerId, 'EUR');
   const distanceExpression = buildDistanceExpression({
     latColumn: 'service.latitude',
     lngColumn: 'service.longitude',
     originLat: filters.originLat,
     originLng: filters.originLng,
   });
-  const filtersClause = buildServiceFilterClause(filters, { distanceExpression });
+  const filtersClause = buildServiceFilterClause(filters, {
+    distanceExpression,
+    targetCurrency: viewerCurrency,
+  });
   const categoryClause = Number.isFinite(categoryId) ? 'AND service.service_category_id = ?' : '';
 
   if (hasSearchTerm) {
@@ -9822,6 +10103,7 @@ app.get('/api/services/:id', (req, res) => {
         service.service_created_datetime,
         service.last_edit_datetime,
         price.price,
+        price.currency AS currency,
         price.price_type,
         user_account.id AS user_id,
         user_account.email,
@@ -10157,12 +10439,20 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           paymentIntentId: pi.id,
           amountCents,
           status: mapStatus(pi.status),
+          currency: normalizeCurrencyCode(pi?.currency, 'EUR'),
           transferGroup: pi.transfer_group || null,
           paymentMethodId: pmId || null,
           paymentMethodLast4: last4 || null,
         });
 
         if (event.type === 'payment_intent.succeeded' && type === 'deposit') {
+          const [[depositPaymentRow]] = await connection.query(
+            `SELECT amount_cents, final_price_snapshot_cents, currency
+             FROM payments
+             WHERE payment_intent_id = ?
+             LIMIT 1`,
+            [pi.id]
+          );
           const [[bookingRow]] = await connection.query(
             `SELECT
                b.id,
@@ -10211,7 +10501,9 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
                   email: bookingRow.client_email,
                 },
               },
-              depositAmountCents: amountCents,
+              depositAmountCents: depositPaymentRow?.amount_cents ?? amountCents,
+              finalPriceSnapshotCents: depositPaymentRow?.final_price_snapshot_cents ?? null,
+              currency: normalizeCurrencyCode(depositPaymentRow?.currency, pi?.currency || 'EUR'),
             };
           }
         }
