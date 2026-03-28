@@ -137,6 +137,7 @@
 ## Tabla: `price`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
 - `price` (DECIMAL(9,2), NULL)
+- `currency` (CHAR(3), NOT NULL, DEFAULT EUR)
 - `price_type` (VARCHAR(100), NOT NULL)
 
 ## Tabla: `promotion`

@@ -502,6 +502,7 @@ function extractServiceFilters(query) {
   const durationMinutes = parseQueryNumber(query.duration_minutes ?? query.duration ?? query.duration_min ?? query.duration_mins);
   const maxActionRate = parseQueryNumber(query.max_action_rate ?? query.action_rate_max);
   const minRating = parseQueryNumber(query.min_rating ?? query.rating_min);
+  const experienceYears = parseQueryStringArray(query.experience_years ?? query.experienceYears ?? query.experience_year ?? query.experienceYear);
   const requireCompany = parseQueryBoolean(query.require_company ?? query.company_profile ?? query.company_only);
   const requireVerified = parseQueryBoolean(query.require_verified ?? query.verified_only);
   const inPersonOnly = parseQueryBoolean(query.in_person_only ?? query.presential_only ?? query.onsite_only);
@@ -520,6 +521,7 @@ function extractServiceFilters(query) {
     durationMinutes,
     maxActionRate,
     minRating,
+    experienceYears,
     requireCompany,
     requireVerified,
     inPersonOnly,
@@ -583,6 +585,7 @@ function buildServiceFilterClause(filters, {
     durationMinutes,
     maxActionRate,
     minRating,
+    experienceYears,
     requireCompany,
     requireVerified,
     inPersonOnly,
@@ -625,6 +628,20 @@ function buildServiceFilterClause(filters, {
   if (Number.isFinite(minRating)) {
     clauses.push(`COALESCE(${reviewAlias}.average_rating, 0) >= ?`);
     params.push(minRating);
+  }
+
+  const numericExperienceYears = Array.isArray(experienceYears)
+    ? experienceYears
+      .map((value) => {
+        const num = Number(value);
+        return Number.isFinite(num) ? num : null;
+      })
+      .filter((value) => value !== null)
+    : [];
+  if (numericExperienceYears.length > 0) {
+    const placeholders = numericExperienceYears.map(() => '?').join(', ');
+    clauses.push(`${serviceAlias}.experience_years IN (${placeholders})`);
+    params.push(...numericExperienceYears);
   }
 
   if (requireCompany) {
