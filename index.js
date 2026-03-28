@@ -8649,7 +8649,9 @@ app.get('/api/suggestions', (req, res) => {
     const searchQuery = `
       SELECT
         s.service_title,
+        c.id AS service_category_id,
         ct.category_key AS service_category_name,
+        f.id AS service_family_id,
         f.family_key AS service_family,
         t.tag
       FROM service s 
@@ -8691,11 +8693,25 @@ app.get('/api/suggestions', (req, res) => {
             uniqueKeys.add(result.service_title);
           }
           if (result.service_category_name && !uniqueKeys.has(result.service_category_name) && result.service_category_name.toLowerCase().includes(query.toLowerCase())) {
-            suggestions.push({ service_category_name: result.service_category_name });
+            suggestions.push({
+              suggestion_type: 'category',
+              service_category_name: result.service_category_name,
+              category_key: result.service_category_name,
+              service_category_id: result.service_category_id,
+              service_family_id: result.service_family_id,
+              service_family_name: result.service_family,
+              family_key: result.service_family,
+            });
             uniqueKeys.add(result.service_category_name);
           }
           if (result.service_family && !uniqueKeys.has(result.service_family) && result.service_family.toLowerCase().includes(query.toLowerCase())) {
-            suggestions.push({ service_family: result.service_family });
+            suggestions.push({
+              suggestion_type: 'family',
+              service_family: result.service_family,
+              service_family_name: result.service_family,
+              family_key: result.service_family,
+              service_family_id: result.service_family_id,
+            });
             uniqueKeys.add(result.service_family);
           }
           if (result.tag && !uniqueKeys.has(result.tag) && result.tag.toLowerCase().includes(query.toLowerCase())) {
