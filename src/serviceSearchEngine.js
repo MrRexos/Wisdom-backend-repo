@@ -1,64 +1,57 @@
 const path = require('path');
 
-const WORKSPACE_ROOT = path.resolve(__dirname, '..', '..');
+function isMissingModuleForPath(error, possiblePath) {
+  if (error?.code !== 'MODULE_NOT_FOUND') {
+    return false;
+  }
 
-const arClassification = require(path.resolve(
-  WORKSPACE_ROOT,
-  'Wisdom-repo',
-  'Wisdom_expo',
-  'languages',
-  'classification',
-  'ar_clas.json'
-));
-const caClassification = require(path.resolve(
-  WORKSPACE_ROOT,
-  'Wisdom-repo',
-  'Wisdom_expo',
-  'languages',
-  'classification',
-  'ca_clas.json'
-));
-const enClassification = require(path.resolve(
-  WORKSPACE_ROOT,
-  'Wisdom-repo',
-  'Wisdom_expo',
-  'languages',
-  'classification',
-  'en_clas.json'
-));
-const esClassification = require(path.resolve(
-  WORKSPACE_ROOT,
-  'Wisdom-repo',
-  'Wisdom_expo',
-  'languages',
-  'classification',
-  'es_clas.json'
-));
-const frClassification = require(path.resolve(
-  WORKSPACE_ROOT,
-  'Wisdom-repo',
-  'Wisdom_expo',
-  'languages',
-  'classification',
-  'fr_clas.json'
-));
-const zhClassification = require(path.resolve(
-  WORKSPACE_ROOT,
-  'Wisdom-repo',
-  'Wisdom_expo',
-  'languages',
-  'classification',
-  'zh_clas.json'
-));
+  const normalizedPath = String(possiblePath || '').replace(/\\/g, '/');
+  const errorMessage = String(error?.message || '').replace(/\\/g, '/');
 
-const CLASSIFICATION_RESOURCES = {
-  ar: arClassification.ar,
-  ca: caClassification.ca,
-  en: enClassification.en,
-  es: esClassification.es,
-  fr: frClassification.fr,
-  zh: zhClassification['zh-CN'] || zhClassification.zh,
-};
+  return errorMessage.includes(`'${normalizedPath}'`) || errorMessage.includes(`"${normalizedPath}"`);
+}
+
+function loadOptionalJson(possiblePaths = []) {
+  for (const possiblePath of possiblePaths) {
+    try {
+      return require(possiblePath);
+    } catch (error) {
+      if (!isMissingModuleForPath(error, possiblePath)) {
+        throw error;
+      }
+    }
+  }
+
+  return null;
+}
+
+function loadClassificationResources() {
+  const candidateDirectories = [
+    path.resolve(__dirname, 'classification'),
+    path.resolve(__dirname, '..', '..', 'Wisdom-repo', 'Wisdom_expo', 'languages', 'classification'),
+  ];
+  const loadClassificationFile = (fileName) => loadOptionalJson(
+    candidateDirectories.map((directory) => path.resolve(directory, fileName))
+  );
+
+  const arClassification = loadClassificationFile('ar_clas.json');
+  const caClassification = loadClassificationFile('ca_clas.json');
+  const enClassification = loadClassificationFile('en_clas.json');
+  const esClassification = loadClassificationFile('es_clas.json');
+  const frClassification = loadClassificationFile('fr_clas.json');
+  const zhClassification = loadClassificationFile('zh_clas.json');
+
+  return {
+    ar: arClassification?.ar || {},
+    ca: caClassification?.ca || {},
+    en: enClassification?.en || {},
+    es: esClassification?.es || {},
+    fr: frClassification?.fr || {},
+    zh: zhClassification?.['zh-CN'] || zhClassification?.zh || {},
+  };
+}
+
+const CLASSIFICATION_RESOURCES = loadClassificationResources();
 
 const STOP_WORDS = new Set([
   'a', 'al', 'and', 'are', 'at', 'be', 'by', 'con', 'de', 'del', 'des', 'do',
@@ -286,11 +279,16 @@ function humanizeConceptKey(key) {
 function buildConceptStore(scope) {
   const store = new Map();
   const keys = new Set();
+  const aliasPrefix = scope === 'families' ? 'fam_' : 'cat_';
 
   Object.values(CLASSIFICATION_RESOURCES).forEach((resource) => {
     const scopedValues = resource?.[scope] || {};
     Object.keys(scopedValues).forEach((key) => keys.add(key));
   });
+
+  Object.keys(EXTRA_CONCEPT_ALIASES)
+    .filter((key) => key.startsWith(aliasPrefix))
+    .forEach((key) => keys.add(key));
 
   keys.forEach((key) => {
     const aliases = new Set();
