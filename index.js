@@ -435,7 +435,7 @@ const CURRENCY_ALIASES = Object.freeze({
 // Base EUR reference rates snapshot (ECB reference rates for 27 March 2026 where available).
 // AED and SAR are inferred from their long-standing USD pegs, and MAD uses an approximate
 // late-March 2026 market reference because the ECB table does not publish MAD on that page.
-const EUR_BASE_EXCHANGE_RATES = Object.freeze({
+const DEFAULT_EUR_BASE_EXCHANGE_RATES = Object.freeze({
   EUR: 1,
   USD: 1.1517,
   GBP: 0.8672,
@@ -458,6 +458,26 @@ const EUR_BASE_EXCHANGE_RATES = Object.freeze({
   ZAR: 19.7984,
   MAD: 10.82,
 });
+let eurBaseExchangeRates = { ...DEFAULT_EUR_BASE_EXCHANGE_RATES };
+let exchangeRatesMeta = {
+  base: 'EUR',
+  source: 'fallback_snapshot',
+  fetchedAt: null,
+  effectiveDate: null,
+  isFallback: true,
+};
+let exchangeRatesRefreshPromise = null;
+const EXCHANGE_RATES_CACHE_TTL_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.EXCHANGE_RATES_CACHE_TTL_MS || 6 * 60 * 60 * 1000)
+);
+const SUPPORTED_DYNAMIC_CURRENCIES = Object.freeze(
+  Object.keys(DEFAULT_EUR_BASE_EXCHANGE_RATES).filter((currencyCode) => currencyCode !== 'EUR')
+);
+const FRANKFURTER_V2_URL = (
+  process.env.EXCHANGE_RATES_API_URL
+  || 'https://api.frankfurter.dev/v2/rates'
+).trim();
 const CURRENCY_PATTERN_LOCALES = Object.freeze({
   EUR: 'es-ES',
   USD: 'en-US',
@@ -482,11 +502,143 @@ const CURRENCY_PATTERN_LOCALES = Object.freeze({
   MAD: 'ar-MA',
 });
 
+function getDefaultExchangeRates() {
+  return { ...DEFAULT_EUR_BASE_EXCHANGE_RATES };
+}
+
+function getCurrentExchangeRates() {
+  return eurBaseExchangeRates;
+}
+
+function normalizeExchangeRatesMap(rates) {
+  const normalizedRates = getDefaultExchangeRates();
+  normalizedRates.EUR = 1;
+
+  if (!rates || typeof rates !== 'object') {
+    return normalizedRates;
+  }
+
+  for (const [currencyCode, rawRate] of Object.entries(rates)) {
+    const normalizedCurrency = normalizeCurrencyCode(currencyCode, null);
+    const numericRate = Number(rawRate);
+    if (!normalizedCurrency || normalizedCurrency === 'EUR' || !Number.isFinite(numericRate) || numericRate <= 0) {
+      continue;
+    }
+    normalizedRates[normalizedCurrency] = numericRate;
+  }
+
+  return normalizedRates;
+}
+
+function parseFrankfurterRatesPayload(payload) {
+  if (Array.isArray(payload)) {
+    const rates = {};
+    let effectiveDate = null;
+
+    for (const entry of payload) {
+      const quote = normalizeCurrencyCode(entry?.quote, null);
+      const rate = Number(entry?.price ?? entry?.rate ?? entry?.value);
+      if (quote && Number.isFinite(rate) && rate > 0) {
+        rates[quote] = rate;
+      }
+      if (!effectiveDate && typeof entry?.date === 'string' && entry.date.trim()) {
+        effectiveDate = entry.date.trim();
+      }
+    }
+
+    return { rates, effectiveDate };
+  }
+
+  if (payload && typeof payload === 'object') {
+    return {
+      rates: payload.rates && typeof payload.rates === 'object' ? payload.rates : {},
+      effectiveDate: typeof payload.date === 'string' ? payload.date.trim() : null,
+    };
+  }
+
+  return { rates: {}, effectiveDate: null };
+}
+
+function isExchangeRatesCacheFresh() {
+  if (!exchangeRatesMeta?.fetchedAt) {
+    return false;
+  }
+
+  const fetchedAtMs = Date.parse(exchangeRatesMeta.fetchedAt);
+  return Number.isFinite(fetchedAtMs) && (Date.now() - fetchedAtMs) < EXCHANGE_RATES_CACHE_TTL_MS;
+}
+
+async function refreshExchangeRates({ force = false } = {}) {
+  if (!force && isExchangeRatesCacheFresh()) {
+    return {
+      ...exchangeRatesMeta,
+      rates: { ...eurBaseExchangeRates },
+    };
+  }
+
+  if (exchangeRatesRefreshPromise) {
+    return exchangeRatesRefreshPromise;
+  }
+
+  exchangeRatesRefreshPromise = (async () => {
+    const fallbackRates = getCurrentExchangeRates();
+    const requestUrl = `${FRANKFURTER_V2_URL}?base=EUR&quotes=${SUPPORTED_DYNAMIC_CURRENCIES.join(',')}`;
+
+    try {
+      const response = await axios.get(requestUrl, {
+        timeout: 8000,
+        headers: { Accept: 'application/json' },
+      });
+      const { rates, effectiveDate } = parseFrankfurterRatesPayload(response.data);
+      eurBaseExchangeRates = normalizeExchangeRatesMap(rates);
+      exchangeRatesMeta = {
+        base: 'EUR',
+        source: 'frankfurter',
+        fetchedAt: new Date().toISOString(),
+        effectiveDate: effectiveDate || null,
+        isFallback: false,
+      };
+    } catch (error) {
+      console.error('Error refreshing exchange rates:', error?.response?.data || error?.message || error);
+      eurBaseExchangeRates = normalizeExchangeRatesMap(fallbackRates);
+      exchangeRatesMeta = {
+        ...exchangeRatesMeta,
+        base: 'EUR',
+        source: exchangeRatesMeta?.fetchedAt ? exchangeRatesMeta.source : 'fallback_snapshot',
+        fetchedAt: exchangeRatesMeta?.fetchedAt || new Date().toISOString(),
+        effectiveDate: exchangeRatesMeta?.effectiveDate || null,
+        isFallback: true,
+      };
+    } finally {
+      exchangeRatesRefreshPromise = null;
+    }
+
+    return {
+      ...exchangeRatesMeta,
+      rates: { ...eurBaseExchangeRates },
+    };
+  })();
+
+  return exchangeRatesRefreshPromise;
+}
+
+async function ensureExchangeRatesFresh({ force = false } = {}) {
+  try {
+    return await refreshExchangeRates({ force });
+  } catch (error) {
+    console.error('Error ensuring exchange rates freshness:', error);
+    return {
+      ...exchangeRatesMeta,
+      rates: { ...eurBaseExchangeRates },
+    };
+  }
+}
+
 const STRIPE_ZERO_DECIMAL_CURRENCIES = new Set(['JPY', 'KRW']);
 
 function getExchangeRatePerEuro(currency) {
   const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
-  const rate = EUR_BASE_EXCHANGE_RATES[normalizedCurrency];
+  const rate = getCurrentExchangeRates()[normalizedCurrency];
   return Number.isFinite(rate) && rate > 0 ? rate : 1;
 }
 
@@ -646,13 +798,14 @@ function formatCurrencyAmount(amount, currency = 'EUR', locale = 'es-ES') {
 }
 
 function buildCurrencyRateCaseExpression(currencyExpression) {
-  const whenClauses = Object.entries(EUR_BASE_EXCHANGE_RATES)
+  const currentRates = getCurrentExchangeRates();
+  const whenClauses = Object.entries(currentRates)
     .map(([currencyCode, rate]) => `WHEN '${currencyCode}' THEN ${rate}`)
     .join(' ');
 
   return `
     CASE UPPER(COALESCE(${currencyExpression}, 'EUR'))
-      WHEN 'RMB' THEN ${EUR_BASE_EXCHANGE_RATES.CNY}
+      WHEN 'RMB' THEN ${currentRates.CNY || 1}
       ${whenClauses}
       ELSE 1
     END
@@ -1539,6 +1692,16 @@ const pool = mysql.createPool({
 
 
 const promisePool = pool.promise();
+refreshExchangeRates({ force: true }).catch((error) => {
+  console.error('Initial exchange-rates refresh failed:', error?.message || error);
+});
+const exchangeRatesRefreshInterval = setInterval(() => {
+  refreshExchangeRates({ force: true }).catch((error) => {
+    console.error('Scheduled exchange-rates refresh failed:', error?.message || error);
+  });
+}, EXCHANGE_RATES_CACHE_TTL_MS);
+exchangeRatesRefreshInterval.unref?.();
+
 const GOOGLE_WEB_CLIENT_ID = process.env.GOOGLE_WEB_CLIENT_ID || '232292898356-u0584r99cq2hckjlj6i0q2v4gchmuqsg.apps.googleusercontent.com';
 const googleAuthClient = new OAuth2Client(GOOGLE_WEB_CLIENT_ID);
 
@@ -2217,6 +2380,18 @@ const guestSessionLimiter = rateLimit({
 // Ruta de prueba
 app.get('/', (req, res) => {
   res.send('El backend está funcionando.');
+});
+
+app.get('/api/currency-rates', async (req, res) => {
+  const snapshot = await ensureExchangeRatesFresh();
+  res.status(200).json({
+    base: 'EUR',
+    rates: snapshot.rates,
+    date: snapshot.effectiveDate,
+    fetched_at: snapshot.fetchedAt,
+    source: snapshot.source,
+    is_fallback: snapshot.isFallback,
+  });
 });
 
 // Ruta para obtener usuarios
@@ -3811,6 +3986,7 @@ app.get('/api/service-family/:id/categories', (req, res) => {
 
 //Ruta para mostrar todos los servicios de una categoria
 app.get('/api/category/:id/services', async (req, res) => {
+  await ensureExchangeRatesFresh();
   const categoryId = Number(req.params.id);
   const viewerId = Number(req.query.viewer_id ?? req.query.user_id ?? null);
   const viewerCurrency = await resolveUserCurrency(viewerId, 'EUR');
@@ -5575,7 +5751,8 @@ app.get('/api/user/:id/services', authenticateToken, (req, res) => {
 });
 
 //Ruta para obtener el dinero en wallet
-app.get('/api/user/:id/wallet', authenticateToken, (req, res) => {
+app.get('/api/user/:id/wallet', authenticateToken, async (req, res) => {
+  await ensureExchangeRatesFresh();
   const requestedUserId = ensureSameUserOrRespond(req, res);
   if (!requestedUserId) return;
 
@@ -7515,6 +7692,7 @@ app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, re
 
 // Cobra la comisión 10% (mín 1€)
 app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
+  await ensureExchangeRatesFresh();
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
   const { payment_method_id } = req.body;
@@ -7906,6 +8084,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
 
 // Cargo final (destination charge) - FALTA COMISION EXTRA DE WISDOM SI VARIA PRECIO FINAL 
 app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
+  await ensureExchangeRatesFresh();
   const id = parseInt(req.params.id, 10);
   const { payment_method_id } = req.body;
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
@@ -9084,6 +9263,7 @@ app.get('/api/suggestions', async (req, res) => {
 });
 
 app.get('/api/services/filter-categories', async (req, res) => {
+  await ensureExchangeRatesFresh();
   const searchTerm = (req.query.query || '').trim();
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
@@ -9461,6 +9641,7 @@ app.get('/api/services/filter-categories', async (req, res) => {
 
 //Ruta para obtener todos los servicios de una busqueda
 app.get('/api/services', async (req, res) => {
+  await ensureExchangeRatesFresh();
   const searchTerm = (req.query.query || '').trim();
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
@@ -10071,6 +10252,7 @@ app.get('/api/services', async (req, res) => {
 });
 
 app.get('/api/services/count', async (req, res) => {
+  await ensureExchangeRatesFresh();
   const searchTerm = (req.query.query || '').trim();
   const hasSearchTerm = searchTerm.length > 0;
   const searchPattern = hasSearchTerm ? `%${searchTerm}%` : '%';
