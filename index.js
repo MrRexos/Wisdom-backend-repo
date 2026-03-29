@@ -2798,8 +2798,8 @@ cron.schedule('0 3 * * *', async () => {
       DELETE b FROM booking b
       LEFT JOIN payments p
         ON p.booking_id = b.id AND p.type = 'deposit'
-      WHERE b.booking_status = 'pending_deposit'
-        AND b.order_datetime < (NOW() - INTERVAL 24 HOUR)
+      WHERE b.service_status = 'pending_deposit'
+        AND b.created_at < (NOW() - INTERVAL 24 HOUR)
         AND (p.id IS NULL OR p.status IN ('requires_payment_method','canceled','payment_failed'));
     `);
     console.log('[CRON] Limpieza de reservas pending_deposit ejecutada');
@@ -4978,7 +4978,13 @@ app.delete('/api/services/:id', async (req, res) => {
       `SELECT COUNT(*) AS count
          FROM booking
         WHERE service_id = ?
-          AND (booking_status IS NULL OR LOWER(booking_status) NOT IN ('cancelled', 'completed'))`,
+          AND (
+            service_status NOT IN ('canceled', 'expired')
+            AND NOT (
+              service_status = 'finished'
+              AND settlement_status IN ('paid', 'refunded', 'partially_refunded')
+            )
+          )`,
       [serviceId]
     );
 
@@ -5759,34 +5765,44 @@ app.get('/api/service/:id', (req, res) => {
         (SELECT COUNT(*)
          FROM booking b
          WHERE b.service_id = s.id
-           AND LOWER(b.booking_status) IN ('accepted', 'confirmed', 'completed')) AS confirmed_booking_count,
+           AND b.service_status IN ('accepted', 'in_progress', 'finished')) AS confirmed_booking_count,
         (SELECT COALESCE(SUM(completed_count) - COUNT(*), 0)
          FROM (
            SELECT COUNT(*) AS completed_count
            FROM booking b
            WHERE b.service_id = s.id
-             AND LOWER(b.booking_status) = 'completed'
-           GROUP BY b.user_id
+             AND b.service_status = 'finished'
+           GROUP BY b.client_user_id
          ) AS completed_by_user) AS repeated_bookings_count,
-        (SELECT COALESCE(SUM(COALESCE(b.final_price, 0) - COALESCE(b.commission, 0)), 0)
+        (SELECT COALESCE(SUM(
+            COALESCE(cp.proposed_total_amount_cents, b.estimated_total_amount_cents, 0)
+            - COALESCE(cp.proposed_commission_amount_cents, b.estimated_commission_amount_cents, 0)
+          ), 0) / 100
          FROM booking b
+         LEFT JOIN booking_closure_proposal cp ON cp.id = (
+           SELECT cp2.id
+           FROM booking_closure_proposal cp2
+           WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+           ORDER BY cp2.id DESC
+           LIMIT 1
+         )
          WHERE b.service_id = s.id
-           AND LOWER(b.booking_status) = 'completed') AS total_earned_amount,
+           AND b.service_status = 'finished') AS total_earned_amount,
         (SELECT COUNT(DISTINCT sl.user_id)
          FROM item_list il
          JOIN service_list sl ON il.list_id = sl.id
          WHERE il.service_id = s.id) AS likes_count,
         (SELECT ROUND(COALESCE(SUM(
              CASE
-               WHEN b.service_duration IS NOT NULL THEN b.service_duration
-               WHEN b.booking_start_datetime IS NOT NULL AND b.booking_end_datetime IS NOT NULL
-                 THEN GREATEST(TIMESTAMPDIFF(MINUTE, b.booking_start_datetime, b.booking_end_datetime), 0)
+               WHEN b.requested_duration_minutes IS NOT NULL THEN b.requested_duration_minutes
+               WHEN b.requested_start_datetime IS NOT NULL AND b.requested_end_datetime IS NOT NULL
+                 THEN GREATEST(TIMESTAMPDIFF(MINUTE, b.requested_start_datetime, b.requested_end_datetime), 0)
                ELSE 0
              END
            ), 0) / 60, 2)
          FROM booking b
          WHERE b.service_id = s.id
-           AND LOWER(b.booking_status) = 'completed') AS total_hours_completed
+           AND b.service_status = 'finished') AS total_hours_completed
       FROM service s
       JOIN price p ON s.price_id = p.id
       JOIN user_account ua ON s.user_id = ua.id
@@ -10644,7 +10660,7 @@ app.get('/api/services', async (req, res) => {
       LEFT JOIN (
         SELECT
           service_id,
-          SUM(CASE WHEN LOWER(booking_status) IN ('accepted', 'confirmed', 'completed') THEN 1 ELSE 0 END) AS confirmed_booking_count
+          SUM(CASE WHEN service_status IN ('accepted', 'in_progress', 'finished') THEN 1 ELSE 0 END) AS confirmed_booking_count
         FROM booking
         GROUP BY service_id
       ) AS booking_data ON service.id = booking_data.service_id
@@ -10655,11 +10671,11 @@ app.get('/api/services', async (req, res) => {
         FROM (
           SELECT
             service_id,
-            user_id,
+            client_user_id,
             COUNT(*) AS completed_count
           FROM booking
-          WHERE LOWER(booking_status) = 'completed'
-          GROUP BY service_id, user_id
+          WHERE service_status = 'finished'
+          GROUP BY service_id, client_user_id
         ) AS completed_by_user
         GROUP BY service_id
       ) AS repeat_data ON service.id = repeat_data.service_id
@@ -10998,7 +11014,7 @@ app.get('/api/services', async (req, res) => {
       LEFT JOIN (
         SELECT
           service_id,
-          SUM(CASE WHEN LOWER(booking_status) IN ('accepted', 'confirmed', 'completed') THEN 1 ELSE 0 END) AS confirmed_booking_count
+          SUM(CASE WHEN service_status IN ('accepted', 'in_progress', 'finished') THEN 1 ELSE 0 END) AS confirmed_booking_count
         FROM booking
         GROUP BY service_id
       ) AS booking_data ON service.id = booking_data.service_id
@@ -11009,11 +11025,11 @@ app.get('/api/services', async (req, res) => {
         FROM (
           SELECT
             service_id,
-            user_id,
+            client_user_id,
             COUNT(*) AS completed_count
           FROM booking
-          WHERE LOWER(booking_status) = 'completed'
-          GROUP BY service_id, user_id
+          WHERE service_status = 'finished'
+          GROUP BY service_id, client_user_id
         ) AS completed_by_user
         GROUP BY service_id
       ) AS repeat_data ON service.id = repeat_data.service_id

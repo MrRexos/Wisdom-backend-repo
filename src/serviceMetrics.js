@@ -987,16 +987,26 @@ async function computeServiceSuccessRate({
     `
       SELECT
         b.service_id,
-        b.user_id,
-        LOWER(b.booking_status) AS booking_status,
-        b.booking_start_datetime,
-        b.booking_end_datetime,
-        b.order_datetime,
-        b.final_price,
-        b.commission,
+        b.client_user_id,
+        LOWER(b.service_status) AS service_status,
+        LOWER(b.settlement_status) AS settlement_status,
+        b.requested_start_datetime,
+        b.requested_end_datetime,
+        b.created_at,
+        b.estimated_total_amount_cents,
+        b.estimated_commission_amount_cents,
+        cp.proposed_total_amount_cents,
+        cp.proposed_commission_amount_cents,
         COALESCE(pay.last_status, '') AS final_payment_status
       FROM booking b
       JOIN service s ON s.id = b.service_id
+      LEFT JOIN booking_closure_proposal cp ON cp.id = (
+        SELECT cp2.id
+        FROM booking_closure_proposal cp2
+        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        ORDER BY cp2.id DESC
+        LIMIT 1
+      )
       LEFT JOIN (
         SELECT
           booking_id,
@@ -1007,9 +1017,9 @@ async function computeServiceSuccessRate({
       ) pay ON pay.booking_id = b.id
       WHERE s.service_category_id = ?
         AND (
-          (b.booking_end_datetime IS NOT NULL AND b.booking_end_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
-          (b.booking_start_datetime IS NOT NULL AND b.booking_start_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
-          (b.order_datetime IS NOT NULL AND b.order_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY))
+          (b.requested_end_datetime IS NOT NULL AND b.requested_end_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
+          (b.requested_start_datetime IS NOT NULL AND b.requested_start_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
+          (b.created_at IS NOT NULL AND b.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY))
         )
     `,
     [resolvedCategoryId, RETENTION_WINDOW_DAYS, RETENTION_WINDOW_DAYS, RETENTION_WINDOW_DAYS],
@@ -1067,7 +1077,7 @@ async function computeServiceSuccessRate({
   };
 
   const now = new Date();
-  const confirmedStatuses = new Set(['accepted', 'confirmed', 'completed']);
+  const confirmedStatuses = new Set(['accepted', 'in_progress', 'finished']);
 
   for (const row of bookingRows || []) {
     const serviceKey = Number(row.service_id);
@@ -1075,9 +1085,9 @@ async function computeServiceSuccessRate({
     const metrics = ensureMetrics(serviceKey);
     if (!metrics) continue;
 
-    const endDate = ensureDate(row.booking_end_datetime);
-    const startDate = ensureDate(row.booking_start_datetime);
-    const orderDate = ensureDate(row.order_datetime);
+    const endDate = ensureDate(row.requested_end_datetime);
+    const startDate = ensureDate(row.requested_start_datetime);
+    const orderDate = ensureDate(row.created_at);
     const eventDate = endDate || startDate || orderDate;
     if (!eventDate) continue;
 
@@ -1088,23 +1098,35 @@ async function computeServiceSuccessRate({
     const withinSuccessWindow = ageDays <= SUCCESS_WINDOW_DAYS;
     const weight = withinSuccessWindow ? computeExponentialWeight(ageDays, SUCCESS_HALF_LIFE_DAYS) : 0;
 
-    const status = String(row.booking_status || '').toLowerCase();
+    const status = String(row.service_status || '').toLowerCase();
+    const settlementStatus = String(row.settlement_status || '').toLowerCase();
     const finalStatus = String(row.final_payment_status || '').toLowerCase();
-    const netRevenue = Math.max(0, toNumber(row.final_price) - toNumber(row.commission));
-    const isDisputed = finalStatus.includes('dispute') || finalStatus.includes('refund');
+    const totalAmount = Math.max(
+      0,
+      toNumber(row.proposed_total_amount_cents ?? row.estimated_total_amount_cents) / 100,
+    );
+    const commissionAmount = Math.max(
+      0,
+      toNumber(row.proposed_commission_amount_cents ?? row.estimated_commission_amount_cents) / 100,
+    );
+    const netRevenue = Math.max(0, totalAmount - commissionAmount);
+    const isDisputed = settlementStatus === 'in_dispute'
+      || settlementStatus === 'manual_review_required'
+      || finalStatus.includes('dispute')
+      || finalStatus.includes('refund');
 
     if (withinSuccessWindow && confirmedStatuses.has(status)) {
       metrics.confirmedWeighted += weight;
       metrics.confirmedRaw180 += 1;
     }
 
-    if (withinSuccessWindow && status === 'cancelled') {
+    if (withinSuccessWindow && status === 'canceled') {
       metrics.cancelledWeighted += weight;
     }
 
-    if (status === 'completed') {
+    if (status === 'finished') {
       if (ageDays <= RETENTION_WINDOW_DAYS) {
-        const clientKey = Number(row.user_id);
+        const clientKey = Number(row.client_user_id);
         if (Number.isFinite(clientKey)) {
           const clients = metrics.clients;
           clients.set(clientKey, (clients.get(clientKey) || 0) + 1);
