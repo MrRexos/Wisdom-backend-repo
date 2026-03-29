@@ -373,6 +373,77 @@ function formatDateTimeEs(date) {
   });
 }
 
+const SQL_DATE_ONLY_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
+const SQL_DATETIME_REGEX = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,6})?)?$/;
+
+function formatUtcSqlDateTime(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
+function parseDateTimeInput(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === 'number') {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const isoCandidate = trimmed.replace(' ', 'T');
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(isoCandidate)) {
+    const parsed = new Date(isoCandidate);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const sqlDateTimeMatch = trimmed.match(SQL_DATETIME_REGEX);
+  if (sqlDateTimeMatch) {
+    const [, year, month, day, hour, minute, second = '00'] = sqlDateTimeMatch;
+    const parsed = new Date(Date.UTC(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute),
+      Number(second)
+    ));
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const sqlDateMatch = trimmed.match(SQL_DATE_ONLY_REGEX);
+  if (sqlDateMatch) {
+    const [, year, month, day] = sqlDateMatch;
+    const parsed = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), 0, 0, 0));
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const fallback = new Date(trimmed);
+  return Number.isNaN(fallback.getTime()) ? null : fallback;
+}
+
+function toUtcSqlDateTime(value) {
+  const parsed = parseDateTimeInput(value);
+  return parsed ? formatUtcSqlDateTime(parsed) : null;
+}
+
 function composeDisplayName({ firstName, surname, username, email }) {
   const fullName = [firstName, surname].filter(Boolean).join(' ').trim();
   if (fullName) return fullName;
@@ -1741,6 +1812,7 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD,
   database: process.env.DB_DATABASE,
   port: process.env.DB_PORT,
+  timezone: 'Z',
   //socketPath: `/cloudsql/${process.env.INSTANCE_CONNECTION_NAME}`,
   waitForConnections: true,
   connectionLimit: 20,  // Número máximo de conexiones en el pool
@@ -1748,6 +1820,14 @@ const pool = mysql.createPool({
   connectTimeout: 20000,     // Tiempo máximo que una conexión puede estar inactiva antes de ser liberada.
 });
 
+
+pool.on('connection', (connection) => {
+  connection.query("SET time_zone = '+00:00'", (error) => {
+    if (error) {
+      console.error('Error setting MySQL session time zone to UTC:', error);
+    }
+  });
+});
 
 const promisePool = pool.promise();
 refreshExchangeRates({ force: true }).catch((error) => {
@@ -6747,17 +6827,19 @@ app.post('/api/bookings', (req, res) => {
 
 // Función para crear la reserva 
 function createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res) {
+  const normalizedBookingStartDateTime = toUtcSqlDateTime(booking_start_datetime);
+  const normalizedBookingEndDateTime = toUtcSqlDateTime(booking_end_datetime);
   const bookingQuery = `
     INSERT INTO booking (user_id, service_id, address_id, payment_method_id, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, is_paid, booking_status, description, order_datetime)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_deposit', ?, NOW())
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_deposit', ?, UTC_TIMESTAMP())
   `;
   const bookingValues = [
     user_id,
     service_id,
     addressId, // Esto puede ser null
     null, // payment_method_id se establece en NULL
-    booking_start_datetime || null,
-    booking_end_datetime || null,
+    normalizedBookingStartDateTime,
+    normalizedBookingEndDateTime,
     recurrent_pattern_id || null,
     promotion_id || null,
     service_duration || null,
@@ -6877,6 +6959,9 @@ app.put('/api/bookings/:id', (req, res) => {
     if (address_id === 'null' || address_id === '') address_id = null;
   }
 
+  const normalizedBookingStartDateTime = toUtcSqlDateTime(booking_start_datetime);
+  const normalizedBookingEndDateTime = toUtcSqlDateTime(booking_end_datetime);
+
   pool.getConnection((err, connection) => {
     if (err) {
       console.error('Error al obtener la conexión:', err);
@@ -6891,8 +6976,8 @@ app.put('/api/bookings/:id', (req, res) => {
       'description = ?'
     ];
     const values = [
-      booking_start_datetime,
-      booking_end_datetime,
+      normalizedBookingStartDateTime,
+      normalizedBookingEndDateTime,
       service_duration,
       final_price,
       description
@@ -6946,6 +7031,9 @@ app.put('/api/bookings/:id', (req, res) => {
 app.patch('/api/bookings/:id/update-data', (req, res) => {
   const { id } = req.params;
   const { status, is_paid, booking_end_datetime, service_duration, final_price, commission, address_id } = req.body;
+  const normalizedBookingEndDateTime = typeof booking_end_datetime !== 'undefined'
+    ? toUtcSqlDateTime(booking_end_datetime)
+    : undefined;
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -6960,7 +7048,7 @@ app.patch('/api/bookings/:id/update-data', (req, res) => {
       fields.push('booking_status = ?');
       values.push(status);
       if (String(status).toLowerCase() === 'accepted') {
-        fields.push('booking_start_datetime = IF(booking_start_datetime IS NULL, NOW(), booking_start_datetime)');
+        fields.push('booking_start_datetime = IF(booking_start_datetime IS NULL, UTC_TIMESTAMP(), booking_start_datetime)');
       }
     }
     if (typeof is_paid !== 'undefined') {
@@ -6971,7 +7059,7 @@ app.patch('/api/bookings/:id/update-data', (req, res) => {
     // Campos extra de la reserva (fin, duración, precio final, comisión)
     if (typeof booking_end_datetime !== 'undefined') {
       fields.push('booking_end_datetime = ?');
-      values.push(booking_end_datetime);
+      values.push(normalizedBookingEndDateTime);
     }
     if (typeof service_duration !== 'undefined') {
       fields.push('service_duration = ?');
@@ -6993,7 +7081,7 @@ app.patch('/api/bookings/:id/update-data', (req, res) => {
     // Autocompletar fin  cuando se marque como completada
     if (typeof status !== 'undefined' && String(status).toLowerCase() === 'completed') {
       if (typeof booking_end_datetime === 'undefined') {
-        fields.push('booking_end_datetime = IFNULL(booking_end_datetime, NOW())');
+        fields.push('booking_end_datetime = IFNULL(booking_end_datetime, UTC_TIMESTAMP())');
       }
     }
 
