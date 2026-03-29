@@ -28,6 +28,20 @@ const {
   buildServiceSearchSuggestions,
   rankServiceSearchCandidates,
 } = require('./src/serviceSearchEngine');
+const {
+  MIN_BOOKING_DURATION_MINUTES,
+  MAX_BOOKING_DURATION_MINUTES,
+  normalizeServiceStatus,
+  normalizeSettlementStatus,
+  normalizeDurationMinutes,
+  isDurationMinutesInRange,
+  buildBookingSchedule,
+  deriveLegacyBookingStatus,
+  deriveLegacyIsPaid,
+  canEditBooking,
+  buildTransitionPatch,
+  normalizeLegacyStatusUpdate,
+} = require('./src/bookingDomain');
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
 const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
 const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
@@ -1381,6 +1395,372 @@ function computePricing({ priceType, unitPrice, durationMinutes, currency = 'EUR
   const final = round2(base + commission);
 
   return { base, commission, final, minutes };
+}
+
+function computeBookingPricingSnapshot({ priceType, unitPrice, durationMinutes, currency = 'EUR' }) {
+  const normalizedPriceType = String(priceType || '').trim().toLowerCase();
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const normalizedMinutes = Math.max(0, Math.round(Number(durationMinutes) || 0));
+  const normalizedUnitPrice = Number.parseFloat(unitPrice) || 0;
+
+  let baseAmount = 0;
+  if (normalizedPriceType === 'hour') {
+    baseAmount = normalizedUnitPrice * (normalizedMinutes / 60);
+  } else if (normalizedPriceType === 'fix' || normalizedPriceType === 'budget') {
+    baseAmount = normalizedUnitPrice;
+  } else {
+    baseAmount = normalizedUnitPrice;
+  }
+
+  const roundedBaseAmount = round2(baseAmount);
+  const roundedCommissionAmount = Math.max(
+    getMinimumCommissionAmount(normalizedCurrency),
+    round1(roundedBaseAmount * 0.1)
+  );
+  const shouldNullFinalAmount =
+    (normalizedPriceType === 'hour' && normalizedMinutes <= 0) ||
+    (normalizedPriceType === 'budget' && roundedBaseAmount <= 0);
+
+  return {
+    type: normalizedPriceType,
+    currency: normalizedCurrency,
+    minutes: normalizedMinutes,
+    base: roundedBaseAmount,
+    commission: roundedCommissionAmount,
+    final: shouldNullFinalAmount ? null : round2(roundedBaseAmount + roundedCommissionAmount),
+  };
+}
+
+function normalizeNullableInteger(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const parsedValue = Number.parseInt(value, 10);
+  return Number.isInteger(parsedValue) ? parsedValue : null;
+}
+
+function toDbDateTime(value) {
+  if (value instanceof Date) {
+    return formatUtcSqlDateTime(value);
+  }
+
+  return value;
+}
+
+function mapBookingRecordForApi(row = {}) {
+  const normalizedServiceStatus = normalizeServiceStatus(row.service_status, 'pending_deposit');
+  const normalizedSettlementStatus = normalizeSettlementStatus(row.settlement_status, 'none');
+  const effectivePriceType = String(row.price_type_snapshot || row.price_type || '').trim().toLowerCase();
+  const serviceCurrency = normalizeCurrencyCode(
+    row.service_currency_snapshot,
+    normalizeCurrencyCode(row.currency, normalizeCurrencyCode(row.service_currency, 'EUR'))
+  );
+  const requestedStartDateTime = row.requested_start_datetime ?? row.booking_start_datetime ?? null;
+  const requestedEndDateTime = row.requested_end_datetime ?? row.booking_end_datetime ?? null;
+  const requestedDurationMinutes = row.requested_duration_minutes ?? row.service_duration ?? null;
+  const closureTotalAmountCents = row.proposed_total_amount_cents ?? row.closure_proposed_total_amount_cents ?? null;
+  const closureCommissionAmountCents = row.proposed_commission_amount_cents ?? row.closure_proposed_commission_amount_cents ?? null;
+  const closureBaseAmountCents = row.proposed_base_amount_cents ?? row.closure_proposed_base_amount_cents ?? null;
+  const estimatedTotalPrice = row.estimated_total_amount_cents !== null && row.estimated_total_amount_cents !== undefined
+    ? fromMinorUnits(row.estimated_total_amount_cents, serviceCurrency)
+    : null;
+  const estimatedCommission = row.estimated_commission_amount_cents !== null && row.estimated_commission_amount_cents !== undefined
+    ? fromMinorUnits(row.estimated_commission_amount_cents, serviceCurrency)
+    : null;
+  const estimatedBasePrice = row.estimated_base_amount_cents !== null && row.estimated_base_amount_cents !== undefined
+    ? fromMinorUnits(row.estimated_base_amount_cents, serviceCurrency)
+    : null;
+  const closureTotalPrice = closureTotalAmountCents !== null && closureTotalAmountCents !== undefined
+    ? fromMinorUnits(closureTotalAmountCents, serviceCurrency)
+    : null;
+  const closureCommission = closureCommissionAmountCents !== null && closureCommissionAmountCents !== undefined
+    ? fromMinorUnits(closureCommissionAmountCents, serviceCurrency)
+    : null;
+  const closureBasePrice = closureBaseAmountCents !== null && closureBaseAmountCents !== undefined
+    ? fromMinorUnits(closureBaseAmountCents, serviceCurrency)
+    : null;
+  const hasActiveClosureProposal = row.closure_proposal_id !== null
+    && row.closure_proposal_id !== undefined;
+  const needsClosureInput = normalizedServiceStatus === 'finished'
+    && ['hour', 'budget'].includes(effectivePriceType)
+    && !hasActiveClosureProposal;
+
+  let finalPrice = row.final_price ?? null;
+  if (finalPrice === null) {
+    if (closureTotalPrice !== null) {
+      finalPrice = closureTotalPrice;
+    } else if (estimatedTotalPrice !== null) {
+      finalPrice = estimatedTotalPrice;
+    }
+  }
+
+  let commission = row.commission ?? null;
+  if (commission === null) {
+    if (closureCommission !== null) {
+      commission = closureCommission;
+    } else if (estimatedCommission !== null) {
+      commission = estimatedCommission;
+    }
+  }
+
+  let basePrice = row.base_price ?? null;
+  if (basePrice === null) {
+    if (closureBasePrice !== null) {
+      basePrice = closureBasePrice;
+    } else if (estimatedBasePrice !== null) {
+      basePrice = estimatedBasePrice;
+    }
+  }
+
+  return {
+    ...row,
+    id: row.id ?? row.booking_id ?? null,
+    booking_id: row.booking_id ?? row.id ?? null,
+    user_id: row.user_id ?? row.client_user_id ?? null,
+    client_user_id: row.client_user_id ?? row.user_id ?? null,
+    service_user_id: row.service_user_id ?? row.provider_user_id_snapshot ?? null,
+    service_status: normalizedServiceStatus,
+    settlement_status: normalizedSettlementStatus,
+    booking_status: deriveLegacyBookingStatus({
+      serviceStatus: normalizedServiceStatus,
+      settlementStatus: normalizedSettlementStatus,
+      cancellationReasonCode: row.cancellation_reason_code,
+    }),
+    is_paid: deriveLegacyIsPaid(normalizedSettlementStatus) ? 1 : 0,
+    booking_start_datetime: requestedStartDateTime,
+    booking_end_datetime: requestedEndDateTime,
+    service_duration: requestedDurationMinutes,
+    requested_start_datetime: requestedStartDateTime,
+    requested_end_datetime: requestedEndDateTime,
+    requested_duration_minutes: requestedDurationMinutes,
+    order_datetime: row.order_datetime ?? row.created_at ?? null,
+    final_price: finalPrice,
+    commission,
+    base_price: basePrice,
+    estimated_total_price: estimatedTotalPrice,
+    estimated_commission: estimatedCommission,
+    estimated_base_price: estimatedBasePrice,
+    closure_total_price: closureTotalPrice,
+    closure_commission: closureCommission,
+    closure_base_price: closureBasePrice,
+    closure_final_duration_minutes: row.proposed_final_duration_minutes ?? null,
+    has_active_closure_proposal: hasActiveClosureProposal,
+    needs_closure_input: needsClosureInput,
+    can_edit: canEditBooking({
+      service_status: normalizedServiceStatus,
+      settlement_status: normalizedSettlementStatus,
+    }),
+    price_type: row.price_type ?? row.price_type_snapshot ?? null,
+    currency: normalizeCurrencyCode(row.currency, serviceCurrency),
+  };
+}
+
+function buildBookingStatusFilter(status, tableAlias = 'b') {
+  const normalizedStatus = String(status || '').trim().toLowerCase().replace(/-/g, '_');
+  if (!normalizedStatus) {
+    return { clause: '', params: [] };
+  }
+
+  switch (normalizedStatus) {
+    case 'completed':
+      return { clause: ` AND ${tableAlias}.service_status = ?`, params: ['finished'] };
+    case 'rejected':
+      return {
+        clause: ` AND ${tableAlias}.service_status = 'canceled' AND COALESCE(${tableAlias}.cancellation_reason_code, '') IN ('rejected','provider_rejected','rejected_by_provider')`,
+        params: [],
+      };
+    case 'paid':
+      return { clause: ` AND ${tableAlias}.settlement_status = ?`, params: ['paid'] };
+    case 'payment_failed':
+      return { clause: ` AND ${tableAlias}.settlement_status = ?`, params: ['payment_failed'] };
+    default: {
+      const mappedLegacyStatus = normalizeLegacyStatusUpdate(normalizedStatus);
+      if (mappedLegacyStatus.serviceStatus) {
+        return {
+          clause: ` AND ${tableAlias}.service_status = ?`,
+          params: [mappedLegacyStatus.serviceStatus],
+        };
+      }
+      if (mappedLegacyStatus.settlementStatus) {
+        return {
+          clause: ` AND ${tableAlias}.settlement_status = ?`,
+          params: [mappedLegacyStatus.settlementStatus],
+        };
+      }
+      return { clause: '', params: [] };
+    }
+  }
+}
+
+async function insertBookingStatusHistory(connection, {
+  bookingId,
+  fromServiceStatus,
+  toServiceStatus,
+  fromSettlementStatus,
+  toSettlementStatus,
+  changedByUserId = null,
+  reasonCode = null,
+  note = null,
+}) {
+  await connection.query(
+    `INSERT INTO booking_status_history
+      (booking_id, from_service_status, to_service_status, from_settlement_status, to_settlement_status, changed_by_user_id, reason_code, note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      bookingId,
+      fromServiceStatus || null,
+      toServiceStatus,
+      fromSettlementStatus || null,
+      toSettlementStatus,
+      changedByUserId || null,
+      reasonCode || null,
+      note || null,
+    ]
+  );
+}
+
+async function transitionBookingStateRecord(connection, currentBooking, {
+  nextServiceStatus,
+  nextSettlementStatus,
+  changedByUserId = null,
+  reasonCode = null,
+  note = null,
+  extraPatch = {},
+}) {
+  const transition = buildTransitionPatch(currentBooking, {
+    nextServiceStatus,
+    nextSettlementStatus,
+  });
+  const patch = { ...transition.patch, ...extraPatch };
+  const patchEntries = Object.entries(patch).filter(([, value]) => typeof value !== 'undefined');
+
+  if (patchEntries.length === 0) {
+    return {
+      ...transition,
+      appliedPatch: {},
+    };
+  }
+
+  const setClause = patchEntries.map(([columnName]) => `${columnName} = ?`).join(', ');
+  const values = patchEntries.map(([, value]) => toDbDateTime(value));
+
+  await connection.query(
+    `UPDATE booking SET ${setClause} WHERE id = ?`,
+    [...values, currentBooking.id]
+  );
+
+  if (transition.changed) {
+    await insertBookingStatusHistory(connection, {
+      bookingId: currentBooking.id,
+      fromServiceStatus: transition.fromServiceStatus,
+      toServiceStatus: transition.toServiceStatus,
+      fromSettlementStatus: transition.fromSettlementStatus,
+      toSettlementStatus: transition.toSettlementStatus,
+      changedByUserId,
+      reasonCode,
+      note,
+    });
+  }
+
+  return {
+    ...transition,
+    appliedPatch: patch,
+  };
+}
+
+async function upsertActiveClosureProposal(connection, {
+  booking,
+  createdByUserId,
+  proposedBaseAmountCents,
+  proposedFinalDurationMinutes = null,
+  zeroChargeMode = false,
+}) {
+  const bookingCurrency = normalizeCurrencyCode(booking?.service_currency_snapshot, 'EUR');
+  const priceTypeSnapshot = String(booking?.price_type_snapshot || '').trim().toLowerCase();
+  const estimatedTotalAmountCents = Number(booking?.estimated_total_amount_cents || 0);
+  const estimatedDurationMinutes = normalizeNullableInteger(booking?.requested_duration_minutes);
+  const normalizedProposedBaseAmountCents = Math.max(0, Number(proposedBaseAmountCents || 0));
+  const proposalPricing = computeBookingPricingSnapshot({
+    priceType: priceTypeSnapshot === 'budget' ? 'budget' : 'fix',
+    unitPrice: fromMinorUnits(normalizedProposedBaseAmountCents, bookingCurrency),
+    durationMinutes: proposedFinalDurationMinutes || 0,
+    currency: bookingCurrency,
+  });
+  const proposedCommissionAmountCents = toMinorUnits(proposalPricing.commission || 0, bookingCurrency);
+  const proposedTotalAmountCents = proposalPricing.final === null
+    ? 0
+    : toMinorUnits(proposalPricing.final, bookingCurrency);
+  const depositAlreadyPaidAmountCents = Number(booking?.deposit_amount_cents_snapshot || 0);
+  const amountDueFromClientCents = Math.max(0, proposedTotalAmountCents - depositAlreadyPaidAmountCents);
+  const amountToRefundCents = Math.max(0, depositAlreadyPaidAmountCents - proposedTotalAmountCents);
+  const providerPayoutAmountCents = normalizedProposedBaseAmountCents;
+  const platformAmountCents = proposedCommissionAmountCents;
+
+  const [[existingProposal]] = await connection.query(
+    `SELECT id
+     FROM booking_closure_proposal
+     WHERE booking_id = ? AND status = 'active'
+     ORDER BY id DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [booking.id]
+  );
+
+  const queryValues = [
+    priceTypeSnapshot,
+    estimatedDurationMinutes,
+    normalizeNullableInteger(proposedFinalDurationMinutes),
+    estimatedTotalAmountCents,
+    normalizedProposedBaseAmountCents,
+    proposedCommissionAmountCents,
+    proposedTotalAmountCents,
+    depositAlreadyPaidAmountCents,
+    amountDueFromClientCents,
+    amountToRefundCents,
+    providerPayoutAmountCents,
+    platformAmountCents,
+    zeroChargeMode ? 1 : 0,
+  ];
+
+  if (existingProposal?.id) {
+    await connection.query(
+      `UPDATE booking_closure_proposal
+       SET price_type_snapshot = ?,
+           estimated_duration_minutes = ?,
+           proposed_final_duration_minutes = ?,
+           estimated_total_amount_cents = ?,
+           proposed_base_amount_cents = ?,
+           proposed_commission_amount_cents = ?,
+           proposed_total_amount_cents = ?,
+           deposit_already_paid_amount_cents = ?,
+           amount_due_from_client_cents = ?,
+           amount_to_refund_cents = ?,
+           provider_payout_amount_cents = ?,
+           platform_amount_cents = ?,
+           zero_charge_mode = ?,
+           sent_at = UTC_TIMESTAMP(),
+           revoked_at = NULL,
+           accepted_at = NULL,
+           rejected_at = NULL
+       WHERE id = ?`,
+      [...queryValues, existingProposal.id]
+    );
+    return existingProposal.id;
+  }
+
+  const [insertResult] = await connection.query(
+    `INSERT INTO booking_closure_proposal
+      (booking_id, created_by_user_id, status, price_type_snapshot, estimated_duration_minutes, proposed_final_duration_minutes, estimated_total_amount_cents, proposed_base_amount_cents, proposed_commission_amount_cents, proposed_total_amount_cents, deposit_already_paid_amount_cents, amount_due_from_client_cents, amount_to_refund_cents, provider_payout_amount_cents, platform_amount_cents, zero_charge_mode, auto_charge_eligible)
+     VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+    [
+      booking.id,
+      createdByUserId,
+      ...queryValues,
+    ]
+  );
+
+  return insertResult.insertId;
 }
 
 // Garantiza un Customer y lo persiste en user_account.stripe_customer_id
@@ -5616,191 +5996,236 @@ app.get('/api/suggested_professional', (req, res) => {
 });
 
 //Ruta para obtener todas las reservas de un user
-app.get('/api/user/:userId/bookings', authenticateToken, (req, res) => {
+app.get('/api/user/:userId/bookings', authenticateToken, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res, req.params.userId);
   if (!requestedUserId) return;
-  const { status } = req.query;
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
-
-    // Consulta para obtener la información de todas las reservas y servicios asociados
-    let query = `
+  try {
+    const { status } = req.query;
+    const statusFilter = buildBookingStatusFilter(status, 'b');
+    const [bookingRows] = await promisePool.query(
+      `
       SELECT
-          booking.id AS booking_id,
-          booking.booking_start_datetime,
-          booking.booking_end_datetime,
-          booking.service_duration,
-          booking.final_price,
-          booking.commission,
-          booking.is_paid,
-          booking.booking_status,
-          booking.order_datetime,
-          service.id AS service_id,
-          service.service_title,
-          service.description,
-          service.service_category_id,
-          service.price_id,
-          service.latitude,
-          service.longitude,
-          service.action_rate,
-          service.user_can_ask,
-          service.user_can_consult,
-          service.price_consult,
-          service.consult_via_id,
-          service.is_individual,
-          service.is_hidden,
-          service.service_created_datetime,
-          service.last_edit_datetime,
-          price.price,
-          price.currency AS currency,
-          price.price_type,
-          user_account.id AS service_user_id,
-          user_account.email,
-          user_account.phone,
-          user_account.username,
-          user_account.first_name,
-          user_account.surname,
-          user_account.profile_picture,
-          user_account.is_professional,
-          user_account.language,
-          (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
-          FROM service_image si 
-          WHERE si.service_id = service.id) AS images
-      FROM booking
-      LEFT JOIN service ON booking.service_id = service.id
-      LEFT JOIN price ON service.price_id = price.id
-      LEFT JOIN user_account ON service.user_id = user_account.id
-      WHERE booking.user_id = ?`;
+        b.id AS booking_id,
+        b.id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
+        b.service_id,
+        b.address_id,
+        b.description,
+        b.service_status,
+        b.settlement_status,
+        b.created_at,
+        b.updated_at,
+        b.requested_start_datetime,
+        b.requested_duration_minutes,
+        b.requested_end_datetime,
+        b.deposit_confirmed_at,
+        b.accepted_at,
+        b.started_at,
+        b.finished_at,
+        b.canceled_at,
+        b.expired_at,
+        b.accept_deadline_at,
+        b.expires_at,
+        b.client_approval_deadline_at,
+        b.last_minute_window_starts_at,
+        b.canceled_by_user_id,
+        b.cancellation_reason_code,
+        b.cancellation_note,
+        b.service_title_snapshot,
+        b.price_type_snapshot,
+        b.service_currency_snapshot,
+        b.unit_price_amount_cents_snapshot,
+        b.minimum_notice_policy_snapshot,
+        b.estimated_base_amount_cents,
+        b.estimated_commission_amount_cents,
+        b.estimated_total_amount_cents,
+        b.deposit_amount_cents_snapshot,
+        b.deposit_currency_snapshot,
+        cp.proposed_base_amount_cents,
+        cp.proposed_commission_amount_cents,
+        cp.proposed_total_amount_cents,
+        cp.status AS closure_status,
+        s.id AS service_id,
+        COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
+        s.description,
+        s.service_category_id,
+        s.price_id,
+        s.latitude,
+        s.longitude,
+        s.action_rate,
+        s.user_can_ask,
+        s.user_can_consult,
+        s.price_consult,
+        s.consult_via_id,
+        s.is_individual,
+        s.is_hidden,
+        s.service_created_datetime,
+        s.last_edit_datetime,
+        p.price,
+        COALESCE(p.currency, b.service_currency_snapshot) AS currency,
+        COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
+        su.id AS service_user_id,
+        su.email,
+        su.phone,
+        su.username,
+        su.first_name,
+        su.surname,
+        su.profile_picture,
+        su.is_professional,
+        su.language,
+        (
+          SELECT JSON_ARRAYAGG(
+            JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order)
+          )
+          FROM service_image si
+          WHERE si.service_id = s.id
+        ) AS images
+      FROM booking b
+      LEFT JOIN service s ON b.service_id = s.id
+      LEFT JOIN price p ON s.price_id = p.id
+      LEFT JOIN user_account su ON COALESCE(s.user_id, b.provider_user_id_snapshot) = su.id
+      LEFT JOIN booking_closure_proposal cp ON cp.id = (
+        SELECT cp2.id
+        FROM booking_closure_proposal cp2
+        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        ORDER BY cp2.id DESC
+        LIMIT 1
+      )
+      WHERE b.client_user_id = ?${statusFilter.clause}
+      ORDER BY b.created_at DESC
+      `,
+      [requestedUserId, ...statusFilter.params]
+    );
 
-    const params = [requestedUserId];
-    if (status) {
-      query += ' AND booking.booking_status = ?';
-      params.push(status);
-    }
-    query += ' ORDER BY booking.order_datetime DESC;';
-
-    connection.query(query, params, (err, bookingsData) => {
-      connection.release(); // Liberar la conexión después de usarla
-
-      if (err) {
-        console.error('Error al obtener la información de las reservas:', err);
-        res.status(500).json({ error: 'Error al obtener la información de las reservas.' });
-        return;
-      }
-
-      if (bookingsData.length > 0) {
-        res.status(200).json(bookingsData); // Devolver la lista de reservas con la información del servicio y usuario
-      } else {
-        res.status(200).json({ notFound: true, message: 'No se encontraron reservas para este usuario.' });
-      }
-    });
-  });
+    return res.status(200).json(bookingRows.map(mapBookingRecordForApi));
+  } catch (error) {
+    console.error('Error al obtener la información de las reservas:', error);
+    return res.status(500).json({ error: 'Error al obtener la información de las reservas.' });
+  }
 });
 
 //Ruta para obtener todas las reservas de un profesional
-app.get('/api/service-user/:userId/bookings', (req, res) => {
-  const { userId } = req.params; // ID del usuario dentro de la tabla service
-  const { status } = req.query;
+app.get('/api/service-user/:userId/bookings', authenticateToken, async (req, res) => {
+  const requestedUserId = ensureSameUserOrRespond(req, res, req.params.userId);
+  if (!requestedUserId) return;
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
+  try {
+    const { status } = req.query;
+    const statusFilter = buildBookingStatusFilter(status, 'b');
+    const [bookingRows] = await promisePool.query(
+      `
+      SELECT
+        b.id AS booking_id,
+        b.id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
+        b.service_id,
+        b.address_id,
+        b.description,
+        b.service_status,
+        b.settlement_status,
+        b.created_at,
+        b.updated_at,
+        b.requested_start_datetime,
+        b.requested_duration_minutes,
+        b.requested_end_datetime,
+        b.deposit_confirmed_at,
+        b.accepted_at,
+        b.started_at,
+        b.finished_at,
+        b.canceled_at,
+        b.expired_at,
+        b.accept_deadline_at,
+        b.expires_at,
+        b.client_approval_deadline_at,
+        b.last_minute_window_starts_at,
+        b.canceled_by_user_id,
+        b.cancellation_reason_code,
+        b.cancellation_note,
+        b.service_title_snapshot,
+        b.price_type_snapshot,
+        b.service_currency_snapshot,
+        b.unit_price_amount_cents_snapshot,
+        b.minimum_notice_policy_snapshot,
+        b.estimated_base_amount_cents,
+        b.estimated_commission_amount_cents,
+        b.estimated_total_amount_cents,
+        b.deposit_amount_cents_snapshot,
+        b.deposit_currency_snapshot,
+        cp.proposed_base_amount_cents,
+        cp.proposed_commission_amount_cents,
+        cp.proposed_total_amount_cents,
+        cp.status AS closure_status,
+        s.id AS service_id,
+        COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
+        s.description,
+        s.service_category_id,
+        s.price_id,
+        s.latitude,
+        s.longitude,
+        s.action_rate,
+        s.user_can_ask,
+        s.user_can_consult,
+        s.price_consult,
+        s.consult_via_id,
+        s.is_individual,
+        s.experience_years,
+        s.is_hidden,
+        s.service_created_datetime,
+        s.last_edit_datetime,
+        p.price,
+        COALESCE(p.currency, b.service_currency_snapshot) AS currency,
+        COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
+        su.id AS service_user_id,
+        su.email AS service_user_email,
+        su.phone AS service_user_phone,
+        su.username AS service_user_username,
+        su.first_name AS service_user_first_name,
+        su.surname AS service_user_surname,
+        su.profile_picture AS service_user_profile_picture,
+        su.is_professional AS service_user_is_professional,
+        su.language AS service_user_language,
+        bu.id AS booking_user_id,
+        bu.email AS booking_user_email,
+        bu.phone AS booking_user_phone,
+        bu.username AS booking_user_username,
+        bu.first_name AS booking_user_first_name,
+        bu.surname AS booking_user_surname,
+        bu.profile_picture AS booking_user_profile_picture,
+        bu.is_professional AS booking_user_is_professional,
+        bu.language AS booking_user_language,
+        (
+          SELECT JSON_ARRAYAGG(
+            JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order)
+          )
+          FROM service_image si
+          WHERE si.service_id = s.id
+        ) AS images
+      FROM booking b
+      LEFT JOIN service s ON b.service_id = s.id
+      LEFT JOIN price p ON s.price_id = p.id
+      LEFT JOIN user_account su ON COALESCE(s.user_id, b.provider_user_id_snapshot) = su.id
+      LEFT JOIN user_account bu ON b.client_user_id = bu.id
+      LEFT JOIN booking_closure_proposal cp ON cp.id = (
+        SELECT cp2.id
+        FROM booking_closure_proposal cp2
+        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        ORDER BY cp2.id DESC
+        LIMIT 1
+      )
+      WHERE COALESCE(s.user_id, b.provider_user_id_snapshot) = ?${statusFilter.clause}
+      ORDER BY b.created_at DESC
+      `,
+      [requestedUserId, ...statusFilter.params]
+    );
 
-    // Consulta para obtener la información de todas las reservas donde el servicio pertenece a un usuario específico
-    let query = `
-      SELECT 
-        booking.id AS booking_id,
-        booking.user_id AS booking_user_id,
-        booking.booking_start_datetime,
-        booking.booking_end_datetime,
-        booking.service_duration,
-        booking.final_price,
-        booking.commission,
-        booking.is_paid,
-        booking.booking_status,
-        booking.order_datetime,
-        service.id AS service_id,
-        service.service_title,
-        service.description,
-        service.service_category_id,
-        service.price_id,
-        service.latitude,
-        service.longitude,
-        service.action_rate,
-        service.user_can_ask,
-        service.user_can_consult,
-        service.price_consult,
-        service.consult_via_id,
-        service.is_individual,
-        service.experience_years,
-        service.is_hidden,
-        service.service_created_datetime,
-        service.last_edit_datetime,
-        price.price,
-        price.currency AS currency,
-        price.price_type,
-        -- Información del usuario que presta el servicio
-        service_user.id AS service_user_id,
-        service_user.email AS service_user_email,
-        service_user.phone AS service_user_phone,
-        service_user.username AS service_user_username,
-        service_user.first_name AS service_user_first_name,
-        service_user.surname AS service_user_surname,
-        service_user.profile_picture AS service_user_profile_picture,
-        service_user.is_professional AS service_user_is_professional,
-        service_user.language AS service_user_language,
-        -- Información del usuario que realizó la reserva
-        booking_user.id AS booking_user_id,
-        booking_user.email AS booking_user_email,
-        booking_user.phone AS booking_user_phone,
-        booking_user.username AS booking_user_username,
-        booking_user.first_name AS booking_user_first_name,
-        booking_user.surname AS booking_user_surname,
-        booking_user.profile_picture AS booking_user_profile_picture,
-        booking_user.is_professional AS booking_user_is_professional,
-        booking_user.language AS booking_user_language,
-        -- Subconsulta para obtener las imágenes del servicio
-        (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', si.id, 'image_url', si.image_url, 'object_name', si.object_name, 'order', si.order))
-         FROM service_image si 
-         WHERE si.service_id = service.id) AS images
-      FROM booking
-      JOIN service ON booking.service_id = service.id
-      JOIN price ON service.price_id = price.id
-      JOIN user_account AS service_user ON service.user_id = service_user.id -- Usuario que presta el servicio
-      JOIN user_account AS booking_user ON booking.user_id = booking_user.id -- Usuario que realizó la reserva
-      WHERE service.user_id = ?`;
-
-    const params = [userId];
-    if (status) {
-      query += ' AND booking.booking_status = ?';
-      params.push(status);
-    }
-    query += ' ORDER BY booking.order_datetime DESC;';
-
-    connection.query(query, params, (err, bookingsData) => {
-      connection.release(); // Liberar la conexión después de usarla
-
-      if (err) {
-        console.error('Error al obtener la información de las reservas:', err);
-        res.status(500).json({ error: 'Error al obtener la información de las reservas.' });
-        return;
-      }
-
-      if (bookingsData.length > 0) {
-        res.status(200).json(bookingsData); // Devolver la lista de reservas con la información del servicio y usuario
-      } else {
-        res.status(200).json({ notFound: true, message: 'No se encontraron reservas para este usuario.' });
-      }
-    });
-  });
+    return res.status(200).json(bookingRows.map(mapBookingRecordForApi));
+  } catch (error) {
+    console.error('Error al obtener la información de las reservas:', error);
+    return res.status(500).json({ error: 'Error al obtener la información de las reservas.' });
+  }
 });
 
 //Ruta para mostrar todos los servicios de un profesional
@@ -6732,178 +7157,282 @@ app.delete('/api/address/:id', (req, res) => {
 });
 
 //Crear reserva
-app.post('/api/bookings', (req, res) => {
-  const {
-    user_id,
-    address_id,
-    address_type,
-    street_number,
-    address_1,
-    address_2,
-    postal_code,
-    city,
-    state,
-    country,
-    service_id,
-    booking_start_datetime,
-    booking_end_datetime,
-    recurrent_pattern_id,
-    promotion_id,
-    service_duration,
-    final_price,
-    commission,
-    description // Nueva propiedad para la descripción
-  } = req.body;
+app.post('/api/bookings', async (req, res) => {
+  const authenticatedUserId = parseRequestedUserId(req.user?.id);
+  const requestedUserId = normalizeNullableInteger(req.body.client_user_id ?? req.body.user_id);
+  const serviceId = normalizeNullableInteger(req.body.service_id);
 
-  let normalizedAddressId = address_id;
-  if (normalizedAddressId === 'null' || normalizedAddressId === '') {
-    normalizedAddressId = null;
+  if (!authenticatedUserId || !requestedUserId || requestedUserId !== authenticatedUserId) {
+    return res.status(403).json({ error: 'No autorizado para crear la reserva.' });
   }
 
-  // Verificación de campos requeridos para el usuario
-  if (!user_id) {
-    return res.status(400).json({ error: 'El campo user_id es requerido.' });
+  if (!serviceId) {
+    return res.status(400).json({ error: 'service_id es requerido.' });
   }
 
-  // Si street_number o address_2 son undefined o vacíos, se establecen como NULL
-  const streetNumberValue = street_number || null;
-  const address2Value = address_2 || null;
+  const requestedStartInput = req.body.requested_start_datetime ?? req.body.booking_start_datetime ?? null;
+  const requestedDurationMinutes = normalizeDurationMinutes(
+    req.body.requested_duration_minutes ?? req.body.service_duration ?? null
+  );
 
-  // Variable para almacenar el address_id
-  let addressId = null;
+  if (!isDurationMinutesInRange(requestedDurationMinutes)) {
+    return res.status(400).json({
+      error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
+    });
+  }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  const parsedRequestedStartDateTime = parseDateTimeInput(requestedStartInput);
+  if (parsedRequestedStartDateTime && parsedRequestedStartDateTime.getTime() < Date.now()) {
+    return res.status(400).json({ error: 'No se puede reservar en el pasado.' });
+  }
+
+  const description = typeof req.body.description === 'string' && req.body.description.trim()
+    ? req.body.description.trim()
+    : null;
+
+  let addressId = normalizeNullableInteger(req.body.address_id);
+  const streetNumberValue = req.body.street_number || null;
+  const address2Value = req.body.address_2 || null;
+  const connection = await promisePool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    if (addressId !== null) {
+      const [[existingAddress]] = await connection.query(
+        'SELECT id FROM address WHERE id = ? LIMIT 1 FOR UPDATE',
+        [addressId]
+      );
+      if (!existingAddress) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'address_id no existe.' });
+      }
+    } else if (
+      req.body.address_type &&
+      req.body.address_1 &&
+      req.body.postal_code &&
+      req.body.city &&
+      req.body.state &&
+      req.body.country
+    ) {
+      const [addressInsertResult] = await connection.query(
+        `INSERT INTO address
+          (address_type, street_number, address_1, address_2, postal_code, city, state, country)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          req.body.address_type,
+          streetNumberValue,
+          req.body.address_1,
+          address2Value,
+          req.body.postal_code,
+          req.body.city,
+          req.body.state,
+          req.body.country,
+        ]
+      );
+      addressId = addressInsertResult.insertId;
     }
 
-    const continueWithBookingAddress = (nextAddressId) => {
-      createBooking(connection, user_id, service_id, nextAddressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res);
-    };
+    const [[serviceSnapshot]] = await connection.query(
+      `
+      SELECT
+        s.id,
+        s.user_id AS provider_user_id_snapshot,
+        s.service_title,
+        p.price,
+        p.currency AS currency,
+        p.price_type
+      FROM service s
+      LEFT JOIN price p ON s.price_id = p.id
+      WHERE s.id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [serviceId]
+    );
 
-    if (normalizedAddressId !== null && typeof normalizedAddressId !== 'undefined') {
-      connection.query('SELECT id FROM address WHERE id = ?', [normalizedAddressId], (validateError, rows) => {
-        if (validateError) {
-          connection.release();
-          console.error('Error al validar address_id:', validateError);
-          return res.status(500).json({ error: 'Error al validar address_id.' });
-        }
-
-        if (!rows || rows.length === 0) {
-          connection.release();
-          return res.status(400).json({ error: 'address_id no existe.' });
-        }
-
-        continueWithBookingAddress(Number(normalizedAddressId));
-      });
-      return;
+    if (!serviceSnapshot) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Servicio no encontrado.' });
     }
 
-    // Paso 1: Verificar si se necesita insertar la dirección
-    if (address_type && address_1 && postal_code && city && state && country) {
-      // Insertar la dirección en `address`
-      const addressQuery = 'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-      const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country];
+    const now = new Date();
+    const schedule = buildBookingSchedule({
+      createdAt: now,
+      requestedStartDateTime: parsedRequestedStartDateTime,
+      requestedDurationMinutes,
+    });
+    const serviceCurrency = normalizeCurrencyCode(serviceSnapshot.currency, 'EUR');
+    const unitPriceAmount = Number.parseFloat(serviceSnapshot.price) || 0;
+    const unitPriceAmountCentsSnapshot = serviceSnapshot.price === null || serviceSnapshot.price === undefined
+      ? null
+      : toMinorUnits(unitPriceAmount, serviceCurrency);
+    const pricingSnapshot = computeBookingPricingSnapshot({
+      priceType: serviceSnapshot.price_type,
+      unitPrice: unitPriceAmount,
+      durationMinutes: requestedDurationMinutes,
+      currency: serviceCurrency,
+    });
+    const estimatedBaseAmountCents = pricingSnapshot.final === null && pricingSnapshot.type !== 'fix'
+      ? null
+      : toMinorUnits(pricingSnapshot.base, serviceCurrency);
+    const estimatedCommissionAmountCents = toMinorUnits(pricingSnapshot.commission || 0, serviceCurrency);
+    const estimatedTotalAmountCents = pricingSnapshot.final === null
+      ? null
+      : toMinorUnits(pricingSnapshot.final, serviceCurrency);
 
-      connection.query(addressQuery, addressValues, (err, result) => {
-        if (err) {
-          connection.release();
-          console.error('Error al insertar la dirección:', err);
-          return res.status(500).json({ error: 'Error al insertar la dirección.' });
-        }
+    const [bookingInsertResult] = await connection.query(
+      `
+      INSERT INTO booking
+        (
+          client_user_id,
+          service_id,
+          provider_user_id_snapshot,
+          address_id,
+          description,
+          service_status,
+          settlement_status,
+          requested_start_datetime,
+          requested_duration_minutes,
+          requested_end_datetime,
+          accept_deadline_at,
+          expires_at,
+          last_minute_window_starts_at,
+          service_title_snapshot,
+          price_type_snapshot,
+          service_currency_snapshot,
+          unit_price_amount_cents_snapshot,
+          estimated_base_amount_cents,
+          estimated_commission_amount_cents,
+          estimated_total_amount_cents,
+          deposit_amount_cents_snapshot,
+          deposit_currency_snapshot
+        )
+      VALUES (?, ?, ?, ?, ?, 'pending_deposit', 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        requestedUserId,
+        serviceId,
+        serviceSnapshot.provider_user_id_snapshot,
+        addressId,
+        description,
+        toDbDateTime(schedule.requestedStartDateTime),
+        schedule.requestedDurationMinutes,
+        toDbDateTime(schedule.requestedEndDateTime),
+        toDbDateTime(schedule.acceptDeadlineAt),
+        toDbDateTime(schedule.expiresAt),
+        toDbDateTime(schedule.lastMinuteWindowStartsAt),
+        serviceSnapshot.service_title,
+        String(serviceSnapshot.price_type || '').trim().toLowerCase() || null,
+        serviceCurrency,
+        unitPriceAmountCentsSnapshot,
+        estimatedBaseAmountCents,
+        estimatedCommissionAmountCents,
+        estimatedTotalAmountCents,
+        estimatedCommissionAmountCents,
+        serviceCurrency,
+      ]
+    );
 
-        addressId = result.insertId; // ID de la dirección recién insertada
+    await insertBookingStatusHistory(connection, {
+      bookingId: bookingInsertResult.insertId,
+      fromServiceStatus: null,
+      toServiceStatus: 'pending_deposit',
+      fromSettlementStatus: null,
+      toSettlementStatus: 'none',
+      changedByUserId: authenticatedUserId,
+      reasonCode: 'created',
+    });
 
-        // Paso 2: Insertar en la tabla `booking`
-        continueWithBookingAddress(addressId);
-      });
-    } else {
-      // Si no se necesita una dirección, se usa NULL para address_id
-      continueWithBookingAddress(addressId);
-    }
-  });
+    const [[createdBookingRow]] = await connection.query(
+      `
+      SELECT
+        b.id AS booking_id,
+        b.*,
+        p.price,
+        COALESCE(p.currency, b.service_currency_snapshot) AS currency,
+        COALESCE(p.price_type, b.price_type_snapshot) AS price_type
+      FROM booking b
+      LEFT JOIN service s ON b.service_id = s.id
+      LEFT JOIN price p ON s.price_id = p.id
+      WHERE b.id = ?
+      LIMIT 1
+      `,
+      [bookingInsertResult.insertId]
+    );
+
+    await connection.commit();
+    return res.status(201).json({
+      message: 'Reserva creada con éxito',
+      booking: mapBookingRecordForApi(createdBookingRow),
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al insertar la reserva:', error);
+    return res.status(500).json({ error: 'Error al insertar la reserva.' });
+  } finally {
+    connection.release();
+  }
 });
 
-// Función para crear la reserva 
-function createBooking(connection, user_id, service_id, addressId, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, description, res) {
-  const normalizedBookingStartDateTime = toUtcSqlDateTime(booking_start_datetime);
-  const normalizedBookingEndDateTime = toUtcSqlDateTime(booking_end_datetime);
-  const bookingQuery = `
-    INSERT INTO booking (user_id, service_id, address_id, payment_method_id, booking_start_datetime, booking_end_datetime, recurrent_pattern_id, promotion_id, service_duration, final_price, commission, is_paid, booking_status, description, order_datetime)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_deposit', ?, UTC_TIMESTAMP())
-  `;
-  const bookingValues = [
-    user_id,
-    service_id,
-    addressId, // Esto puede ser null
-    null, // payment_method_id se establece en NULL
-    normalizedBookingStartDateTime,
-    normalizedBookingEndDateTime,
-    recurrent_pattern_id || null,
-    promotion_id || null,
-    service_duration || null,
-    final_price || null,
-    commission || null,
-    false, // is_paid
-    description || null // Se establece la descripción, puede ser null
-  ];
-
-  connection.query(bookingQuery, bookingValues, (err, result) => {
-    if (err) {
-      connection.release();
-      console.error('Error al insertar la reserva:', err);
-      return res.status(500).json({ error: 'Error al insertar la reserva.' });
-    }
-
-    const newBookingId = result.insertId;
-    const selectQuery = 'SELECT * FROM booking WHERE id = ?';
-    connection.query(selectQuery, [newBookingId], (selectErr, bookingData) => {
-      connection.release();
-      if (selectErr) {
-        console.error('Error al obtener la reserva creada:', selectErr);
-        return res.status(500).json({ error: 'Error al obtener la reserva creada.' });
-      }
-      if (bookingData.length === 0) {
-        return res.status(500).json({ error: 'No se encontró la reserva creada.' });
-      }
-
-      res.status(201).json({ message: 'Reserva creada con éxito', booking: bookingData[0] });
-    });
-  });
-}
-
 // Obtener detalles de una reserva
-app.get('/api/bookings/:id', (req, res) => {
-  const { id } = req.params;
+app.get('/api/bookings/:id', async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    const query = `
+  try {
+    const [bookingRows] = await promisePool.query(
+      `
       SELECT
+        b.id AS booking_id,
         b.id,
-        b.user_id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
         b.service_id,
         b.address_id,
-        b.payment_method_id,
-        b.booking_start_datetime,
-        b.booking_end_datetime,
-        b.recurrent_pattern_id,
-        b.promotion_id,
-        b.service_duration,
-        b.final_price,
-        b.commission,
-        b.is_paid,
-        b.booking_status,
-        b.order_datetime,
         b.description,
-        pr.price,
-        pr.currency AS currency,
-        pr.price_type,
+        b.service_status,
+        b.settlement_status,
+        b.created_at,
+        b.updated_at,
+        b.requested_start_datetime,
+        b.requested_duration_minutes,
+        b.requested_end_datetime,
+        b.deposit_confirmed_at,
+        b.accepted_at,
+        b.started_at,
+        b.finished_at,
+        b.canceled_at,
+        b.expired_at,
+        b.accept_deadline_at,
+        b.expires_at,
+        b.client_approval_deadline_at,
+        b.last_minute_window_starts_at,
+        b.canceled_by_user_id,
+        b.cancellation_reason_code,
+        b.cancellation_note,
+        b.service_title_snapshot,
+        b.price_type_snapshot,
+        b.service_currency_snapshot,
+        b.unit_price_amount_cents_snapshot,
+        b.minimum_notice_policy_snapshot,
+        b.estimated_base_amount_cents,
+        b.estimated_commission_amount_cents,
+        b.estimated_total_amount_cents,
+        b.deposit_amount_cents_snapshot,
+        b.deposit_currency_snapshot,
+        b.selected_customer_payment_method_id,
+        cp.id AS closure_proposal_id,
+        cp.status AS closure_status,
+        cp.proposed_base_amount_cents,
+        cp.proposed_commission_amount_cents,
+        cp.proposed_total_amount_cents,
+        cp.proposed_final_duration_minutes,
+        p.price,
+        COALESCE(p.currency, b.service_currency_snapshot) AS currency,
+        COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
         pm.provider,
         pm.card_number,
         pm.expiry_date,
@@ -6919,235 +7448,435 @@ app.get('/api/bookings/:id', (req, res) => {
         a.country
       FROM booking b
       LEFT JOIN service s ON b.service_id = s.id
-      LEFT JOIN price pr ON s.price_id = pr.id
-      LEFT JOIN payment_method pm ON b.payment_method_id = pm.id
+      LEFT JOIN price p ON s.price_id = p.id
+      LEFT JOIN payment_method pm ON b.selected_customer_payment_method_id = pm.id
       LEFT JOIN address a ON b.address_id = a.id
+      LEFT JOIN booking_closure_proposal cp ON cp.id = (
+        SELECT cp2.id
+        FROM booking_closure_proposal cp2
+        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        ORDER BY cp2.id DESC
+        LIMIT 1
+      )
       WHERE b.id = ?
-    `;
+      LIMIT 1
+      `,
+      [bookingId]
+    );
 
-    connection.query(query, [id], (err, result) => {
-      connection.release();
-      if (err) {
-        console.error('Error al obtener la reserva:', err);
-        return res.status(500).json({ error: 'Error al obtener la reserva.' });
-      }
+    if (bookingRows.length === 0) {
+      return res.status(404).json({ message: 'Reserva no encontrada.' });
+    }
 
-      if (result.length === 0) {
-        return res.status(404).json({ message: 'Reserva no encontrada.' });
-      }
-
-      res.status(200).json(result[0]);
-    });
-  });
+    return res.status(200).json(mapBookingRecordForApi(bookingRows[0]));
+  } catch (error) {
+    console.error('Error al obtener la reserva:', error);
+    return res.status(500).json({ error: 'Error al obtener la reserva.' });
+  }
 });
 
 // Actualizar una reserva
-app.put('/api/bookings/:id', (req, res) => {
-  const { id } = req.params;
-  let {
-    booking_start_datetime,
-    booking_end_datetime,
-    service_duration,
-    final_price,
-    commission,
-    description,
-    address_id
-  } = req.body;
-
-  // Normaliza posibles valores del front
-  if (Object.prototype.hasOwnProperty.call(req.body, 'address_id')) {
-    if (address_id === 'null' || address_id === '') address_id = null;
+app.put('/api/bookings/:id', async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
   }
 
-  const normalizedBookingStartDateTime = toUtcSqlDateTime(booking_start_datetime);
-  const normalizedBookingEndDateTime = toUtcSqlDateTime(booking_end_datetime);
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+    const [[currentBooking]] = await connection.query(
+      `
+      SELECT
+        b.id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
+        b.service_status,
+        b.settlement_status,
+        b.created_at,
+        b.requested_start_datetime,
+        b.requested_duration_minutes,
+        b.requested_end_datetime,
+        b.description,
+        b.address_id,
+        b.price_type_snapshot,
+        b.service_currency_snapshot,
+        b.unit_price_amount_cents_snapshot,
+        b.minimum_notice_policy_snapshot,
+        b.estimated_base_amount_cents,
+        b.estimated_commission_amount_cents,
+        b.estimated_total_amount_cents
+      FROM booking b
+      WHERE b.id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!currentBooking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
     }
 
-    const setParts = [
-      'booking_start_datetime = ?',
-      'booking_end_datetime = ?',
-      'service_duration = ?',
-      'final_price = ?',
-      'description = ?'
-    ];
-    const values = [
-      normalizedBookingStartDateTime,
-      normalizedBookingEndDateTime,
-      service_duration,
-      final_price,
-      description
-    ];
-
-    if (Object.prototype.hasOwnProperty.call(req.body, 'commission')) {
-      setParts.push('commission = ?');
-      values.push(commission);
+    const isClientOwner = req.user && Number(req.user.id) === Number(currentBooking.client_user_id);
+    const isProviderOwner = req.user && Number(req.user.id) === Number(currentBooking.provider_user_id_snapshot);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isClientOwner && !isProviderOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'No autorizado.' });
     }
 
-    // Si viene address_id en el body, lo actualizamos (puede ser null)
-    if (Object.prototype.hasOwnProperty.call(req.body, 'address_id')) {
-      setParts.push('address_id = ?');
-      values.push(address_id); // <-- puede ser null y MySQL lo guardará como NULL
+    if (!canEditBooking(currentBooking)) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'La reserva ya no se puede editar en este estado.' });
     }
 
-    const runUpdate = () => {
-      const sql = `UPDATE booking SET ${setParts.join(', ')} WHERE id = ?`;
-      connection.query(sql, [...values, id], (err2) => {
-        connection.release();
-        if (err2) {
-          console.error('Error al actualizar la reserva:', err2);
-          return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-        }
-        res.status(200).json({ message: 'Reserva actualizada con éxito' });
-      });
-    };
+    const hasStartField = Object.prototype.hasOwnProperty.call(req.body, 'requested_start_datetime')
+      || Object.prototype.hasOwnProperty.call(req.body, 'booking_start_datetime');
+    const hasDurationField = Object.prototype.hasOwnProperty.call(req.body, 'requested_duration_minutes')
+      || Object.prototype.hasOwnProperty.call(req.body, 'service_duration');
+    const hasDescriptionField = Object.prototype.hasOwnProperty.call(req.body, 'description');
+    const hasAddressField = Object.prototype.hasOwnProperty.call(req.body, 'address_id');
 
-    // Solo validamos contra address si address_id NO es null
-    if (Object.prototype.hasOwnProperty.call(req.body, 'address_id') && address_id !== null) {
-      connection.query('SELECT id FROM address WHERE id = ?', [address_id], (err3, rows) => {
-        if (err3) {
-          connection.release();
-          console.error('Error al validar address_id:', err3);
-          return res.status(500).json({ error: 'Error al validar address_id.' });
-        }
-        if (!rows || rows.length === 0) {
-          connection.release();
+    let nextAddressId = currentBooking.address_id;
+    if (hasAddressField) {
+      nextAddressId = normalizeNullableInteger(req.body.address_id);
+      if (nextAddressId !== null) {
+        const [[existingAddress]] = await connection.query(
+          'SELECT id FROM address WHERE id = ? LIMIT 1 FOR UPDATE',
+          [nextAddressId]
+        );
+        if (!existingAddress) {
+          await connection.rollback();
           return res.status(400).json({ error: 'address_id no existe.' });
         }
-        runUpdate();
-      });
-    } else {
-      // address_id no viene o es null => no validar, solo actualizar (quedará a NULL si lo pasaste)
-      runUpdate();
+      }
     }
-  });
+
+    const requestedStartInput = hasStartField
+      ? (req.body.requested_start_datetime ?? req.body.booking_start_datetime ?? null)
+      : currentBooking.requested_start_datetime;
+    const requestedStartDateTime = parseDateTimeInput(requestedStartInput);
+    const requestedDurationMinutes = hasDurationField
+      ? normalizeDurationMinutes(req.body.requested_duration_minutes ?? req.body.service_duration ?? null)
+      : normalizeDurationMinutes(currentBooking.requested_duration_minutes);
+
+    if (!isDurationMinutesInRange(requestedDurationMinutes)) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
+      });
+    }
+
+    if (requestedStartDateTime && requestedStartDateTime.getTime() < Date.now()) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'No se puede reprogramar la reserva en el pasado.' });
+    }
+
+    const schedule = buildBookingSchedule({
+      createdAt: currentBooking.created_at,
+      requestedStartDateTime,
+      requestedDurationMinutes,
+    });
+    const bookingCurrency = normalizeCurrencyCode(currentBooking.service_currency_snapshot, 'EUR');
+    const unitPriceAmount = currentBooking.unit_price_amount_cents_snapshot === null || currentBooking.unit_price_amount_cents_snapshot === undefined
+      ? 0
+      : fromMinorUnits(currentBooking.unit_price_amount_cents_snapshot, bookingCurrency);
+    const pricingSnapshot = computeBookingPricingSnapshot({
+      priceType: currentBooking.price_type_snapshot,
+      unitPrice: unitPriceAmount,
+      durationMinutes: requestedDurationMinutes,
+      currency: bookingCurrency,
+    });
+    const nextDescription = hasDescriptionField
+      ? (typeof req.body.description === 'string' && req.body.description.trim() ? req.body.description.trim() : null)
+      : currentBooking.description;
+    const estimatedBaseAmountCents = pricingSnapshot.final === null && pricingSnapshot.type !== 'fix'
+      ? null
+      : toMinorUnits(pricingSnapshot.base, bookingCurrency);
+    const estimatedCommissionAmountCents = toMinorUnits(pricingSnapshot.commission || 0, bookingCurrency);
+    const estimatedTotalAmountCents = pricingSnapshot.final === null
+      ? null
+      : toMinorUnits(pricingSnapshot.final, bookingCurrency);
+
+    await connection.query(
+      `
+      UPDATE booking
+      SET requested_start_datetime = ?,
+          requested_duration_minutes = ?,
+          requested_end_datetime = ?,
+          accept_deadline_at = ?,
+          expires_at = ?,
+          last_minute_window_starts_at = ?,
+          address_id = ?,
+          description = ?,
+          estimated_base_amount_cents = ?,
+          estimated_commission_amount_cents = ?,
+          estimated_total_amount_cents = ?,
+          deposit_amount_cents_snapshot = ?
+      WHERE id = ?
+      `,
+      [
+        toDbDateTime(schedule.requestedStartDateTime),
+        schedule.requestedDurationMinutes,
+        toDbDateTime(schedule.requestedEndDateTime),
+        toDbDateTime(schedule.acceptDeadlineAt),
+        toDbDateTime(schedule.expiresAt),
+        toDbDateTime(schedule.lastMinuteWindowStartsAt),
+        nextAddressId,
+        nextDescription,
+        estimatedBaseAmountCents,
+        estimatedCommissionAmountCents,
+        estimatedTotalAmountCents,
+        estimatedCommissionAmountCents,
+        bookingId,
+      ]
+    );
+
+    await connection.commit();
+    return res.status(200).json({ message: 'Reserva actualizada con éxito' });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al actualizar la reserva:', error);
+    return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+  } finally {
+    connection.release();
+  }
 });
 
 // Actualizar datos de una reserva
-app.patch('/api/bookings/:id/update-data', (req, res) => {
-  const { id } = req.params;
-  const { status, is_paid, booking_end_datetime, service_duration, final_price, commission, address_id } = req.body;
-  const normalizedBookingEndDateTime = typeof booking_end_datetime !== 'undefined'
-    ? toUtcSqlDateTime(booking_end_datetime)
-    : undefined;
+app.patch('/api/bookings/:id/update-data', async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        b.id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
+        b.service_status,
+        b.settlement_status,
+        b.requested_duration_minutes,
+        b.price_type_snapshot,
+        b.service_currency_snapshot,
+        b.unit_price_amount_cents_snapshot,
+        b.estimated_total_amount_cents,
+        b.deposit_amount_cents_snapshot,
+        b.cancellation_reason_code
+      FROM booking b
+      WHERE b.id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
     }
 
-    const fields = [];
-    const values = [];
+    const isClientOwner = req.user && Number(req.user.id) === Number(booking.client_user_id);
+    const isProviderOwner = req.user && Number(req.user.id) === Number(booking.provider_user_id_snapshot);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isClientOwner && !isProviderOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
 
-    if (typeof status !== 'undefined') {
-      fields.push('booking_status = ?');
-      values.push(status);
-      if (String(status).toLowerCase() === 'accepted') {
-        fields.push('booking_start_datetime = IF(booking_start_datetime IS NULL, UTC_TIMESTAMP(), booking_start_datetime)');
+    const mappedLegacyStatus = typeof req.body.status !== 'undefined'
+      ? normalizeLegacyStatusUpdate(req.body.status, booking)
+      : {};
+
+    let nextServiceStatus = typeof req.body.service_status !== 'undefined'
+      ? normalizeServiceStatus(req.body.service_status, booking.service_status)
+      : (mappedLegacyStatus.serviceStatus || booking.service_status);
+    let nextSettlementStatus = typeof req.body.settlement_status !== 'undefined'
+      ? normalizeSettlementStatus(req.body.settlement_status, booking.settlement_status)
+      : (mappedLegacyStatus.settlementStatus || booking.settlement_status);
+
+    if (typeof req.body.is_paid !== 'undefined') {
+      nextSettlementStatus = req.body.is_paid ? 'paid' : (
+        normalizeServiceStatus(nextServiceStatus, booking.service_status) === 'finished'
+          ? 'awaiting_payment'
+          : 'none'
+      );
+    }
+
+    const extraPatch = {};
+    if (typeof req.body.address_id !== 'undefined') {
+      const nextAddressId = normalizeNullableInteger(req.body.address_id);
+      if (nextAddressId !== null) {
+        const [[existingAddress]] = await connection.query(
+          'SELECT id FROM address WHERE id = ? LIMIT 1 FOR UPDATE',
+          [nextAddressId]
+        );
+        if (!existingAddress) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'address_id no existe.' });
+        }
+      }
+      extraPatch.address_id = nextAddressId;
+    }
+
+    const explicitCancellationReason = typeof req.body.cancellation_reason_code === 'string'
+      ? req.body.cancellation_reason_code.trim()
+      : null;
+    const explicitCancellationNote = typeof req.body.cancellation_note === 'string'
+      ? req.body.cancellation_note.trim()
+      : null;
+    const mappedCancellationReason = mappedLegacyStatus.cancellationReasonCode || null;
+    if (explicitCancellationReason || mappedCancellationReason) {
+      extraPatch.cancellation_reason_code = explicitCancellationReason || mappedCancellationReason;
+    }
+    if (explicitCancellationNote !== null) {
+      extraPatch.cancellation_note = explicitCancellationNote || null;
+    }
+    if (
+      normalizeServiceStatus(nextServiceStatus, booking.service_status) !== 'canceled'
+      && normalizeServiceStatus(nextServiceStatus, booking.service_status) !== 'expired'
+      && Object.prototype.hasOwnProperty.call(extraPatch, 'cancellation_reason_code')
+    ) {
+      extraPatch.cancellation_reason_code = null;
+    }
+
+    const bookingCurrency = normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR');
+    const unitPriceAmount = booking.unit_price_amount_cents_snapshot === null || booking.unit_price_amount_cents_snapshot === undefined
+      ? 0
+      : fromMinorUnits(booking.unit_price_amount_cents_snapshot, bookingCurrency);
+
+    if (
+      Object.prototype.hasOwnProperty.call(req.body, 'service_duration')
+      || Object.prototype.hasOwnProperty.call(req.body, 'requested_duration_minutes')
+      || Object.prototype.hasOwnProperty.call(req.body, 'final_price')
+    ) {
+      const priceTypeSnapshot = String(booking.price_type_snapshot || '').trim().toLowerCase();
+      if (priceTypeSnapshot === 'hour' || priceTypeSnapshot === 'budget') {
+        const proposedDurationMinutes = normalizeDurationMinutes(
+          req.body.service_duration ?? req.body.requested_duration_minutes ?? booking.requested_duration_minutes
+        );
+        if (priceTypeSnapshot === 'hour' && !isDurationMinutesInRange(proposedDurationMinutes)) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
+          });
+        }
+
+        let proposedBaseAmountCents = 0;
+        if (priceTypeSnapshot === 'hour') {
+          const hourlyPricing = computeBookingPricingSnapshot({
+            priceType: 'hour',
+            unitPrice: unitPriceAmount,
+            durationMinutes: proposedDurationMinutes,
+            currency: bookingCurrency,
+          });
+          proposedBaseAmountCents = toMinorUnits(hourlyPricing.base, bookingCurrency);
+        } else {
+          const proposedBudgetBase = Number(req.body.final_price ?? 0);
+          if (!Number.isFinite(proposedBudgetBase) || proposedBudgetBase < 0) {
+            await connection.rollback();
+            return res.status(400).json({ error: 'final_price inválido.' });
+          }
+          proposedBaseAmountCents = toMinorUnits(proposedBudgetBase, bookingCurrency);
+        }
+
+        await upsertActiveClosureProposal(connection, {
+          booking: {
+            ...booking,
+            id: bookingId,
+          },
+          createdByUserId: req.user?.id || null,
+          proposedBaseAmountCents,
+          proposedFinalDurationMinutes: priceTypeSnapshot === 'hour' ? proposedDurationMinutes : null,
+        });
+
+        if (
+          normalizeServiceStatus(nextServiceStatus, booking.service_status) === 'finished'
+          && normalizeSettlementStatus(nextSettlementStatus, booking.settlement_status) === 'none'
+        ) {
+          nextSettlementStatus = 'awaiting_payment';
+        }
       }
     }
-    if (typeof is_paid !== 'undefined') {
-      fields.push('is_paid = ?');
-      values.push(is_paid);
-    }
 
-    // Campos extra de la reserva (fin, duración, precio final, comisión)
-    if (typeof booking_end_datetime !== 'undefined') {
-      fields.push('booking_end_datetime = ?');
-      values.push(normalizedBookingEndDateTime);
-    }
-    if (typeof service_duration !== 'undefined') {
-      fields.push('service_duration = ?');
-      values.push(service_duration);
-    }
-    if (typeof final_price !== 'undefined') {
-      fields.push('final_price = ?');
-      values.push(final_price);
-    }
-    if (typeof commission !== 'undefined') {
-      fields.push('commission = ?');
-      values.push(commission);
-    }
-    if (typeof address_id !== 'undefined') {
-      fields.push('address_id = ?');
-      values.push(address_id);
-    }
+    const transitionResult = await transitionBookingStateRecord(connection, booking, {
+      nextServiceStatus,
+      nextSettlementStatus,
+      changedByUserId: req.user?.id || null,
+      reasonCode: typeof req.body.status === 'string' ? String(req.body.status).trim().toLowerCase() : null,
+      extraPatch,
+    });
 
-    // Autocompletar fin  cuando se marque como completada
-    if (typeof status !== 'undefined' && String(status).toLowerCase() === 'completed') {
-      if (typeof booking_end_datetime === 'undefined') {
-        fields.push('booking_end_datetime = IFNULL(booking_end_datetime, UTC_TIMESTAMP())');
-      }
-    }
-
-    if (fields.length === 0) {
-      connection.release();
+    if (!transitionResult.changed && Object.keys(transitionResult.appliedPatch || {}).length === 0) {
+      await connection.rollback();
       return res.status(400).json({ error: 'No fields to update.' });
     }
 
-    const proceedUpdate = () => {
-      const query = `UPDATE booking SET ${fields.join(', ')} WHERE id = ?`;
-      values.push(id);
-      connection.query(query, values, (err, result) => {
-        connection.release();
-        if (err) {
-          console.error('Error al actualizar el estado de la reserva:', err);
-          return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-        }
-        res.status(200).json({ message: 'Estado actualizado' });
-      });
-    };
-
-    if (typeof address_id !== 'undefined') {
-      connection.query('SELECT id FROM address WHERE id = ?', [address_id], (err, rows) => {
-        if (err) {
-          connection.release();
-          console.error('Error al validar address_id:', err);
-          return res.status(500).json({ error: 'Error al validar address_id.' });
-        }
-        if (!rows || rows.length === 0) {
-          connection.release();
-          return res.status(400).json({ error: 'address_id no existe.' });
-        }
-        proceedUpdate();
-      });
-    } else {
-      proceedUpdate();
-    }
-  });
+    await connection.commit();
+    return res.status(200).json({ message: 'Estado actualizado' });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al actualizar el estado de la reserva:', error);
+    return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+  } finally {
+    connection.release();
+  }
 });
 
 // Actualizar el pago de una reserva
-app.patch('/api/bookings/:id/is_paid', (req, res) => {
-  const { id } = req.params;
-  const { is_paid } = req.body;
-
-  if (typeof is_paid === 'undefined') {
+app.patch('/api/bookings/:id/is_paid', async (req, res) => {
+  if (typeof req.body.is_paid === 'undefined') {
     return res.status(400).json({ error: 'is_paid es requerido.' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [[booking]] = await connection.query(
+      'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
     }
 
-    const query = 'UPDATE booking SET is_paid = ? WHERE id = ?';
+    const nextSettlementStatus = req.body.is_paid ? 'paid' : (
+      normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'finished'
+        ? 'awaiting_payment'
+        : 'none'
+    );
 
-    connection.query(query, [is_paid, id], (err, result) => {
-      connection.release();
-      if (err) {
-        console.error('Error al actualizar el pago de la reserva:', err);
-        return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-      }
-      res.status(200).json({ message: 'Pago actualizado' });
+    await transitionBookingStateRecord(connection, booking, {
+      nextSettlementStatus,
+      changedByUserId: req.user?.id || null,
+      reasonCode: 'manual_payment_update',
     });
-  });
+
+    await connection.commit();
+    return res.status(200).json({ message: 'Pago actualizado' });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al actualizar el pago de la reserva:', error);
+    return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+  } finally {
+    connection.release();
+  }
 });
 
 const COLLECTION_METHOD_BANK_COUNTRY_TO_CURRENCY = Object.freeze({
@@ -7815,18 +8544,23 @@ app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, re
   try {
     await conn.beginTransaction();
     const [[b]] = await conn.query(
-      'SELECT user_id, booking_status FROM booking WHERE id = ? FOR UPDATE', [id]
+      'SELECT id, client_user_id, service_status, settlement_status FROM booking WHERE id = ? FOR UPDATE',
+      [id]
     );
     if (!b) { await conn.rollback(); return res.status(404).json({ error: 'Reserva no encontrada' }); }
-    const isOwner = req.user && Number(req.user.id) === Number(b.user_id);
+    const isOwner = req.user && Number(req.user.id) === Number(b.client_user_id);
     const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
     if (!isOwner && !isStaff) { await conn.rollback(); return res.status(403).json({ error: 'No autorizado' }); }
     const [[pdep]] = await conn.query(
       "SELECT status FROM payments WHERE booking_id = ? AND type='deposit' LIMIT 1", [id]
     );
     const succeeded = pdep && pdep.status === 'succeeded';
-    if (!succeeded && b.booking_status === 'pending_deposit') {
-      await conn.query("UPDATE booking SET booking_status='payment_failed' WHERE id=?", [id]);
+    if (!succeeded && normalizeServiceStatus(b.service_status, 'pending_deposit') === 'pending_deposit') {
+      await transitionBookingStateRecord(conn, b, {
+        nextSettlementStatus: 'payment_failed',
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'deposit_payment_failed',
+      });
     }
     await conn.commit();
     res.json({ ok: true });
@@ -7862,22 +8596,71 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
 
     const [rows] = await connection.query(
       `
-      SELECT b.id, b.user_id, b.final_price, b.commission, b.booking_status,
-             b.service_duration, b.booking_start_datetime, b.booking_end_datetime,
+      SELECT
+             b.id,
+             b.client_user_id AS user_id,
+             b.service_status,
+             b.settlement_status,
+             b.requested_duration_minutes AS service_duration,
+             b.requested_start_datetime AS booking_start_datetime,
+             b.requested_end_datetime AS booking_end_datetime,
+             b.deposit_amount_cents_snapshot,
+             b.deposit_currency_snapshot,
+             b.price_type_snapshot,
+             b.service_currency_snapshot,
+             b.unit_price_amount_cents_snapshot,
+             b.estimated_commission_amount_cents,
+             b.estimated_total_amount_cents,
+             cp.proposed_commission_amount_cents,
+             cp.proposed_total_amount_cents,
              s.id AS service_id,
-             p.price AS unit_price, p.price_type, p.currency AS service_currency,
+             p.price AS unit_price,
+             COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
+             COALESCE(p.currency, b.service_currency_snapshot) AS service_currency,
              u.email AS customer_email, u.stripe_customer_id, u.currency AS customer_currency
       FROM booking b
       JOIN service s ON b.service_id = s.id
       JOIN price   p ON s.price_id = p.id
-      JOIN user_account u ON b.user_id = u.id
+      JOIN user_account u ON b.client_user_id = u.id
+      LEFT JOIN booking_closure_proposal cp ON cp.id = (
+        SELECT cp2.id
+        FROM booking_closure_proposal cp2
+        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        ORDER BY cp2.id DESC
+        LIMIT 1
+      )
       WHERE b.id = ? FOR UPDATE
       `,
       [id]
     );
     booking = rows[0];
     if (!booking) throw new Error('Reserva no encontrada');
-    if (booking.booking_status === 'cancelled') throw new Error('Reserva cancelada');
+    if (normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'canceled') {
+      throw new Error('Reserva cancelada');
+    }
+
+    const bookingCurrency = normalizeCurrencyCode(
+      booking.service_currency_snapshot,
+      normalizeCurrencyCode(booking.service_currency, 'EUR')
+    );
+    booking.final_price = booking.proposed_total_amount_cents != null
+      ? fromMinorUnits(booking.proposed_total_amount_cents, bookingCurrency)
+      : (
+        booking.estimated_total_amount_cents != null
+          ? fromMinorUnits(booking.estimated_total_amount_cents, bookingCurrency)
+          : null
+      );
+    booking.commission = booking.proposed_commission_amount_cents != null
+      ? fromMinorUnits(booking.proposed_commission_amount_cents, bookingCurrency)
+      : (
+        booking.estimated_commission_amount_cents != null
+          ? fromMinorUnits(booking.estimated_commission_amount_cents, bookingCurrency)
+          : null
+      );
+    booking.booking_status = deriveLegacyBookingStatus({
+      serviceStatus: booking.service_status,
+      settlementStatus: booking.settlement_status,
+    });
 
     console.log('Información de reserva obtenida:', {
       bookingId: id,
@@ -7927,19 +8710,36 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
     const existingDepositPayment = await getPaymentRow(connection, id, 'deposit');
     chargeCurrency = normalizeCurrencyCode(
       existingDepositPayment?.currency,
-      normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
+      normalizeCurrencyCode(
+        booking.deposit_currency_snapshot,
+        normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
+      )
     );
-
-    const convertedUnitPrice = convertAmount(booking.unit_price || 0, booking.service_currency, chargeCurrency);
-    const pricing = computePricing({
+    const fallbackConvertedUnitPrice = booking.unit_price_amount_cents_snapshot == null
+      ? convertAmount(booking.unit_price || 0, booking.service_currency, chargeCurrency)
+      : convertAmount(
+        fromMinorUnits(booking.unit_price_amount_cents_snapshot, bookingCurrency),
+        bookingCurrency,
+        chargeCurrency
+      );
+    const fallbackPricing = computeBookingPricingSnapshot({
       priceType: booking.price_type,
-      unitPrice: convertedUnitPrice,
+      unitPrice: fallbackConvertedUnitPrice,
       durationMinutes: effectiveMinutes,
       currency: chargeCurrency,
     });
 
-    commissionCents = toMinorUnits(pricing.commission || 0, chargeCurrency);
-    const finalCentsSnapshot = pricing.final == null ? 0 : toMinorUnits(pricing.final, chargeCurrency);
+    commissionCents = Number(
+      existingDepositPayment?.amount_cents
+      ?? booking.deposit_amount_cents_snapshot
+      ?? booking.estimated_commission_amount_cents
+      ?? toMinorUnits(fallbackPricing.commission || 0, chargeCurrency)
+    );
+    const finalCentsSnapshot = Number(
+      booking.proposed_total_amount_cents
+      ?? booking.estimated_total_amount_cents
+      ?? (fallbackPricing.final == null ? 0 : toMinorUnits(fallbackPricing.final, chargeCurrency))
+    );
 
     // Congelar importes creando fila de pago (para poder atar idempotencia a payment.id)
     await upsertPaymentRow(connection, {
@@ -8126,15 +8926,23 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
         lastErrorMessage: paymentPersistence.lastErrorMessage,
       });
       if (intent.status === 'succeeded') {
-        await conn2.query(
-          'UPDATE booking SET booking_status = "requested" WHERE id = ?',
-          [id]
-        );
+        await transitionBookingStateRecord(conn2, booking, {
+          nextServiceStatus: 'requested',
+          nextSettlementStatus: booking.settlement_status === 'payment_failed' ? 'none' : booking.settlement_status,
+          changedByUserId: req.user?.id || null,
+          reasonCode: 'deposit_succeeded',
+          extraPatch: {
+            deposit_confirmed_at: new Date(),
+            deposit_amount_cents_snapshot: commissionCents,
+            deposit_currency_snapshot: chargeCurrency,
+          },
+        });
       } else if (intent.status === 'canceled') {
-        await conn2.query(
-          'UPDATE booking SET booking_status = "payment_failed" WHERE id = ? AND booking_status = "pending_deposit"',
-          [id]
-        );
+        await transitionBookingStateRecord(conn2, booking, {
+          nextSettlementStatus: 'payment_failed',
+          changedByUserId: req.user?.id || null,
+          reasonCode: 'deposit_canceled',
+        });
       }
       await conn2.commit();
     } catch (e) {
@@ -8248,23 +9056,70 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     // Bloquear la reserva y obtener datos necesarios
     const [rows] = await connection.query(
       `
-      SELECT b.id, b.user_id, b.final_price, b.commission, b.is_paid,
-             b.service_duration, b.booking_start_datetime, b.booking_end_datetime,
+      SELECT
+             b.id,
+             b.client_user_id AS user_id,
+             b.service_status,
+             b.settlement_status,
+             b.requested_duration_minutes AS service_duration,
+             b.requested_start_datetime AS booking_start_datetime,
+             b.requested_end_datetime AS booking_end_datetime,
+             b.price_type_snapshot,
+             b.service_currency_snapshot,
+             b.unit_price_amount_cents_snapshot,
+             b.estimated_base_amount_cents,
+             b.estimated_commission_amount_cents,
+             b.estimated_total_amount_cents,
+             b.deposit_amount_cents_snapshot,
+             cp.proposed_base_amount_cents,
+             cp.proposed_commission_amount_cents,
+             cp.proposed_total_amount_cents,
+             cp.proposed_final_duration_minutes,
              cust.email AS customer_email, cust.stripe_customer_id AS customer_id, cust.currency AS customer_currency,
              provider.stripe_account_id,
-             p.price AS unit_price, p.price_type, p.currency AS service_currency
+             p.price AS unit_price,
+             COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
+             COALESCE(p.currency, b.service_currency_snapshot) AS service_currency
       FROM booking b
       JOIN service s ON b.service_id = s.id
       JOIN price p ON s.price_id = p.id
       JOIN user_account provider ON s.user_id = provider.id
-      JOIN user_account cust ON b.user_id = cust.id
+      JOIN user_account cust ON b.client_user_id = cust.id
+      LEFT JOIN booking_closure_proposal cp ON cp.id = (
+        SELECT cp2.id
+        FROM booking_closure_proposal cp2
+        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        ORDER BY cp2.id DESC
+        LIMIT 1
+      )
       WHERE b.id = ? FOR UPDATE
       `,
       [id]
     );
     booking = rows[0];
     if (!booking) throw new Error('Reserva no encontrada');
-    if (booking.is_paid) throw new Error('Reserva ya pagada');
+    if (normalizeSettlementStatus(booking.settlement_status, 'none') === 'paid') {
+      throw new Error('Reserva ya pagada');
+    }
+
+    const bookingCurrency = normalizeCurrencyCode(
+      booking.service_currency_snapshot,
+      normalizeCurrencyCode(booking.service_currency, 'EUR')
+    );
+    booking.final_price = booking.proposed_total_amount_cents != null
+      ? fromMinorUnits(booking.proposed_total_amount_cents, bookingCurrency)
+      : (
+        booking.estimated_total_amount_cents != null
+          ? fromMinorUnits(booking.estimated_total_amount_cents, bookingCurrency)
+          : null
+      );
+    booking.commission = booking.proposed_commission_amount_cents != null
+      ? fromMinorUnits(booking.proposed_commission_amount_cents, bookingCurrency)
+      : (
+        booking.estimated_commission_amount_cents != null
+          ? fromMinorUnits(booking.estimated_commission_amount_cents, bookingCurrency)
+          : null
+      );
 
     const isOwner = req.user && Number(req.user.id) === Number(booking.user_id);
     const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
@@ -8541,43 +9396,32 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     }
 
     // Recalcular el total pendiente en la moneda congelada del depósito
-    // Determinar minutos: usar service_duration si existe; si no, derivar de start/end
-    const storedDurationMin = Number.isFinite(Number(booking.service_duration)) ? Number(booking.service_duration) : null;
-    let derivedMinutes = null;
-    try {
-      if (!storedDurationMin && booking.booking_start_datetime && booking.booking_end_datetime) {
-        const t0 = new Date(booking.booking_start_datetime);
-        const t1 = new Date(booking.booking_end_datetime);
-        if (!Number.isNaN(t0.getTime()) && !Number.isNaN(t1.getTime())) {
-          const diffMs = Math.max(0, t1.getTime() - t0.getTime());
-          derivedMinutes = Math.round(diffMs / 60000);
-        }
-      }
-    } catch (_) { /* noop safe derive */ }
+    const chosenTotalAmountCentsInBookingCurrency = Number(
+      booking.proposed_total_amount_cents
+      ?? booking.estimated_total_amount_cents
+      ?? 0
+    );
+    const chosenCommissionAmountCentsInBookingCurrency = Number(
+      booking.proposed_commission_amount_cents
+      ?? booking.estimated_commission_amount_cents
+      ?? 0
+    );
 
-    const effectiveMinutes = storedDurationMin ?? derivedMinutes ?? 0;
-    const isBudget = String(booking.price_type || '').toLowerCase() === 'budget';
-    const convertedUnitPrice = convertAmount(booking.unit_price || 0, booking.service_currency, chargeCurrency);
-    const convertedFinalBase = convertAmount(booking.final_price || 0, booking.service_currency, chargeCurrency);
+    const chosenTotalAmount = convertAmount(
+      fromMinorUnits(chosenTotalAmountCentsInBookingCurrency, bookingCurrency),
+      bookingCurrency,
+      chargeCurrency
+    );
+    const chosenCommissionAmount = convertAmount(
+      fromMinorUnits(chosenCommissionAmountCentsInBookingCurrency, bookingCurrency),
+      bookingCurrency,
+      chargeCurrency
+    );
 
-    const pricing = isBudget
-      ? computePricing({
-        priceType: 'fix',
-        unitPrice: convertedFinalBase,
-        durationMinutes: 0,
-        currency: chargeCurrency,
-      })
-      : computePricing({
-        priceType: booking.price_type,
-        unitPrice: convertedUnitPrice,
-        durationMinutes: effectiveMinutes,
-        currency: chargeCurrency,
-      });
-
-    finalChosenCents = toMinorUnits(pricing.final || 0, chargeCurrency);
-    commissionChosenCents = toMinorUnits(pricing.commission || 0, chargeCurrency);
-    finalCents = toMinorUnits(booking.final_price || 0, booking.service_currency);
-    commissionCents = toMinorUnits(booking.commission || 0, booking.service_currency);
+    finalChosenCents = toMinorUnits(chosenTotalAmount, chargeCurrency);
+    commissionChosenCents = toMinorUnits(chosenCommissionAmount, chargeCurrency);
+    finalCents = chosenTotalAmountCentsInBookingCurrency;
+    commissionCents = chosenCommissionAmountCentsInBookingCurrency;
     finalCalcCents = finalChosenCents;
     commissionCalcCents = commissionChosenCents;
 
@@ -8612,10 +9456,11 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           currency: chargeCurrency,
           transferGroup: `booking-${id}`,
         });
-        await connNoCharge.query(
-          'UPDATE booking SET is_paid = 1 WHERE id = ?',
-          [id]
-        );
+        await transitionBookingStateRecord(connNoCharge, booking, {
+          nextSettlementStatus: 'paid',
+          changedByUserId: req.user?.id || null,
+          reasonCode: 'final_payment_covered_by_deposit',
+        });
         await connNoCharge.commit();
       } catch (noChargeError) {
         try { await connNoCharge.rollback(); } catch { }
@@ -8861,110 +9706,17 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
 
 // Pago final de una reserva completada (NO ACTIVO!)
 app.post('/api/bookings/:id/final-payment', authenticateToken, (req, res) => {
-  const { id } = req.params;
-
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    const query = `
-      SELECT b.final_price, b.commission, p.currency AS service_currency
-      FROM booking b
-      JOIN service s ON b.service_id = s.id
-      JOIN price p ON s.price_id = p.id
-      WHERE b.id = ?
-    `;
-    connection.query(query, [id], async (err, results) => {
-      connection.release();
-      if (err) {
-        console.error('Error al obtener la reserva:', err);
-        return res.status(500).json({ error: 'Error al obtener la reserva.' });
-      }
-
-      if (results.length === 0) {
-        return res.status(404).json({ message: 'Reserva no encontrada.' });
-      }
-
-      const finalPrice = parseFloat(results[0].final_price || 0);
-      const commission = parseFloat(results[0].commission || 0);
-      const serviceCurrency = normalizeCurrencyCode(results[0].service_currency, 'EUR');
-      const amountToPay = Number((finalPrice - commission).toFixed(2));
-      if (amountToPay <= 0) {
-        return res.status(400).json({ error: 'El importe final es cero o negativo.' });
-      }
-
-      try {
-        const intent = await stripe.paymentIntents.create({
-          amount: toMinorUnits(amountToPay, serviceCurrency),
-          currency: toStripeCurrencyCode(serviceCurrency),
-          metadata: { booking_id: id, type: 'final' }
-        });
-        res.status(200).json({ clientSecret: intent.client_secret });
-      } catch (stripeErr) {
-        console.error('Error al crear el pago final:', stripeErr);
-        res.status(500).json({ error: 'Error al procesar el pago final.' });
-      }
-    });
+  return res.status(410).json({
+    error: 'deprecated_endpoint',
+    message: 'Usa /api/bookings/:id/final-payment-transfer para el flujo actual.',
   });
 });
 
 // Transferir el pago final al profesional con Stripe Connect (NO ACTIVO!)
 app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
-  const { id } = req.params;
-
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
-
-    const query = `SELECT b.final_price, b.commission, s.user_id, u.stripe_account_id, p.currency AS service_currency
-                   FROM booking b
-                   JOIN service s ON b.service_id = s.id
-                   JOIN price p ON s.price_id = p.id
-                   JOIN user_account u ON s.user_id = u.id
-                   WHERE b.id = ?`;
-
-    connection.query(query, [id], async (qErr, results) => {
-      connection.release();
-      if (qErr) {
-        console.error('Error al obtener la reserva:', qErr);
-        return res.status(500).json({ error: 'Error al obtener la reserva.' });
-      }
-
-      if (results.length === 0) {
-        return res.status(404).json({ message: 'Reserva no encontrada.' });
-      }
-
-      const { final_price, commission, stripe_account_id } = results[0];
-      const serviceCurrency = normalizeCurrencyCode(results[0].service_currency, 'EUR');
-
-      if (!stripe_account_id) {
-        return res.status(400).json({ error: 'El profesional no tiene cuenta Stripe.' });
-      }
-
-      const finalPrice = parseFloat(results[0].final_price || 0);
-      const commissionAmount = parseFloat(results[0].commission || 0);
-      const amount = Number((finalPrice - commissionAmount).toFixed(2));
-      if (amount <= 0) {
-        return res.status(400).json({ error: 'El importe a transferir es cero o negativo.' });
-      }
-
-      try {
-        await stripe.transfers.create({
-          amount: toMinorUnits(amount, serviceCurrency),
-          currency: toStripeCurrencyCode(serviceCurrency),
-          destination: stripe_account_id,
-          metadata: { booking_id: id }
-        });
-        res.status(200).json({ message: 'Transferencia realizada con éxito' });
-      } catch (stripeErr) {
-        console.error('Error al realizar la transferencia:', stripeErr);
-        res.status(500).json({ error: 'Error al realizar la transferencia.' });
-      }
-    });
+  return res.status(410).json({
+    error: 'deprecated_endpoint',
+    message: 'Usa /api/bookings/:id/final-payment-transfer para el flujo actual.',
   });
 });
 
@@ -8981,15 +9733,19 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
     const query = `
       SELECT
         b.id AS booking_id,
-        b.final_price,
-        b.commission,
-        b.is_paid,
-        b.booking_start_datetime,
-        b.booking_end_datetime,
+        b.service_status,
+        b.settlement_status,
+        b.requested_start_datetime,
+        b.requested_end_datetime,
+        b.service_currency_snapshot,
+        b.estimated_commission_amount_cents,
+        b.estimated_total_amount_cents,
         b.description AS booking_description,
-        s.service_title,
+        COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
         s.description AS service_description,
-        p.currency AS service_currency,
+        COALESCE(p.currency, b.service_currency_snapshot) AS service_currency,
+        cp.proposed_commission_amount_cents,
+        cp.proposed_total_amount_cents,
         cu.email AS customer_email,
         cu.phone AS customer_phone,
         cu.first_name AS customer_first_name,
@@ -9008,10 +9764,17 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         a.state AS provider_state,
         a.country AS provider_country
       FROM booking b
-      JOIN user_account cu ON b.user_id = cu.id
+      JOIN user_account cu ON b.client_user_id = cu.id
       JOIN service s ON b.service_id = s.id
       JOIN price p ON s.price_id = p.id
       JOIN user_account sp ON s.user_id = sp.id
+      LEFT JOIN booking_closure_proposal cp ON cp.id = (
+        SELECT cp2.id
+        FROM booking_closure_proposal cp2
+        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        ORDER BY cp2.id DESC
+        LIMIT 1
+      )
       LEFT JOIN (
         SELECT cm1.* FROM collection_method cm1
         JOIN (
@@ -9037,6 +9800,23 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       }
 
       const data = results[0];
+      data.is_paid = deriveLegacyIsPaid(data.settlement_status);
+      data.booking_start_datetime = data.requested_start_datetime;
+      data.booking_end_datetime = data.requested_end_datetime;
+      data.commission = data.proposed_commission_amount_cents != null
+        ? fromMinorUnits(data.proposed_commission_amount_cents, data.service_currency || 'EUR')
+        : (
+          data.estimated_commission_amount_cents != null
+            ? fromMinorUnits(data.estimated_commission_amount_cents, data.service_currency || 'EUR')
+            : 0
+        );
+      data.final_price = data.proposed_total_amount_cents != null
+        ? fromMinorUnits(data.proposed_total_amount_cents, data.service_currency || 'EUR')
+        : (
+          data.estimated_total_amount_cents != null
+            ? fromMinorUnits(data.estimated_total_amount_cents, data.service_currency || 'EUR')
+            : 0
+        );
       let depositPayment = null;
       let finalPayment = null;
 
@@ -9311,32 +10091,30 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
 });
 
 // Borrar una reserva por su id
-app.delete('/api/delete_booking/:id', (req, res) => {
-  const { id } = req.params; // ID de la reserva a eliminar
+app.delete('/api/delete_booking/:id', async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  try {
+    const [[booking]] = await promisePool.query(
+      'SELECT id FROM booking WHERE id = ? LIMIT 1',
+      [bookingId]
+    );
+
+    if (!booking) {
+      return res.status(404).json({ message: 'Reserva no encontrada' });
     }
 
-    const deleteQuery = 'DELETE FROM booking WHERE id = ?';
-
-    connection.query(deleteQuery, [id], (err, result) => {
-      connection.release(); // Liberar la conexión después de usarla
-
-      if (err) {
-        console.error('Error al eliminar la reserva:', err);
-        return res.status(500).json({ error: 'Error al eliminar la reserva.' });
-      }
-
-      if (result.affectedRows > 0) {
-        res.status(200).json({ message: 'Reserva eliminada con éxito' });
-      } else {
-        res.status(404).json({ message: 'Reserva no encontrada' });
-      }
+    return res.status(409).json({
+      error: 'Las reservas ya no se eliminan físicamente.',
+      code: 'BOOKING_SOFT_DELETE_ONLY',
     });
-  });
+  } catch (error) {
+    console.error('Error al bloquear el borrado de la reserva:', error);
+    return res.status(500).json({ error: 'Error al procesar la reserva.' });
+  }
 });
 
 //Ruta para obtener las sugerencias de busqueda de servicios
@@ -10884,10 +11662,13 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           const [[bookingRow]] = await connection.query(
             `SELECT
                b.id,
-               b.booking_start_datetime,
-               b.booking_end_datetime,
-               b.final_price,
-               s.service_title,
+               b.service_status,
+               b.settlement_status,
+               b.requested_start_datetime,
+               b.requested_end_datetime,
+               b.service_currency_snapshot,
+               b.estimated_total_amount_cents,
+               COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
                client.first_name AS client_first_name,
                client.surname AS client_surname,
                client.username AS client_username,
@@ -10897,25 +11678,33 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
                prof.username AS professional_username,
                prof.email AS professional_email
              FROM booking b
-             LEFT JOIN user_account client ON client.id = b.user_id
+             LEFT JOIN user_account client ON client.id = b.client_user_id
              LEFT JOIN service s ON s.id = b.service_id
-             LEFT JOIN user_account prof ON prof.id = s.user_id
+             LEFT JOIN user_account prof ON prof.id = COALESCE(s.user_id, b.provider_user_id_snapshot)
              WHERE b.id = ?
              LIMIT 1`,
             [bookingId]
           );
-          const [updateResult] = await connection.query(
-            'UPDATE booking SET booking_status = "requested" WHERE id = ? AND booking_status <> "requested"',
-            [bookingId]
-          );
-          if (bookingRow && updateResult.affectedRows > 0) {
+          if (bookingRow) {
+            await transitionBookingStateRecord(connection, bookingRow, {
+              nextServiceStatus: 'requested',
+              nextSettlementStatus: bookingRow.settlement_status === 'payment_failed' ? 'none' : bookingRow.settlement_status,
+              reasonCode: 'deposit_succeeded_webhook',
+              extraPatch: {
+                deposit_confirmed_at: new Date(),
+                deposit_amount_cents_snapshot: depositPaymentRow?.amount_cents ?? amountCents,
+                deposit_currency_snapshot: normalizeCurrencyCode(depositPaymentRow?.currency, pi?.currency || 'EUR'),
+              },
+            });
             depositNotification = {
               booking: {
                 id: bookingRow.id,
                 serviceTitle: bookingRow.service_title,
-                start: bookingRow.booking_start_datetime,
-                end: bookingRow.booking_end_datetime,
-                finalPrice: bookingRow.final_price,
+                start: bookingRow.requested_start_datetime,
+                end: bookingRow.requested_end_datetime,
+                finalPrice: bookingRow.estimated_total_amount_cents != null
+                  ? fromMinorUnits(bookingRow.estimated_total_amount_cents, bookingRow.service_currency_snapshot || 'EUR')
+                  : null,
                 professional: {
                   firstName: bookingRow.professional_first_name,
                   surname: bookingRow.professional_surname,
@@ -10936,13 +11725,30 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           }
         }
         if (event.type === 'payment_intent.succeeded' && type === 'final') {
-          await connection.query('UPDATE booking SET is_paid = 1 WHERE id = ?', [bookingId]);
-        }
-        if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'deposit') {
-          await connection.query(
-            'UPDATE booking SET booking_status = "payment_failed" WHERE id = ? AND booking_status = "pending_deposit"',
+          const [[bookingRow]] = await connection.query(
+            'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
             [bookingId]
           );
+          if (bookingRow) {
+            await transitionBookingStateRecord(connection, bookingRow, {
+              nextSettlementStatus: 'paid',
+              reasonCode: 'final_payment_succeeded_webhook',
+            });
+          }
+        }
+        if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'deposit') {
+          const [[bookingRow]] = await connection.query(
+            'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
+            [bookingId]
+          );
+          if (bookingRow) {
+            await transitionBookingStateRecord(connection, bookingRow, {
+              nextSettlementStatus: 'payment_failed',
+              reasonCode: event.type === 'payment_intent.canceled'
+                ? 'deposit_canceled_webhook'
+                : 'deposit_failed_webhook',
+            });
+          }
         }
         if (event.type === 'payment_intent.canceled' && type === 'final') {
           // opcional: revertir is_paid si fuera necesario en tu dominio
@@ -10982,8 +11788,17 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
             'UPDATE payments SET status = ? WHERE payment_intent_id = ?',
             ['refunded', piId]
           );
-          if (payment.type === 'final' && fullyRefunded) {
-            await connection.query('UPDATE booking SET is_paid = 0 WHERE id = ?', [payment.booking_id]);
+          if (fullyRefunded) {
+            const [[bookingRow]] = await connection.query(
+              'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
+              [payment.booking_id]
+            );
+            if (bookingRow) {
+              await transitionBookingStateRecord(connection, bookingRow, {
+                nextSettlementStatus: 'refunded',
+                reasonCode: payment.type === 'final' ? 'final_refunded_webhook' : 'deposit_refunded_webhook',
+              });
+            }
           }
         }
         await connection.commit();
