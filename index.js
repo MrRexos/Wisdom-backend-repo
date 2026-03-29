@@ -458,6 +458,29 @@ const EUR_BASE_EXCHANGE_RATES = Object.freeze({
   ZAR: 19.7984,
   MAD: 10.82,
 });
+const CURRENCY_PATTERN_LOCALES = Object.freeze({
+  EUR: 'es-ES',
+  USD: 'en-US',
+  GBP: 'en-GB',
+  JPY: 'ja-JP',
+  CAD: 'en-CA',
+  MXN: 'es-MX',
+  BRL: 'pt-BR',
+  CNY: 'zh-CN',
+  INR: 'hi-IN',
+  AUD: 'en-AU',
+  SGD: 'en-SG',
+  HKD: 'zh-HK',
+  NZD: 'en-NZ',
+  KRW: 'ko-KR',
+  PHP: 'en-PH',
+  CHF: 'de-CH',
+  AED: 'ar-AE',
+  SAR: 'ar-SA',
+  TRY: 'tr-TR',
+  ZAR: 'en-ZA',
+  MAD: 'ar-MA',
+});
 
 const STRIPE_ZERO_DECIMAL_CURRENCIES = new Set(['JPY', 'KRW']);
 
@@ -560,6 +583,47 @@ function getCurrencyDisplaySymbol(currency, locale = 'es-ES') {
   return preferredCandidates[0].value;
 }
 
+function getCurrencyPatternLocale(currency, locale = 'es-ES') {
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  return CURRENCY_PATTERN_LOCALES[normalizedCurrency] || locale;
+}
+
+function getCurrencyLayout(currency, locale = 'es-ES') {
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const patternLocale = getCurrencyPatternLocale(normalizedCurrency, locale);
+
+  try {
+    const parts = new Intl.NumberFormat(patternLocale, {
+      style: 'currency',
+      currency: normalizedCurrency,
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2,
+    }).formatToParts(1234.5);
+
+    const currencyIndex = parts.findIndex((part) => part.type === 'currency');
+    const firstNumberIndex = parts.findIndex((part) => ['integer', 'fraction'].includes(part.type));
+    let lastNumberIndex = -1;
+    for (let index = parts.length - 1; index >= 0; index -= 1) {
+      if (['integer', 'fraction'].includes(parts[index]?.type)) {
+        lastNumberIndex = index;
+        break;
+      }
+    }
+
+    const placement = currencyIndex >= 0 && firstNumberIndex >= 0 && currencyIndex < firstNumberIndex
+      ? 'prefix'
+      : 'suffix';
+    const literalParts = placement === 'prefix'
+      ? parts.slice(currencyIndex + 1, firstNumberIndex)
+      : parts.slice(lastNumberIndex + 1, currencyIndex);
+    const separator = literalParts.some((part) => /\s/u.test(part?.value || '')) ? ' ' : '';
+
+    return { placement, separator };
+  } catch (error) {
+    return { placement: 'suffix', separator: ' ' };
+  }
+}
+
 function formatCurrencyAmount(amount, currency = 'EUR', locale = 'es-ES') {
   const numericAmount = Number(amount);
   if (!Number.isFinite(numericAmount)) {
@@ -568,31 +632,17 @@ function formatCurrencyAmount(amount, currency = 'EUR', locale = 'es-ES') {
 
   const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
   const cleanSymbol = getCurrencyDisplaySymbol(normalizedCurrency, locale);
+  const { placement, separator } = getCurrencyLayout(normalizedCurrency, locale);
+  const absoluteAmount = Math.abs(numericAmount);
+  const sign = numericAmount < 0 ? '-' : '';
+  const formattedNumber = absoluteAmount.toLocaleString(locale, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  });
 
-  try {
-    const formatter = new Intl.NumberFormat(locale, {
-      style: 'currency',
-      currency: normalizedCurrency,
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 2,
-    });
-    const formattedParts = formatter.formatToParts(numericAmount);
-    const hasCurrencyPart = formattedParts.some((part) => part.type === 'currency');
-
-    if (hasCurrencyPart) {
-      return formattedParts
-        .map((part) => (part.type === 'currency' ? cleanSymbol : part.value))
-        .join('')
-        .trim();
-    }
-
-    return formatter.format(numericAmount);
-  } catch (error) {
-    return `${numericAmount.toLocaleString(locale, {
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 2,
-    })} ${cleanSymbol}`.trim();
-  }
+  return placement === 'prefix'
+    ? `${sign}${cleanSymbol}${separator}${formattedNumber}`.trim()
+    : `${sign}${formattedNumber}${separator}${cleanSymbol}`.trim();
 }
 
 function buildCurrencyRateCaseExpression(currencyExpression) {
