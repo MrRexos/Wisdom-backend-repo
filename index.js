@@ -515,18 +515,84 @@ function toStripeCurrencyCode(currency) {
   return normalizeCurrencyCode(currency, 'EUR').toLowerCase();
 }
 
+function sanitizeCurrencyDisplayValue(value) {
+  return String(value || '')
+    .replace(/[\u200e\u200f\u061c\u2066-\u2069]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
+function getCurrencyDisplaySymbol(currency, locale = 'es-ES') {
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const candidates = [];
+
+  for (const currencyDisplay of ['narrowSymbol', 'symbol']) {
+    try {
+      const formatter = new Intl.NumberFormat(locale, {
+        style: 'currency',
+        currency: normalizedCurrency,
+        currencyDisplay,
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0,
+      });
+      const value = sanitizeCurrencyDisplayValue(
+        formatter.formatToParts(0).find((part) => part.type === 'currency')?.value
+      );
+      if (value && value.toUpperCase() !== normalizedCurrency) {
+        candidates.push({ value, currencyDisplay });
+      }
+    } catch (error) {}
+  }
+
+  if (!candidates.length) {
+    return normalizedCurrency;
+  }
+
+  const preferredCandidates = candidates.some((candidate) => !/[A-Za-z]/.test(candidate.value))
+    ? candidates.filter((candidate) => !/[A-Za-z]/.test(candidate.value))
+    : candidates;
+
+  preferredCandidates.sort((left, right) => (
+    Number(right.currencyDisplay === 'narrowSymbol') - Number(left.currencyDisplay === 'narrowSymbol')
+    || left.value.length - right.value.length
+  ));
+
+  return preferredCandidates[0].value;
+}
+
 function formatCurrencyAmount(amount, currency = 'EUR', locale = 'es-ES') {
   const numericAmount = Number(amount);
   if (!Number.isFinite(numericAmount)) {
     return 'No disponible';
   }
 
-  return new Intl.NumberFormat(locale, {
-    style: 'currency',
-    currency: normalizeCurrencyCode(currency, 'EUR'),
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  }).format(numericAmount);
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const cleanSymbol = getCurrencyDisplaySymbol(normalizedCurrency, locale);
+
+  try {
+    const formatter = new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency: normalizedCurrency,
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2,
+    });
+    const formattedParts = formatter.formatToParts(numericAmount);
+    const hasCurrencyPart = formattedParts.some((part) => part.type === 'currency');
+
+    if (hasCurrencyPart) {
+      return formattedParts
+        .map((part) => (part.type === 'currency' ? cleanSymbol : part.value))
+        .join('')
+        .trim();
+    }
+
+    return formatter.format(numericAmount);
+  } catch (error) {
+    return `${numericAmount.toLocaleString(locale, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2,
+    })} ${cleanSymbol}`.trim();
+  }
 }
 
 function buildCurrencyRateCaseExpression(currencyExpression) {
