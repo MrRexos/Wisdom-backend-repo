@@ -34,21 +34,101 @@
 
 ## Tabla: `booking`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
-- `user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
+- `client_user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
 - `service_id` (INT, FK -> service.id, NULL)
+- `provider_user_id_snapshot` (INT UNSIGNED, FK -> user_account.id, NULL)
 - `address_id` (INT, FK -> address.id, NULL)
-- `payment_method_id` (INT, FK -> payment_method.id, NULL)
-- `booking_start_datetime` (DATETIME, NULL)
-- `booking_end_datetime` (DATETIME, NULL)
-- `recurrent_pattern_id` (INT, FK -> recurrent_pattern.id, NULL)
-- `promotion_id` (INT, FK -> promotion.id, NULL)
-- `service_duration` (INT, NULL)
-- `final_price` (DECIMAL(9,2), NULL)
-- `commission` (DECIMAL(9,2), NULL)
-- `is_paid` (TINYINT(1), NOT NULL, DEFAULT 0)
-- `booking_status` (ENUM('PENDING_DEPOSIT','REQUESTED','ACCEPTED','REJECTED','CANCELED','COMPLETED','PAYMENT_FAILED'), NOT NULL, DEFAULT pending_deposit)
-- `order_datetime` (DATETIME, NOT NULL)
 - `description` (TEXT, NULL)
+- `service_status` (ENUM('pending_deposit','requested','accepted','in_progress','finished','canceled','expired'), NOT NULL, DEFAULT pending_deposit)
+- `settlement_status` (ENUM('none','pending_client_approval','awaiting_payment','paid','refund_pending','partially_refunded','refunded','payment_failed','manual_review_required','in_dispute'), NOT NULL, DEFAULT none)
+- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `updated_at` (DATETIME, DEFAULT_GENERATED on update CURRENT_TIMESTAMP, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `requested_start_datetime` (DATETIME, NULL)
+- `requested_duration_minutes` (INT, NULL)
+- `requested_end_datetime` (DATETIME, NULL)
+- `deposit_confirmed_at` (DATETIME, NULL)
+- `accepted_at` (DATETIME, NULL)
+- `started_at` (DATETIME, NULL)
+- `finished_at` (DATETIME, NULL)
+- `canceled_at` (DATETIME, NULL)
+- `expired_at` (DATETIME, NULL)
+- `accept_deadline_at` (DATETIME, NULL)
+- `expires_at` (DATETIME, NOT NULL)
+- `client_approval_deadline_at` (DATETIME, NULL)
+- `last_minute_window_starts_at` (DATETIME, NULL)
+- `canceled_by_user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
+- `cancellation_reason_code` (VARCHAR(100), NULL)
+- `cancellation_note` (TEXT, NULL)
+- `service_title_snapshot` (VARCHAR(255), NULL)
+- `price_type_snapshot` (VARCHAR(100), NULL)
+- `service_currency_snapshot` (CHAR(3), NOT NULL, DEFAULT EUR)
+- `unit_price_amount_cents_snapshot` (INT, NULL)
+- `minimum_notice_policy_snapshot` (INT, NULL)
+- `estimated_base_amount_cents` (INT, NULL)
+- `estimated_commission_amount_cents` (INT, NULL)
+- `estimated_total_amount_cents` (INT, NULL)
+- `selected_customer_payment_method_id` (INT, FK -> payment_method.id, NULL)
+- `deposit_amount_cents_snapshot` (INT, NULL)
+- `deposit_currency_snapshot` (CHAR(3), NULL)
+
+## Tabla: `booking_change_request`
+- `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
+- `booking_id` (INT, FK -> booking.id, NOT NULL)
+- `requested_by_user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
+- `target_user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
+- `status` (ENUM('pending','accepted','rejected','canceled','expired'), NOT NULL, DEFAULT pending)
+- `changes_json` (JSON, NOT NULL)
+- `message` (TEXT, NULL)
+- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `resolved_at` (DATETIME, NULL)
+
+## Tabla: `booking_closure_proposal`
+- `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
+- `booking_id` (INT, FK -> booking.id, NOT NULL)
+- `created_by_user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
+- `status` (ENUM('active','revoked','accepted','rejected','superseded'), NOT NULL, DEFAULT active)
+- `price_type_snapshot` (VARCHAR(100), NOT NULL)
+- `estimated_duration_minutes` (INT, NULL)
+- `proposed_final_duration_minutes` (INT, NULL)
+- `estimated_total_amount_cents` (INT, NOT NULL)
+- `proposed_base_amount_cents` (INT, NOT NULL)
+- `proposed_commission_amount_cents` (INT, NOT NULL)
+- `proposed_total_amount_cents` (INT, NOT NULL)
+- `deposit_already_paid_amount_cents` (INT, NOT NULL, DEFAULT 0)
+- `amount_due_from_client_cents` (INT, NOT NULL)
+- `amount_to_refund_cents` (INT, NOT NULL, DEFAULT 0)
+- `provider_payout_amount_cents` (INT, NOT NULL)
+- `platform_amount_cents` (INT, NOT NULL)
+- `zero_charge_mode` (TINYINT(1), NOT NULL, DEFAULT 0)
+- `auto_charge_eligible` (TINYINT(1), NOT NULL, DEFAULT 0)
+- `auto_charge_scheduled_at` (DATETIME, NULL)
+- `sent_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `revoked_at` (DATETIME, NULL)
+- `accepted_at` (DATETIME, NULL)
+- `rejected_at` (DATETIME, NULL)
+
+## Tabla: `booking_issue_report`
+- `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
+- `booking_id` (INT, FK -> booking.id, NOT NULL)
+- `reported_by_user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
+- `reported_against_user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
+- `issue_type` (ENUM('no_show_client','no_show_provider','last_minute_client','last_minute_provider','general_problem','payment_dispute'), NOT NULL)
+- `status` (ENUM('open','resolved','dismissed'), NOT NULL, DEFAULT open)
+- `details` (TEXT, NOT NULL)
+- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `resolved_at` (DATETIME, NULL)
+
+## Tabla: `booking_status_history`
+- `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
+- `booking_id` (INT, FK -> booking.id, NOT NULL)
+- `from_service_status` (VARCHAR(50), NULL)
+- `to_service_status` (VARCHAR(50), NOT NULL)
+- `from_settlement_status` (VARCHAR(50), NULL)
+- `to_settlement_status` (VARCHAR(50), NOT NULL)
+- `changed_by_user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
+- `reason_code` (VARCHAR(100), NULL)
+- `note` (TEXT, NULL)
+- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
 
 ## Tabla: `collection_method`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
@@ -308,6 +388,16 @@
 - `not_available_event_start_datetime` (DATETIME, NOT NULL)
 - `not_available_event_end_datetime` (DATETIME, NOT NULL)
 
+## Tabla: `user_strike`
+- `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
+- `user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
+- `booking_id` (INT, FK -> booking.id, NULL)
+- `issue_report_id` (INT UNSIGNED, FK -> booking_issue_report.id, NULL)
+- `reason_code` (VARCHAR(100), NOT NULL)
+- `status` (ENUM('active','forgiven'), NOT NULL, DEFAULT active)
+- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `forgiven_at` (DATETIME, NULL)
+
 
 ----------------------------------------------------------
 
@@ -322,12 +412,34 @@
 
 ### Tabla: `booking`
 - `id`: **PK** (Key Name: `PRIMARY`)
-- `address_id`: **FK** -> `address`.`id` (Key Name: `fk_booking_address_id_addres_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
-- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_booking_user_id_user_account_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
-- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_booking_service_id_service_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
-- `recurrent_pattern_id`: **FK** -> `recurrent_pattern`.`id` (Key Name: `fk_booking_recurrent_pattern_id_recurrent_pattern_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
-- `promotion_id`: **FK** -> `promotion`.`id` (Key Name: `fk_booking_promotion_id_promotion_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
-- `payment_method_id`: **FK** -> `payment_method`.`id` (Key Name: `fk_booking_payment_method_id_payment_method_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `client_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_booking_client_user_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `provider_user_id_snapshot`: **FK** -> `user_account`.`id` (Key Name: `fk_booking_provider_user_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `address_id`: **FK** -> `address`.`id` (Key Name: `fk_booking_address_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `service_id`: **FK** -> `service`.`id` (Key Name: `fk_booking_service_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `selected_customer_payment_method_id`: **FK** -> `payment_method`.`id` (Key Name: `fk_booking_payment_method_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `canceled_by_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_booking_canceled_by_user_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+
+### Tabla: `booking_change_request`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_bcr_booking`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `requested_by_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_bcr_req_user`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `target_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_bcr_tgt_user`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `booking_closure_proposal`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_bcp_booking`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `created_by_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_bcp_user`, ON DELETE RESTRICT, ON UPDATE NO ACTION)
+
+### Tabla: `booking_issue_report`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_bir_booking`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `reported_by_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_bir_rep_user`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `reported_against_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_bir_tgt_user`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `booking_status_history`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_bsh_booking`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `changed_by_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_bsh_user`, ON DELETE SET NULL, ON UPDATE NO ACTION)
 
 ### Tabla: `collection_method`
 - `id`: **PK** (Key Name: `PRIMARY`)
@@ -451,3 +563,9 @@
 ### Tabla: `user_not_available`
 - `id`: **PK** (Key Name: `PRIMARY`)
 - `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_user_not_available_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `user_strike`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_us_user`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_us_booking`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `issue_report_id`: **FK** -> `booking_issue_report`.`id` (Key Name: `fk_us_issue_report`, ON DELETE SET NULL, ON UPDATE NO ACTION)
