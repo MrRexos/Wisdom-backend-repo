@@ -10609,7 +10609,7 @@ function formatLeadTimeLabel(minutes) {
           expand: ['payment_method', 'latest_charge.payment_method_details'],
         });
 
-        // Si falta método de pago y el cliente nos envía uno ahora, adjuntarlo y confirmar en servidor
+        // Si falta método de pago y el cliente nos envía uno ahora, adjuntarlo y confirmar on-session
         if (intent.status === 'requires_payment_method' && payment_method_id) {
           pm = await stripe.paymentMethods.retrieve(payment_method_id);
           if (pm.customer && pm.customer !== customerId) {
@@ -10633,10 +10633,10 @@ function formatLeadTimeLabel(minutes) {
               save_payment_method: requestedSavePaymentMethod ? '1' : '0',
             },
           });
-          intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
+          intent = await stripe.paymentIntents.confirm(intent.id);
         }
       } else {
-        // Crear intent nuevo: si traen PM, confirmar server-side; si no, devolver client_secret para confirmar en el cliente
+        // Crear intent nuevo: si traen PM, confirmar on-session; si no, devolver client_secret para confirmar en el cliente
         if (payment_method_id) {
           intent = await stripe.paymentIntents.create(
             {
@@ -10645,7 +10645,6 @@ function formatLeadTimeLabel(minutes) {
               customer: customerId,
               payment_method: payment_method_id,
               confirm: true,
-              off_session: true,
               receipt_email: booking.customer_email || undefined,
               automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
               transfer_group: transferGroup,
