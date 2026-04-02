@@ -93,6 +93,19 @@ function normalizeDurationMinutes(value) {
   return numericValue;
 }
 
+function normalizeMinimumNoticeMinutes(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numericValue = Math.round(Number(value));
+  if (!Number.isFinite(numericValue) || numericValue < 0) {
+    return null;
+  }
+
+  return numericValue;
+}
+
 function isDurationMinutesInRange(value) {
   if (value === null || value === undefined) {
     return true;
@@ -110,6 +123,27 @@ function deriveRequestedEndDateTime(requestedStartDateTime, requestedDurationMin
   }
 
   return new Date(startDate.getTime() + durationMinutes * 60 * 1000);
+}
+
+function meetsMinimumNotice({
+  requestedStartDateTime,
+  minimumNoticeMinutes,
+  now = new Date(),
+} = {}) {
+  const normalizedRequestedStartDateTime = parseDateInput(requestedStartDateTime);
+  const normalizedMinimumNoticeMinutes = normalizeMinimumNoticeMinutes(minimumNoticeMinutes);
+  const normalizedNow = parseDateInput(now) || new Date();
+
+  if (!normalizedRequestedStartDateTime || normalizedMinimumNoticeMinutes === null) {
+    return true;
+  }
+
+  if (normalizedMinimumNoticeMinutes <= 0) {
+    return true;
+  }
+
+  return normalizedRequestedStartDateTime.getTime() - normalizedNow.getTime()
+    >= normalizedMinimumNoticeMinutes * 60 * 1000;
 }
 
 function deriveAcceptDeadlineAt(createdAtInput, requestedStartDateTimeInput) {
@@ -370,8 +404,10 @@ module.exports = {
   normalizeServiceStatus,
   normalizeSettlementStatus,
   normalizeDurationMinutes,
+  normalizeMinimumNoticeMinutes,
   isDurationMinutesInRange,
   deriveRequestedEndDateTime,
+  meetsMinimumNotice,
   deriveAcceptDeadlineAt,
   deriveExpiresAt,
   deriveLastMinuteWindowStartsAt,

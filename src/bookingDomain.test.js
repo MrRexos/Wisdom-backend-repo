@@ -11,8 +11,10 @@ const {
   deriveLastMinuteWindowStartsAt,
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
+  meetsMinimumNotice,
   deriveRequestedEndDateTime,
   deriveExpiresAt,
+  normalizeMinimumNoticeMinutes,
   normalizeLegacyStatusUpdate,
 } = require("./bookingDomain");
 
@@ -25,6 +27,51 @@ test("deriveRequestedEndDateTime adds duration minutes to the requested start", 
   const result = deriveRequestedEndDateTime("2026-03-29T10:00:00.000Z", 95);
   assert.ok(result instanceof Date);
   assert.equal(result.toISOString(), "2026-03-29T11:35:00.000Z");
+});
+
+test("normalizeMinimumNoticeMinutes accepts nullable and non negative values", () => {
+  assert.equal(normalizeMinimumNoticeMinutes(null), null);
+  assert.equal(normalizeMinimumNoticeMinutes(""), null);
+  assert.equal(normalizeMinimumNoticeMinutes(-5), null);
+  assert.equal(normalizeMinimumNoticeMinutes("120"), 120);
+});
+
+test("meetsMinimumNotice ignores bookings without start or without policy", () => {
+  assert.equal(
+    meetsMinimumNotice({
+      requestedStartDateTime: null,
+      minimumNoticeMinutes: 120,
+      now: "2026-03-29T10:00:00.000Z",
+    }),
+    true
+  );
+  assert.equal(
+    meetsMinimumNotice({
+      requestedStartDateTime: "2026-03-29T13:00:00.000Z",
+      minimumNoticeMinutes: null,
+      now: "2026-03-29T10:00:00.000Z",
+    }),
+    true
+  );
+});
+
+test("meetsMinimumNotice enforces the configured lead time", () => {
+  assert.equal(
+    meetsMinimumNotice({
+      requestedStartDateTime: "2026-03-29T11:59:00.000Z",
+      minimumNoticeMinutes: 120,
+      now: "2026-03-29T10:00:00.000Z",
+    }),
+    false
+  );
+  assert.equal(
+    meetsMinimumNotice({
+      requestedStartDateTime: "2026-03-29T12:00:00.000Z",
+      minimumNoticeMinutes: 120,
+      now: "2026-03-29T10:00:00.000Z",
+    }),
+    true
+  );
 });
 
 test("deriveAcceptDeadlineAt uses start datetime directly when lead time is under one hour", () => {

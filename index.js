@@ -34,10 +34,12 @@ const {
   normalizeServiceStatus,
   normalizeSettlementStatus,
   normalizeDurationMinutes,
+  normalizeMinimumNoticeMinutes,
   isDurationMinutesInRange,
   buildBookingSchedule,
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
+  meetsMinimumNotice,
   canEditBooking,
   buildTransitionPatch,
   normalizeLegacyStatusUpdate,
@@ -1669,6 +1671,156 @@ async function transitionBookingStateRecord(connection, currentBooking, {
   };
 }
 
+function canAutoExpireRequestedBooking(booking, now = new Date()) {
+  if (normalizeServiceStatus(booking?.service_status, 'pending_deposit') !== 'requested') {
+    return false;
+  }
+
+  const normalizedNow = parseDateTimeInput(now) || new Date();
+  const expiresAt = parseDateTimeInput(booking?.expires_at)
+    || buildBookingSchedule({
+      createdAt: booking?.created_at,
+      requestedStartDateTime: booking?.requested_start_datetime,
+      requestedDurationMinutes: booking?.requested_duration_minutes,
+    }).expiresAt;
+
+  if (!expiresAt) {
+    return false;
+  }
+
+  return expiresAt.getTime() <= normalizedNow.getTime();
+}
+
+function canInitiateDepositRefund(paymentRow) {
+  const normalizedPaymentStatus = String(paymentRow?.status || '').trim().toLowerCase();
+  return Boolean(paymentRow?.payment_intent_id) && normalizedPaymentStatus === 'succeeded';
+}
+
+async function triggerStripeRefundForPaymentIntent(paymentIntentId, metadata = {}) {
+  if (!paymentIntentId) {
+    return null;
+  }
+
+  return stripe.refunds.create({
+    payment_intent: paymentIntentId,
+    metadata,
+  });
+}
+
+async function transitionBookingWithOptionalDepositRefund(connection, currentBooking, {
+  nextServiceStatus,
+  nextSettlementStatus,
+  changedByUserId = null,
+  reasonCode = null,
+  note = null,
+  extraPatch = {},
+  requestDepositRefund = false,
+}) {
+  const depositPayment = requestDepositRefund
+    ? await getPaymentRow(connection, currentBooking.id, 'deposit')
+    : null;
+  const shouldRequestDepositRefund = requestDepositRefund && canInitiateDepositRefund(depositPayment);
+  const transitionResult = await transitionBookingStateRecord(connection, currentBooking, {
+    nextServiceStatus,
+    nextSettlementStatus: shouldRequestDepositRefund ? 'refund_pending' : nextSettlementStatus,
+    changedByUserId,
+    reasonCode,
+    note,
+    extraPatch,
+  });
+
+  if (shouldRequestDepositRefund) {
+    await connection.query(
+      'UPDATE payments SET status = ? WHERE id = ?',
+      ['refund_pending', depositPayment.id]
+    );
+  }
+
+  return {
+    ...transitionResult,
+    refundRequest: shouldRequestDepositRefund
+      ? {
+          bookingId: currentBooking.id,
+          paymentIntentId: depositPayment.payment_intent_id,
+          reasonCode: reasonCode || 'deposit_refund_requested',
+        }
+      : null,
+  };
+}
+
+async function expireRequestedBookingByIdIfNeeded(bookingId) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return { expired: false, refundRequested: false };
+  }
+
+  const connection = await pool.promise().getConnection();
+  let refundRequest = null;
+
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        id,
+        service_status,
+        settlement_status,
+        created_at,
+        requested_start_datetime,
+        requested_duration_minutes,
+        expires_at
+      FROM booking
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [normalizedBookingId]
+    );
+
+    if (!booking || !canAutoExpireRequestedBooking(booking)) {
+      await connection.rollback();
+      return { expired: false, refundRequested: false };
+    }
+
+    const transitionResult = await transitionBookingWithOptionalDepositRefund(connection, booking, {
+      nextServiceStatus: 'expired',
+      nextSettlementStatus: booking.settlement_status,
+      reasonCode: 'request_expired',
+      requestDepositRefund: true,
+    });
+    refundRequest = transitionResult.refundRequest;
+
+    await connection.commit();
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error expiring requested booking:', error);
+    return { expired: false, refundRequested: false, error };
+  } finally {
+    connection.release();
+  }
+
+  if (refundRequest?.paymentIntentId) {
+    try {
+      await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
+        booking_id: String(refundRequest.bookingId),
+        source: 'booking_expired',
+      });
+    } catch (refundError) {
+      console.error('Error refunding expired booking deposit:', {
+        bookingId: refundRequest.bookingId,
+        paymentIntentId: refundRequest.paymentIntentId,
+        error: refundError.message,
+      });
+    }
+  }
+
+  return {
+    expired: true,
+    refundRequested: Boolean(refundRequest?.paymentIntentId),
+  };
+}
+
 async function upsertActiveClosureProposal(connection, {
   booking,
   createdByUserId,
@@ -2805,6 +2957,33 @@ cron.schedule('0 3 * * *', async () => {
     console.log('[CRON] Limpieza de reservas pending_deposit ejecutada');
   } catch (e) {
     console.error('Error en cron cleanup:', e);
+  }
+});
+
+// cron cada 10 minutos para expirar solicitudes pendientes de aceptación
+cron.schedule('*/10 * * * *', async () => {
+  try {
+    const [rows] = await pool.promise().query(
+      `
+      SELECT id
+      FROM booking
+      WHERE service_status = 'requested'
+        AND expires_at IS NOT NULL
+        AND expires_at <= UTC_TIMESTAMP()
+      ORDER BY expires_at ASC
+      LIMIT 100
+      `
+    );
+
+    for (const row of rows || []) {
+      await expireRequestedBookingByIdIfNeeded(row.id);
+    }
+
+    if ((rows || []).length > 0) {
+      console.log(`[CRON] Expiradas ${rows.length} solicitudes de reserva`);
+    }
+  } catch (error) {
+    console.error('Error en cron de expiración de reservas:', error);
   }
 });
 
@@ -5656,6 +5835,7 @@ app.get('/api/service/:id', (req, res) => {
         s.price_consult,
         s.consult_via_id,
         s.is_individual,
+        s.minimum_notice_policy,
         s.is_hidden,
         s.service_created_datetime,
         s.last_edit_datetime,
@@ -6019,8 +6199,7 @@ app.get('/api/user/:userId/bookings', authenticateToken, async (req, res) => {
   try {
     const { status } = req.query;
     const statusFilter = buildBookingStatusFilter(status, 'b');
-    const [bookingRows] = await promisePool.query(
-      `
+    const bookingsQuery = `
       SELECT
         b.id AS booking_id,
         b.id,
@@ -6111,9 +6290,24 @@ app.get('/api/user/:userId/bookings', authenticateToken, async (req, res) => {
       )
       WHERE b.client_user_id = ?${statusFilter.clause}
       ORDER BY b.created_at DESC
-      `,
+      `;
+    let [bookingRows] = await promisePool.query(
+      bookingsQuery,
       [requestedUserId, ...statusFilter.params]
     );
+
+    const expiredBookingIds = bookingRows
+      .filter((booking) => canAutoExpireRequestedBooking(booking))
+      .map((booking) => booking.id);
+    if (expiredBookingIds.length > 0) {
+      for (const expiredBookingId of expiredBookingIds) {
+        await expireRequestedBookingByIdIfNeeded(expiredBookingId);
+      }
+      [bookingRows] = await promisePool.query(
+        bookingsQuery,
+        [requestedUserId, ...statusFilter.params]
+      );
+    }
 
     return res.status(200).json(bookingRows.map(mapBookingRecordForApi));
   } catch (error) {
@@ -6130,8 +6324,7 @@ app.get('/api/service-user/:userId/bookings', authenticateToken, async (req, res
   try {
     const { status } = req.query;
     const statusFilter = buildBookingStatusFilter(status, 'b');
-    const [bookingRows] = await promisePool.query(
-      `
+    const bookingsQuery = `
       SELECT
         b.id AS booking_id,
         b.id,
@@ -6233,9 +6426,24 @@ app.get('/api/service-user/:userId/bookings', authenticateToken, async (req, res
       )
       WHERE COALESCE(s.user_id, b.provider_user_id_snapshot) = ?${statusFilter.clause}
       ORDER BY b.created_at DESC
-      `,
+      `;
+    let [bookingRows] = await promisePool.query(
+      bookingsQuery,
       [requestedUserId, ...statusFilter.params]
     );
+
+    const expiredBookingIds = bookingRows
+      .filter((booking) => canAutoExpireRequestedBooking(booking))
+      .map((booking) => booking.id);
+    if (expiredBookingIds.length > 0) {
+      for (const expiredBookingId of expiredBookingIds) {
+        await expireRequestedBookingByIdIfNeeded(expiredBookingId);
+      }
+      [bookingRows] = await promisePool.query(
+        bookingsQuery,
+        [requestedUserId, ...statusFilter.params]
+      );
+    }
 
     return res.status(200).json(bookingRows.map(mapBookingRecordForApi));
   } catch (error) {
@@ -6272,6 +6480,7 @@ app.get('/api/user/:id/services', authenticateToken, (req, res) => {
         service.price_consult,
         service.consult_via_id,
         service.is_individual,
+        service.minimum_notice_policy,
         service.is_hidden,
         service.service_created_datetime,
         service.last_edit_datetime,
@@ -7173,7 +7382,7 @@ app.delete('/api/address/:id', (req, res) => {
 });
 
 //Crear reserva
-app.post('/api/bookings', async (req, res) => {
+app.post('/api/bookings', authenticateToken, async (req, res) => {
   const authenticatedUserId = parseRequestedUserId(req.user?.id);
   const requestedUserId = normalizeNullableInteger(req.body.client_user_id ?? req.body.user_id);
   const serviceId = normalizeNullableInteger(req.body.service_id);
@@ -7255,6 +7464,7 @@ app.post('/api/bookings', async (req, res) => {
         s.id,
         s.user_id AS provider_user_id_snapshot,
         s.service_title,
+        s.minimum_notice_policy,
         p.price,
         p.currency AS currency,
         p.price_type
@@ -7273,6 +7483,18 @@ app.post('/api/bookings', async (req, res) => {
     }
 
     const now = new Date();
+    const minimumNoticePolicyMinutes = normalizeMinimumNoticeMinutes(serviceSnapshot.minimum_notice_policy);
+    if (!meetsMinimumNotice({
+      requestedStartDateTime: parsedRequestedStartDateTime,
+      minimumNoticeMinutes: minimumNoticePolicyMinutes,
+      now,
+    })) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: `Este servicio exige una antelación mínima de ${formatLeadTimeLabel(minimumNoticePolicyMinutes)}.`,
+      });
+    }
+
     const schedule = buildBookingSchedule({
       createdAt: now,
       requestedStartDateTime: parsedRequestedStartDateTime,
@@ -7318,13 +7540,14 @@ app.post('/api/bookings', async (req, res) => {
           price_type_snapshot,
           service_currency_snapshot,
           unit_price_amount_cents_snapshot,
+          minimum_notice_policy_snapshot,
           estimated_base_amount_cents,
           estimated_commission_amount_cents,
           estimated_total_amount_cents,
           deposit_amount_cents_snapshot,
           deposit_currency_snapshot
         )
-      VALUES (?, ?, ?, ?, ?, 'pending_deposit', 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'pending_deposit', 'none', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         requestedUserId,
@@ -7342,6 +7565,7 @@ app.post('/api/bookings', async (req, res) => {
         String(serviceSnapshot.price_type || '').trim().toLowerCase() || null,
         serviceCurrency,
         unitPriceAmountCentsSnapshot,
+        minimumNoticePolicyMinutes,
         estimatedBaseAmountCents,
         estimatedCommissionAmountCents,
         estimatedTotalAmountCents,
@@ -7392,15 +7616,14 @@ app.post('/api/bookings', async (req, res) => {
 });
 
 // Obtener detalles de una reserva
-app.get('/api/bookings/:id', async (req, res) => {
+app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
   const bookingId = normalizeNullableInteger(req.params.id);
   if (!bookingId) {
     return res.status(400).json({ error: 'Id inválido.' });
   }
 
   try {
-    const [bookingRows] = await promisePool.query(
-      `
+    const bookingQuery = `
       SELECT
         b.id AS booking_id,
         b.id,
@@ -7476,12 +7699,28 @@ app.get('/api/bookings/:id', async (req, res) => {
       )
       WHERE b.id = ?
       LIMIT 1
-      `,
-      [bookingId]
-    );
+      `;
+
+    let [bookingRows] = await promisePool.query(bookingQuery, [bookingId]);
 
     if (bookingRows.length === 0) {
       return res.status(404).json({ message: 'Reserva no encontrada.' });
+    }
+
+    const booking = bookingRows[0];
+    const isClientOwner = req.user && Number(req.user.id) === Number(booking.client_user_id);
+    const isProviderOwner = req.user && Number(req.user.id) === Number(booking.provider_user_id_snapshot);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isClientOwner && !isProviderOwner && !isStaff) {
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
+
+    if (canAutoExpireRequestedBooking(booking)) {
+      await expireRequestedBookingByIdIfNeeded(bookingId);
+      [bookingRows] = await promisePool.query(bookingQuery, [bookingId]);
+      if (bookingRows.length === 0) {
+        return res.status(404).json({ message: 'Reserva no encontrada.' });
+      }
     }
 
     return res.status(200).json(mapBookingRecordForApi(bookingRows[0]));
@@ -7492,7 +7731,7 @@ app.get('/api/bookings/:id', async (req, res) => {
 });
 
 // Actualizar una reserva
-app.put('/api/bookings/:id', async (req, res) => {
+app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
   const bookingId = normalizeNullableInteger(req.params.id);
   if (!bookingId) {
     return res.status(400).json({ error: 'Id inválido.' });
@@ -7591,6 +7830,18 @@ app.put('/api/bookings/:id', async (req, res) => {
       return res.status(400).json({ error: 'No se puede reprogramar la reserva en el pasado.' });
     }
 
+    const minimumNoticePolicyMinutes = normalizeMinimumNoticeMinutes(currentBooking.minimum_notice_policy_snapshot);
+    if (!meetsMinimumNotice({
+      requestedStartDateTime,
+      minimumNoticeMinutes: minimumNoticePolicyMinutes,
+      now: new Date(),
+    })) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: `Este servicio exige una antelación mínima de ${formatLeadTimeLabel(minimumNoticePolicyMinutes)}.`,
+      });
+    }
+
     const schedule = buildBookingSchedule({
       createdAt: currentBooking.created_at,
       requestedStartDateTime,
@@ -7663,13 +7914,14 @@ app.put('/api/bookings/:id', async (req, res) => {
 });
 
 // Actualizar datos de una reserva
-app.patch('/api/bookings/:id/update-data', async (req, res) => {
+app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) => {
   const bookingId = normalizeNullableInteger(req.params.id);
   if (!bookingId) {
     return res.status(400).json({ error: 'Id inválido.' });
   }
 
   const connection = await promisePool.getConnection();
+  let refundRequest = null;
   try {
     await connection.beginTransaction();
 
@@ -7681,7 +7933,11 @@ app.patch('/api/bookings/:id/update-data', async (req, res) => {
         b.provider_user_id_snapshot,
         b.service_status,
         b.settlement_status,
+        b.created_at,
+        b.requested_start_datetime,
         b.requested_duration_minutes,
+        b.expires_at,
+        b.accepted_at,
         b.price_type_snapshot,
         b.service_currency_snapshot,
         b.unit_price_amount_cents_snapshot,
@@ -7707,6 +7963,34 @@ app.patch('/api/bookings/:id/update-data', async (req, res) => {
     if (!isClientOwner && !isProviderOwner && !isStaff) {
       await connection.rollback();
       return res.status(403).json({ error: 'No autorizado.' });
+    }
+
+    if (canAutoExpireRequestedBooking(booking)) {
+      const expiredTransition = await transitionBookingWithOptionalDepositRefund(connection, booking, {
+        nextServiceStatus: 'expired',
+        nextSettlementStatus: booking.settlement_status,
+        reasonCode: 'request_expired',
+        requestDepositRefund: true,
+      });
+      refundRequest = expiredTransition.refundRequest;
+      await connection.commit();
+
+      if (refundRequest?.paymentIntentId) {
+        try {
+          await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
+            booking_id: String(refundRequest.bookingId),
+            source: 'booking_expired',
+          });
+        } catch (refundError) {
+          console.error('Error refunding expired booking deposit during status update:', {
+            bookingId: refundRequest.bookingId,
+            paymentIntentId: refundRequest.paymentIntentId,
+            error: refundError.message,
+          });
+        }
+      }
+
+      return res.status(409).json({ error: 'La solicitud ha expirado.' });
     }
 
     const mappedLegacyStatus = typeof req.body.status !== 'undefined'
@@ -7763,6 +8047,17 @@ app.patch('/api/bookings/:id/update-data', async (req, res) => {
       && Object.prototype.hasOwnProperty.call(extraPatch, 'cancellation_reason_code')
     ) {
       extraPatch.cancellation_reason_code = null;
+    }
+
+    const normalizedCurrentServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
+    const normalizedNextServiceStatus = normalizeServiceStatus(nextServiceStatus, booking.service_status);
+    if (normalizedNextServiceStatus === 'canceled') {
+      extraPatch.canceled_by_user_id = req.user?.id || null;
+      if (!extraPatch.cancellation_reason_code && normalizedCurrentServiceStatus === 'requested') {
+        extraPatch.cancellation_reason_code = isClientOwner
+          ? 'client_canceled_request'
+          : 'provider_canceled_request';
+      }
     }
 
     const bookingCurrency = normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR');
@@ -7824,13 +8119,17 @@ app.patch('/api/bookings/:id/update-data', async (req, res) => {
       }
     }
 
-    const transitionResult = await transitionBookingStateRecord(connection, booking, {
+    const shouldRequestDepositRefund = normalizedCurrentServiceStatus === 'requested'
+      && (normalizedNextServiceStatus === 'canceled' || normalizedNextServiceStatus === 'expired');
+    const transitionResult = await transitionBookingWithOptionalDepositRefund(connection, booking, {
       nextServiceStatus,
       nextSettlementStatus,
       changedByUserId: req.user?.id || null,
       reasonCode: typeof req.body.status === 'string' ? String(req.body.status).trim().toLowerCase() : null,
       extraPatch,
+      requestDepositRefund: shouldRequestDepositRefund,
     });
+    refundRequest = transitionResult.refundRequest;
 
     if (!transitionResult.changed && Object.keys(transitionResult.appliedPatch || {}).length === 0) {
       await connection.rollback();
@@ -7838,6 +8137,22 @@ app.patch('/api/bookings/:id/update-data', async (req, res) => {
     }
 
     await connection.commit();
+
+    if (refundRequest?.paymentIntentId) {
+      try {
+        await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
+          booking_id: String(refundRequest.bookingId),
+          source: normalizedNextServiceStatus === 'expired' ? 'booking_expired' : 'booking_canceled',
+        });
+      } catch (refundError) {
+        console.error('Error refunding booking deposit after state update:', {
+          bookingId: refundRequest.bookingId,
+          paymentIntentId: refundRequest.paymentIntentId,
+          error: refundError.message,
+        });
+      }
+    }
+
     return res.status(200).json({ message: 'Estado actualizado' });
   } catch (error) {
     try { await connection.rollback(); } catch {}
@@ -7849,7 +8164,7 @@ app.patch('/api/bookings/:id/update-data', async (req, res) => {
 });
 
 // Actualizar el pago de una reserva
-app.patch('/api/bookings/:id/is_paid', async (req, res) => {
+app.patch('/api/bookings/:id/is_paid', authenticateToken, async (req, res) => {
   if (typeof req.body.is_paid === 'undefined') {
     return res.status(400).json({ error: 'is_paid es requerido.' });
   }
@@ -8697,11 +9012,35 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
 
     // Helpers de redondeo como en el front
     const round1 = (x) => Number((Math.round(Number(x) * 10) / 10).toFixed(1));
-    const round2 = (n) => {
-      const x = Number(n);
-      if (!Number.isFinite(x)) return 0;
-      return Math.round((x + Number.EPSILON) * 100) / 100;
-    };
+const round2 = (n) => {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round((x + Number.EPSILON) * 100) / 100;
+};
+
+function formatLeadTimeLabel(minutes) {
+  const normalizedMinutes = normalizeMinimumNoticeMinutes(minutes);
+  if (normalizedMinutes === null || normalizedMinutes <= 0) {
+    return null;
+  }
+
+  if (normalizedMinutes % (7 * 24 * 60) === 0) {
+    const weeks = normalizedMinutes / (7 * 24 * 60);
+    return weeks === 1 ? '1 semana' : `${weeks} semanas`;
+  }
+
+  if (normalizedMinutes % (24 * 60) === 0) {
+    const days = normalizedMinutes / (24 * 60);
+    return days === 1 ? '24 horas' : `${days} días`;
+  }
+
+  if (normalizedMinutes % 60 === 0) {
+    const hours = normalizedMinutes / 60;
+    return hours === 1 ? '1 hora' : `${hours} horas`;
+  }
+
+  return normalizedMinutes === 1 ? '1 minuto' : `${normalizedMinutes} minutos`;
+}
 
     // Duración efectiva
     const storedDurationMin = Number.isFinite(Number(booking.service_duration)) ? Number(booking.service_duration) : null;
