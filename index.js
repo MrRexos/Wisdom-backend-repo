@@ -1462,9 +1462,18 @@ function mapBookingRecordForApi(row = {}) {
   const requestedStartDateTime = row.requested_start_datetime ?? row.booking_start_datetime ?? null;
   const requestedEndDateTime = row.requested_end_datetime ?? row.booking_end_datetime ?? null;
   const requestedDurationMinutes = row.requested_duration_minutes ?? row.service_duration ?? null;
+  const normalizedClosureStatus = typeof row.closure_status === 'string'
+    ? row.closure_status.trim().toLowerCase()
+    : null;
+  const closureProposalId = row.closure_proposal_id ?? null;
   const closureTotalAmountCents = row.proposed_total_amount_cents ?? row.closure_proposed_total_amount_cents ?? null;
   const closureCommissionAmountCents = row.proposed_commission_amount_cents ?? row.closure_proposed_commission_amount_cents ?? null;
   const closureBaseAmountCents = row.proposed_base_amount_cents ?? row.closure_proposed_base_amount_cents ?? null;
+  const closureDepositAlreadyPaidAmountCents = row.deposit_already_paid_amount_cents ?? row.closure_deposit_already_paid_amount_cents ?? row.deposit_amount_cents_snapshot ?? null;
+  const closureAmountDueFromClientCents = row.amount_due_from_client_cents ?? row.closure_amount_due_from_client_cents ?? null;
+  const closureAmountToRefundCents = row.amount_to_refund_cents ?? row.closure_amount_to_refund_cents ?? null;
+  const closureProviderPayoutAmountCents = row.provider_payout_amount_cents ?? row.closure_provider_payout_amount_cents ?? null;
+  const closurePlatformAmountCents = row.platform_amount_cents ?? row.closure_platform_amount_cents ?? null;
   const estimatedTotalPrice = row.estimated_total_amount_cents !== null && row.estimated_total_amount_cents !== undefined
     ? fromMinorUnits(row.estimated_total_amount_cents, serviceCurrency)
     : null;
@@ -1483,11 +1492,28 @@ function mapBookingRecordForApi(row = {}) {
   const closureBasePrice = closureBaseAmountCents !== null && closureBaseAmountCents !== undefined
     ? fromMinorUnits(closureBaseAmountCents, serviceCurrency)
     : null;
-  const hasActiveClosureProposal = row.closure_proposal_id !== null
-    && row.closure_proposal_id !== undefined;
+  const closureDepositAlreadyPaid = closureDepositAlreadyPaidAmountCents !== null && closureDepositAlreadyPaidAmountCents !== undefined
+    ? fromMinorUnits(closureDepositAlreadyPaidAmountCents, serviceCurrency)
+    : null;
+  const closureAmountDueFromClient = closureAmountDueFromClientCents !== null && closureAmountDueFromClientCents !== undefined
+    ? fromMinorUnits(closureAmountDueFromClientCents, serviceCurrency)
+    : null;
+  const closureAmountToRefund = closureAmountToRefundCents !== null && closureAmountToRefundCents !== undefined
+    ? fromMinorUnits(closureAmountToRefundCents, serviceCurrency)
+    : null;
+  const closureProviderPayoutAmount = closureProviderPayoutAmountCents !== null && closureProviderPayoutAmountCents !== undefined
+    ? fromMinorUnits(closureProviderPayoutAmountCents, serviceCurrency)
+    : null;
+  const closurePlatformAmount = closurePlatformAmountCents !== null && closurePlatformAmountCents !== undefined
+    ? fromMinorUnits(closurePlatformAmountCents, serviceCurrency)
+    : null;
+  const hasActiveClosureProposal = normalizedClosureStatus
+    ? normalizedClosureStatus === 'active'
+    : closureProposalId !== null && closureProposalId !== undefined;
   const hasOpenIssueReport = row.open_issue_report_id !== null
     && row.open_issue_report_id !== undefined;
-  const needsClosureInput = normalizedServiceStatus === 'finished'
+  const needsClosureInput = (normalizedServiceStatus === 'finished' || normalizedServiceStatus === 'in_progress')
+    && normalizedSettlementStatus === 'none'
     && ['hour', 'budget'].includes(effectivePriceType)
     && !hasActiveClosureProposal;
 
@@ -1546,10 +1572,22 @@ function mapBookingRecordForApi(row = {}) {
     estimated_total_price: estimatedTotalPrice,
     estimated_commission: estimatedCommission,
     estimated_base_price: estimatedBasePrice,
+    closure_proposal_id: closureProposalId,
+    closure_status: normalizedClosureStatus,
+    closure_sent_at: row.closure_sent_at ?? null,
+    closure_accepted_at: row.closure_accepted_at ?? null,
+    closure_rejected_at: row.closure_rejected_at ?? null,
+    closure_revoked_at: row.closure_revoked_at ?? null,
     closure_total_price: closureTotalPrice,
     closure_commission: closureCommission,
     closure_base_price: closureBasePrice,
+    closure_deposit_already_paid: closureDepositAlreadyPaid,
+    closure_amount_due_from_client: closureAmountDueFromClient,
+    closure_amount_to_refund: closureAmountToRefund,
+    closure_provider_payout_amount: closureProviderPayoutAmount,
+    closure_platform_amount: closurePlatformAmount,
     closure_final_duration_minutes: row.proposed_final_duration_minutes ?? null,
+    closure_zero_charge_mode: row.zero_charge_mode === true || row.zero_charge_mode === 1,
     has_active_closure_proposal: hasActiveClosureProposal,
     has_open_issue_report: hasOpenIssueReport,
     needs_closure_input: needsClosureInput,
@@ -2058,6 +2096,76 @@ async function upsertActiveClosureProposal(connection, {
   );
 
   return insertResult.insertId;
+}
+
+const CLIENT_APPROVAL_DEADLINE_MS = 48 * 60 * 60 * 1000;
+
+function buildClientApprovalDeadline(now = new Date()) {
+  const normalizedNow = parseDateTimeInput(now) || new Date();
+  return new Date(normalizedNow.getTime() + CLIENT_APPROVAL_DEADLINE_MS);
+}
+
+async function getLatestClosureProposal(connection, bookingId, { forUpdate = false } = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return null;
+  }
+
+  const [rows] = await connection.query(
+    `
+    SELECT
+      id,
+      booking_id,
+      status,
+      price_type_snapshot,
+      proposed_base_amount_cents,
+      proposed_commission_amount_cents,
+      proposed_total_amount_cents,
+      proposed_final_duration_minutes,
+      deposit_already_paid_amount_cents,
+      amount_due_from_client_cents,
+      amount_to_refund_cents,
+      provider_payout_amount_cents,
+      platform_amount_cents,
+      zero_charge_mode,
+      sent_at,
+      accepted_at,
+      rejected_at,
+      revoked_at
+    FROM booking_closure_proposal
+    WHERE booking_id = ?
+    ORDER BY id DESC
+    LIMIT 1
+    ${forUpdate ? 'FOR UPDATE' : ''}
+    `,
+    [normalizedBookingId]
+  );
+
+  return rows[0] || null;
+}
+
+async function updateClosureProposalStatus(connection, proposalId, nextStatus, now = new Date()) {
+  const normalizedProposalId = normalizeNullableInteger(proposalId);
+  if (!normalizedProposalId) {
+    return;
+  }
+
+  const normalizedNow = parseDateTimeInput(now) || new Date();
+  const acceptedAt = nextStatus === 'accepted' ? toDbDateTime(normalizedNow) : null;
+  const rejectedAt = nextStatus === 'rejected' ? toDbDateTime(normalizedNow) : null;
+  const revokedAt = nextStatus === 'revoked' ? toDbDateTime(normalizedNow) : null;
+
+  await connection.query(
+    `
+    UPDATE booking_closure_proposal
+    SET status = ?,
+        accepted_at = ?,
+        rejected_at = ?,
+        revoked_at = ?
+    WHERE id = ?
+    `,
+    [nextStatus, acceptedAt, rejectedAt, revokedAt, normalizedProposalId]
+  );
 }
 
 // Garantiza un Customer y lo persiste en user_account.stripe_customer_id
@@ -6231,7 +6339,7 @@ app.get('/api/service/:id', (req, res) => {
          LEFT JOIN booking_closure_proposal cp ON cp.id = (
            SELECT cp2.id
            FROM booking_closure_proposal cp2
-           WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+           WHERE cp2.booking_id = b.id
            ORDER BY cp2.id DESC
            LIMIT 1
          )
@@ -6508,10 +6616,22 @@ app.get('/api/user/:userId/bookings', authenticateToken, async (req, res) => {
         b.estimated_total_amount_cents,
         b.deposit_amount_cents_snapshot,
         b.deposit_currency_snapshot,
+        cp.id AS closure_proposal_id,
         cp.proposed_base_amount_cents,
         cp.proposed_commission_amount_cents,
         cp.proposed_total_amount_cents,
+        cp.proposed_final_duration_minutes,
         cp.status AS closure_status,
+        cp.deposit_already_paid_amount_cents,
+        cp.amount_due_from_client_cents,
+        cp.amount_to_refund_cents,
+        cp.provider_payout_amount_cents,
+        cp.platform_amount_cents,
+        cp.zero_charge_mode,
+        cp.sent_at AS closure_sent_at,
+        cp.accepted_at AS closure_accepted_at,
+        cp.rejected_at AS closure_rejected_at,
+        cp.revoked_at AS closure_revoked_at,
         s.id AS service_id,
         COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
         s.description,
@@ -6554,7 +6674,7 @@ app.get('/api/user/:userId/bookings', authenticateToken, async (req, res) => {
       LEFT JOIN booking_closure_proposal cp ON cp.id = (
         SELECT cp2.id
         FROM booking_closure_proposal cp2
-        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        WHERE cp2.booking_id = b.id
         ORDER BY cp2.id DESC
         LIMIT 1
       )
@@ -6634,10 +6754,22 @@ app.get('/api/service-user/:userId/bookings', authenticateToken, async (req, res
         b.estimated_total_amount_cents,
         b.deposit_amount_cents_snapshot,
         b.deposit_currency_snapshot,
+        cp.id AS closure_proposal_id,
         cp.proposed_base_amount_cents,
         cp.proposed_commission_amount_cents,
         cp.proposed_total_amount_cents,
+        cp.proposed_final_duration_minutes,
         cp.status AS closure_status,
+        cp.deposit_already_paid_amount_cents,
+        cp.amount_due_from_client_cents,
+        cp.amount_to_refund_cents,
+        cp.provider_payout_amount_cents,
+        cp.platform_amount_cents,
+        cp.zero_charge_mode,
+        cp.sent_at AS closure_sent_at,
+        cp.accepted_at AS closure_accepted_at,
+        cp.rejected_at AS closure_rejected_at,
+        cp.revoked_at AS closure_revoked_at,
         s.id AS service_id,
         COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
         s.description,
@@ -6691,7 +6823,7 @@ app.get('/api/service-user/:userId/bookings', authenticateToken, async (req, res
       LEFT JOIN booking_closure_proposal cp ON cp.id = (
         SELECT cp2.id
         FROM booking_closure_proposal cp2
-        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        WHERE cp2.booking_id = b.id
         ORDER BY cp2.id DESC
         LIMIT 1
       )
@@ -7941,6 +8073,16 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         cp.proposed_commission_amount_cents,
         cp.proposed_total_amount_cents,
         cp.proposed_final_duration_minutes,
+        cp.deposit_already_paid_amount_cents,
+        cp.amount_due_from_client_cents,
+        cp.amount_to_refund_cents,
+        cp.provider_payout_amount_cents,
+        cp.platform_amount_cents,
+        cp.zero_charge_mode,
+        cp.sent_at AS closure_sent_at,
+        cp.accepted_at AS closure_accepted_at,
+        cp.rejected_at AS closure_rejected_at,
+        cp.revoked_at AS closure_revoked_at,
         bir.id AS open_issue_report_id,
         bir.issue_type AS open_issue_type,
         bir.status AS open_issue_status,
@@ -7970,7 +8112,7 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
       LEFT JOIN booking_closure_proposal cp ON cp.id = (
         SELECT cp2.id
         FROM booking_closure_proposal cp2
-        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        WHERE cp2.booking_id = b.id
         ORDER BY cp2.id DESC
         LIMIT 1
       )
@@ -8493,6 +8635,330 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
     }
     console.error('Error al actualizar el estado de la reserva:', error);
     return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        id,
+        client_user_id,
+        provider_user_id_snapshot,
+        service_status,
+        settlement_status,
+        requested_start_datetime,
+        requested_end_datetime,
+        requested_duration_minutes,
+        price_type_snapshot,
+        service_currency_snapshot,
+        unit_price_amount_cents_snapshot,
+        estimated_base_amount_cents,
+        estimated_commission_amount_cents,
+        estimated_total_amount_cents,
+        deposit_amount_cents_snapshot
+      FROM booking
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const isProviderOwner = req.user && Number(req.user.id) === Number(booking.provider_user_id_snapshot);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isProviderOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo el profesional puede enviar la propuesta de cierre.' });
+    }
+
+    const normalizedServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
+    const normalizedSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+    if (normalizedServiceStatus !== 'in_progress') {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Solo se puede cerrar una reserva en progreso.' });
+    }
+    if (['pending_client_approval', 'awaiting_payment', 'paid', 'in_dispute', 'manual_review_required'].includes(normalizedSettlementStatus)) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'La reserva ya tiene un cierre en curso.' });
+    }
+
+    const latestProposal = await getLatestClosureProposal(connection, bookingId, { forUpdate: true });
+    if (latestProposal?.status === 'active') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Ya existe una propuesta de cierre activa.' });
+    }
+
+    const bookingCurrency = normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR');
+    const priceTypeSnapshot = String(booking.price_type_snapshot || '').trim().toLowerCase();
+    const unitPriceAmount = booking.unit_price_amount_cents_snapshot == null
+      ? 0
+      : fromMinorUnits(booking.unit_price_amount_cents_snapshot, bookingCurrency);
+    const zeroChargeMode = req.body?.zero_charge_mode === true || req.body?.zero_charge_mode === 1;
+
+    let proposedBaseAmountCents = 0;
+    let proposedFinalDurationMinutes = null;
+
+    if (!zeroChargeMode) {
+      if (priceTypeSnapshot === 'hour') {
+        proposedFinalDurationMinutes = normalizeDurationMinutes(
+          req.body?.proposed_final_duration_minutes
+          ?? req.body?.service_duration
+          ?? req.body?.requested_duration_minutes
+          ?? booking.requested_duration_minutes
+        );
+
+        if (!isDurationMinutesInRange(proposedFinalDurationMinutes)) {
+          await connection.rollback();
+          return res.status(400).json({
+            error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
+          });
+        }
+
+        const hourlyPricing = computeBookingPricingSnapshot({
+          priceType: 'hour',
+          unitPrice: unitPriceAmount,
+          durationMinutes: proposedFinalDurationMinutes,
+          currency: bookingCurrency,
+        });
+        proposedBaseAmountCents = toMinorUnits(hourlyPricing.base, bookingCurrency);
+      } else if (priceTypeSnapshot === 'budget') {
+        const proposedBudgetBase = Number(req.body?.proposed_final_price ?? req.body?.final_price);
+        if (!Number.isFinite(proposedBudgetBase) || proposedBudgetBase < 0) {
+          await connection.rollback();
+          return res.status(400).json({ error: 'final_price inválido.' });
+        }
+        proposedBaseAmountCents = toMinorUnits(proposedBudgetBase, bookingCurrency);
+      } else {
+        const fallbackPricing = computeBookingPricingSnapshot({
+          priceType: priceTypeSnapshot === 'budget' ? 'budget' : 'fix',
+          unitPrice: unitPriceAmount,
+          durationMinutes: booking.requested_duration_minutes || 0,
+          currency: bookingCurrency,
+        });
+        proposedBaseAmountCents = Number(
+          booking.estimated_base_amount_cents
+          ?? toMinorUnits(fallbackPricing.base, bookingCurrency)
+          ?? 0
+        );
+      }
+    }
+
+    const proposalId = await upsertActiveClosureProposal(connection, {
+      booking: {
+        ...booking,
+        id: bookingId,
+      },
+      createdByUserId: req.user?.id || null,
+      proposedBaseAmountCents,
+      proposedFinalDurationMinutes,
+      zeroChargeMode,
+    });
+
+    await transitionBookingStateRecord(connection, booking, {
+      nextSettlementStatus: 'pending_client_approval',
+      changedByUserId: req.user?.id || null,
+      reasonCode: 'closure_proposal_sent',
+      extraPatch: {
+        client_approval_deadline_at: buildClientApprovalDeadline(),
+      },
+    });
+
+    await connection.commit();
+    return res.status(200).json({
+      message: 'Propuesta de cierre enviada.',
+      closure_proposal_id: proposalId,
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al crear la propuesta de cierre:', error);
+    return res.status(500).json({ error: 'Error al crear la propuesta de cierre.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/bookings/:id/closure-proposal/revoke', authenticateToken, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        id,
+        client_user_id,
+        provider_user_id_snapshot,
+        service_status,
+        settlement_status
+      FROM booking
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const isProviderOwner = req.user && Number(req.user.id) === Number(booking.provider_user_id_snapshot);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isProviderOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo el profesional puede revocar esta propuesta.' });
+    }
+
+    const latestProposal = await getLatestClosureProposal(connection, bookingId, { forUpdate: true });
+    if (!latestProposal || latestProposal.status !== 'active') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'No hay ninguna propuesta activa para revocar.' });
+    }
+
+    if (normalizeSettlementStatus(booking.settlement_status, 'none') !== 'pending_client_approval') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'La propuesta ya no puede revocarse.' });
+    }
+
+    await updateClosureProposalStatus(connection, latestProposal.id, 'revoked', new Date());
+    await transitionBookingStateRecord(connection, booking, {
+      nextServiceStatus: 'in_progress',
+      nextSettlementStatus: 'none',
+      changedByUserId: req.user?.id || null,
+      reasonCode: 'closure_proposal_revoked',
+      extraPatch: {
+        client_approval_deadline_at: null,
+      },
+    });
+
+    await connection.commit();
+    return res.status(200).json({ message: 'Propuesta de cierre anulada.' });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al revocar la propuesta de cierre:', error);
+    return res.status(500).json({ error: 'Error al revocar la propuesta de cierre.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/bookings/:id/dispute', authenticateToken, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        id,
+        client_user_id,
+        provider_user_id_snapshot,
+        service_status,
+        settlement_status
+      FROM booking
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const isClientOwner = req.user && Number(req.user.id) === Number(booking.client_user_id);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isClientOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo el cliente puede abrir una disputa de cierre.' });
+    }
+
+    const normalizedSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+    if (!['pending_client_approval', 'awaiting_payment'].includes(normalizedSettlementStatus)) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'La reserva no está en un estado disputable.' });
+    }
+
+    const latestProposal = await getLatestClosureProposal(connection, bookingId, { forUpdate: true });
+    if (normalizedSettlementStatus === 'pending_client_approval') {
+      if (!latestProposal || latestProposal.status !== 'active') {
+        await connection.rollback();
+        return res.status(409).json({ error: 'La propuesta de cierre ya no está disponible.' });
+      }
+      await updateClosureProposalStatus(connection, latestProposal.id, 'rejected', new Date());
+    }
+
+    const disputeDetails = typeof req.body?.details === 'string' && req.body.details.trim()
+      ? req.body.details.trim()
+      : 'Client requested manual review for the closure proposal.';
+    const reportedAgainstUserId = Number.isInteger(Number(booking.provider_user_id_snapshot))
+      ? Number(booking.provider_user_id_snapshot)
+      : null;
+
+    const [insertResult] = await connection.query(
+      `
+      INSERT INTO booking_issue_report
+        (booking_id, reported_by_user_id, reported_against_user_id, issue_type, status, details)
+      VALUES (?, ?, ?, 'payment_dispute', 'open', ?)
+      `,
+      [bookingId, req.user?.id || null, reportedAgainstUserId, disputeDetails]
+    );
+
+    await transitionBookingStateRecord(connection, booking, {
+      nextServiceStatus: 'finished',
+      nextSettlementStatus: 'in_dispute',
+      changedByUserId: req.user?.id || null,
+      reasonCode: 'payment_dispute_opened',
+      extraPatch: {
+        client_approval_deadline_at: null,
+      },
+    });
+
+    await connection.commit();
+    return res.status(201).json({
+      message: 'Disputa abierta.',
+      issue_report: {
+        id: insertResult.insertId,
+        booking_id: bookingId,
+        issue_type: 'payment_dispute',
+        status: 'open',
+        details: disputeDetails,
+      },
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al abrir la disputa de la reserva:', error);
+    return res.status(500).json({ error: 'Error al abrir la disputa.' });
   } finally {
     connection.release();
   }
@@ -9422,7 +9888,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
       LEFT JOIN booking_closure_proposal cp ON cp.id = (
         SELECT cp2.id
         FROM booking_closure_proposal cp2
-        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        WHERE cp2.booking_id = b.id
         ORDER BY cp2.id DESC
         LIMIT 1
       )
@@ -9892,10 +10358,16 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
              b.estimated_commission_amount_cents,
              b.estimated_total_amount_cents,
              b.deposit_amount_cents_snapshot,
+             b.client_approval_deadline_at,
+             cp.id AS closure_proposal_id,
+             cp.status AS closure_status,
              cp.proposed_base_amount_cents,
              cp.proposed_commission_amount_cents,
              cp.proposed_total_amount_cents,
              cp.proposed_final_duration_minutes,
+             cp.amount_due_from_client_cents,
+             cp.amount_to_refund_cents,
+             cp.zero_charge_mode,
              cust.email AS customer_email, cust.stripe_customer_id AS customer_id, cust.currency AS customer_currency,
              provider.stripe_account_id,
              p.price AS unit_price,
@@ -9909,7 +10381,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       LEFT JOIN booking_closure_proposal cp ON cp.id = (
         SELECT cp2.id
         FROM booking_closure_proposal cp2
-        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        WHERE cp2.booking_id = b.id
         ORDER BY cp2.id DESC
         LIMIT 1
       )
@@ -9986,6 +10458,45 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       depositPayment?.currency,
       normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
     );
+    const normalizedServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
+    let normalizedSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+    const hasClosureProposal = booking.closure_proposal_id !== null && booking.closure_proposal_id !== undefined;
+    const isLegacyFinishedFlow = normalizedServiceStatus === 'finished' && !hasClosureProposal;
+
+    if (normalizedSettlementStatus === 'pending_client_approval') {
+      if (!hasClosureProposal || booking.closure_status !== 'active') {
+        await connection.rollback();
+        return res.status(409).json({ error: 'La propuesta de cierre ya no está disponible.' });
+      }
+
+      await updateClosureProposalStatus(
+        connection,
+        booking.closure_proposal_id,
+        'accepted',
+        new Date()
+      );
+      await transitionBookingStateRecord(connection, booking, {
+        nextServiceStatus: 'finished',
+        nextSettlementStatus: 'awaiting_payment',
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'closure_proposal_accepted',
+        extraPatch: {
+          client_approval_deadline_at: null,
+        },
+      });
+
+      booking = {
+        ...booking,
+        service_status: 'finished',
+        settlement_status: 'awaiting_payment',
+        client_approval_deadline_at: null,
+        closure_status: 'accepted',
+      };
+      normalizedSettlementStatus = 'awaiting_payment';
+    } else if (normalizedSettlementStatus !== 'awaiting_payment' && !isLegacyFinishedFlow) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'La reserva no está lista para el pago final.' });
+    }
 
     // Comprobar si ya hay cobro final existente en curso o realizado y devolver la info útil en vez de 409
     const [existingFinal] = await connection.query(
@@ -10592,7 +11103,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       LEFT JOIN booking_closure_proposal cp ON cp.id = (
         SELECT cp2.id
         FROM booking_closure_proposal cp2
-        WHERE cp2.booking_id = b.id AND cp2.status = 'active'
+        WHERE cp2.booking_id = b.id
         ORDER BY cp2.id DESC
         LIMIT 1
       )
