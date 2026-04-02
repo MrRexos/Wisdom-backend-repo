@@ -41,7 +41,7 @@
 - `description` (TEXT, NULL)
 - `service_status` (ENUM('pending_deposit','requested','accepted','in_progress','finished','canceled','expired'), NOT NULL, DEFAULT pending_deposit)
 - `settlement_status` (ENUM('none','pending_client_approval','awaiting_payment','paid','refund_pending','partially_refunded','refunded','payment_failed','manual_review_required','in_dispute'), NOT NULL, DEFAULT none)
-- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `order_datetime` (DATETIME, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
 - `updated_at` (DATETIME, DEFAULT_GENERATED on update CURRENT_TIMESTAMP, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
 - `requested_start_datetime` (DATETIME, NULL)
 - `requested_duration_minutes` (INT, NULL)
@@ -70,6 +70,7 @@
 - `selected_customer_payment_method_id` (INT, FK -> payment_method.id, NULL)
 - `deposit_amount_cents_snapshot` (INT, NULL)
 - `deposit_currency_snapshot` (CHAR(3), NULL)
+- `updated_at` (DATETIME, NOT NULL, DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)
 
 ## Tabla: `booking_change_request`
 - `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
@@ -273,6 +274,7 @@
 - `price_consult` (DECIMAL(8,2), NULL)
 - `consult_via_id` (INT, FK -> consult_via.id, NULL)
 - `is_individual` (TINYINT(1), NOT NULL)
+- `minimum_notice_policy` (INT, NULL)
 - `allow_discounts` (TINYINT(1), NOT NULL, DEFAULT 1)
 - `discount_rate` (INT, NULL, DEFAULT 10)
 - `hobbies` (TEXT, NULL)

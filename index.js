@@ -1679,7 +1679,7 @@ function canAutoExpireRequestedBooking(booking, now = new Date()) {
   const normalizedNow = parseDateTimeInput(now) || new Date();
   const expiresAt = parseDateTimeInput(booking?.expires_at)
     || buildBookingSchedule({
-      createdAt: booking?.created_at,
+      createdAt: booking?.order_datetime ?? booking?.created_at,
       requestedStartDateTime: booking?.requested_start_datetime,
       requestedDurationMinutes: booking?.requested_duration_minutes,
     }).expiresAt;
@@ -1766,7 +1766,8 @@ async function expireRequestedBookingByIdIfNeeded(bookingId) {
         id,
         service_status,
         settlement_status,
-        created_at,
+        order_datetime AS created_at,
+        order_datetime,
         requested_start_datetime,
         requested_duration_minutes,
         expires_at
@@ -2951,7 +2952,7 @@ cron.schedule('0 3 * * *', async () => {
       LEFT JOIN payments p
         ON p.booking_id = b.id AND p.type = 'deposit'
       WHERE b.service_status = 'pending_deposit'
-        AND b.created_at < (NOW() - INTERVAL 24 HOUR)
+        AND b.order_datetime < (NOW() - INTERVAL 24 HOUR)
         AND (p.id IS NULL OR p.status IN ('requires_payment_method','canceled','payment_failed'));
     `);
     console.log('[CRON] Limpieza de reservas pending_deposit ejecutada');
@@ -6210,7 +6211,8 @@ app.get('/api/user/:userId/bookings', authenticateToken, async (req, res) => {
         b.description,
         b.service_status,
         b.settlement_status,
-        b.created_at,
+        b.order_datetime AS created_at,
+        b.order_datetime,
         b.updated_at,
         b.requested_start_datetime,
         b.requested_duration_minutes,
@@ -6289,7 +6291,7 @@ app.get('/api/user/:userId/bookings', authenticateToken, async (req, res) => {
         LIMIT 1
       )
       WHERE b.client_user_id = ?${statusFilter.clause}
-      ORDER BY b.created_at DESC
+      ORDER BY b.order_datetime DESC
       `;
     let [bookingRows] = await promisePool.query(
       bookingsQuery,
@@ -6335,7 +6337,8 @@ app.get('/api/service-user/:userId/bookings', authenticateToken, async (req, res
         b.description,
         b.service_status,
         b.settlement_status,
-        b.created_at,
+        b.order_datetime AS created_at,
+        b.order_datetime,
         b.updated_at,
         b.requested_start_datetime,
         b.requested_duration_minutes,
@@ -6425,7 +6428,7 @@ app.get('/api/service-user/:userId/bookings', authenticateToken, async (req, res
         LIMIT 1
       )
       WHERE COALESCE(s.user_id, b.provider_user_id_snapshot) = ?${statusFilter.clause}
-      ORDER BY b.created_at DESC
+      ORDER BY b.order_datetime DESC
       `;
     let [bookingRows] = await promisePool.query(
       bookingsQuery,
@@ -7634,7 +7637,8 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         b.description,
         b.service_status,
         b.settlement_status,
-        b.created_at,
+        b.order_datetime AS created_at,
+        b.order_datetime,
         b.updated_at,
         b.requested_start_datetime,
         b.requested_duration_minutes,
@@ -7749,7 +7753,8 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
         b.provider_user_id_snapshot,
         b.service_status,
         b.settlement_status,
-        b.created_at,
+        b.order_datetime AS created_at,
+        b.order_datetime,
         b.requested_start_datetime,
         b.requested_duration_minutes,
         b.requested_end_datetime,
@@ -7843,7 +7848,7 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
     }
 
     const schedule = buildBookingSchedule({
-      createdAt: currentBooking.created_at,
+      createdAt: currentBooking.order_datetime ?? currentBooking.created_at,
       requestedStartDateTime,
       requestedDurationMinutes,
     });
@@ -7933,7 +7938,8 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
         b.provider_user_id_snapshot,
         b.service_status,
         b.settlement_status,
-        b.created_at,
+        b.order_datetime AS created_at,
+        b.order_datetime,
         b.requested_start_datetime,
         b.requested_duration_minutes,
         b.expires_at,

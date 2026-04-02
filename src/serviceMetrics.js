@@ -992,7 +992,8 @@ async function computeServiceSuccessRate({
         LOWER(b.settlement_status) AS settlement_status,
         b.requested_start_datetime,
         b.requested_end_datetime,
-        b.created_at,
+        b.order_datetime AS created_at,
+        b.order_datetime,
         b.estimated_total_amount_cents,
         b.estimated_commission_amount_cents,
         cp.proposed_total_amount_cents,
@@ -1019,7 +1020,7 @@ async function computeServiceSuccessRate({
         AND (
           (b.requested_end_datetime IS NOT NULL AND b.requested_end_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
           (b.requested_start_datetime IS NOT NULL AND b.requested_start_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY)) OR
-          (b.created_at IS NOT NULL AND b.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY))
+          (b.order_datetime IS NOT NULL AND b.order_datetime >= DATE_SUB(NOW(), INTERVAL ? DAY))
         )
     `,
     [resolvedCategoryId, RETENTION_WINDOW_DAYS, RETENTION_WINDOW_DAYS, RETENTION_WINDOW_DAYS],
@@ -1087,7 +1088,7 @@ async function computeServiceSuccessRate({
 
     const endDate = ensureDate(row.requested_end_datetime);
     const startDate = ensureDate(row.requested_start_datetime);
-    const orderDate = ensureDate(row.created_at);
+    const orderDate = ensureDate(row.order_datetime ?? row.created_at);
     const eventDate = endDate || startDate || orderDate;
     if (!eventDate) continue;
 
