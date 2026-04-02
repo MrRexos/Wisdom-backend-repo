@@ -199,6 +199,34 @@ function deriveLastMinuteWindowStartsAt(createdAtInput, requestedStartDateTimeIn
   return new Date(requestedStartDateTime.getTime() - clampedWindowMs);
 }
 
+function hasRequestedStartDateTimePassed(requestedStartDateTimeInput, now = new Date()) {
+  const requestedStartDateTime = parseDateInput(requestedStartDateTimeInput);
+  const normalizedNow = parseDateInput(now) || new Date();
+
+  if (!requestedStartDateTime) {
+    return false;
+  }
+
+  return requestedStartDateTime.getTime() <= normalizedNow.getTime();
+}
+
+function canReportBookingIssue(booking, now = new Date()) {
+  const normalizedServiceStatus = normalizeServiceStatus(booking?.service_status, "pending_deposit");
+
+  if (normalizedServiceStatus === "in_progress") {
+    return true;
+  }
+
+  if (normalizedServiceStatus !== "accepted") {
+    return false;
+  }
+
+  return hasRequestedStartDateTimePassed(
+    booking?.requested_start_datetime ?? booking?.booking_start_datetime,
+    now
+  );
+}
+
 function buildBookingSchedule({
   createdAt,
   requestedStartDateTime,
@@ -411,6 +439,8 @@ module.exports = {
   deriveAcceptDeadlineAt,
   deriveExpiresAt,
   deriveLastMinuteWindowStartsAt,
+  hasRequestedStartDateTimePassed,
+  canReportBookingIssue,
   buildBookingSchedule,
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,

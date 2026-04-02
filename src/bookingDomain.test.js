@@ -6,6 +6,7 @@ const assert = require("node:assert/strict");
 const {
   buildBookingSchedule,
   buildTransitionPatch,
+  canReportBookingIssue,
   canEditBooking,
   deriveAcceptDeadlineAt,
   deriveLastMinuteWindowStartsAt,
@@ -14,6 +15,7 @@ const {
   meetsMinimumNotice,
   deriveRequestedEndDateTime,
   deriveExpiresAt,
+  hasRequestedStartDateTimePassed,
   normalizeMinimumNoticeMinutes,
   normalizeLegacyStatusUpdate,
 } = require("./bookingDomain");
@@ -130,6 +132,41 @@ test("buildBookingSchedule returns the normalized lifecycle dates together", () 
   assert.equal(schedule.acceptDeadlineAt.toISOString(), "2026-03-29T12:00:00.000Z");
   assert.equal(schedule.expiresAt.toISOString(), "2026-03-29T12:00:00.000Z");
   assert.equal(schedule.lastMinuteWindowStartsAt.toISOString(), "2026-03-29T12:00:00.000Z");
+});
+
+test("hasRequestedStartDateTimePassed only returns true once the requested start is reached", () => {
+  assert.equal(
+    hasRequestedStartDateTimePassed("2026-03-29T10:00:00.000Z", "2026-03-29T09:59:59.000Z"),
+    false
+  );
+  assert.equal(
+    hasRequestedStartDateTimePassed("2026-03-29T10:00:00.000Z", "2026-03-29T10:00:00.000Z"),
+    true
+  );
+});
+
+test("canReportBookingIssue only enables accepted bookings after the start and in progress bookings", () => {
+  assert.equal(
+    canReportBookingIssue(
+      { service_status: "accepted", requested_start_datetime: "2026-03-29T10:00:00.000Z" },
+      "2026-03-29T09:59:00.000Z"
+    ),
+    false
+  );
+  assert.equal(
+    canReportBookingIssue(
+      { service_status: "accepted", requested_start_datetime: "2026-03-29T10:00:00.000Z" },
+      "2026-03-29T10:00:00.000Z"
+    ),
+    true
+  );
+  assert.equal(
+    canReportBookingIssue(
+      { service_status: "in_progress", requested_start_datetime: null },
+      "2026-03-29T08:00:00.000Z"
+    ),
+    true
+  );
 });
 
 test("normalizeLegacyStatusUpdate maps old statuses to the new axes", () => {

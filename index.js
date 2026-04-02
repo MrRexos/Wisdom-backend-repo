@@ -40,6 +40,7 @@ const {
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
   meetsMinimumNotice,
+  canReportBookingIssue,
   canEditBooking,
   buildTransitionPatch,
   normalizeLegacyStatusUpdate,
@@ -1484,6 +1485,8 @@ function mapBookingRecordForApi(row = {}) {
     : null;
   const hasActiveClosureProposal = row.closure_proposal_id !== null
     && row.closure_proposal_id !== undefined;
+  const hasOpenIssueReport = row.open_issue_report_id !== null
+    && row.open_issue_report_id !== undefined;
   const needsClosureInput = normalizedServiceStatus === 'finished'
     && ['hour', 'budget'].includes(effectivePriceType)
     && !hasActiveClosureProposal;
@@ -1548,6 +1551,7 @@ function mapBookingRecordForApi(row = {}) {
     closure_base_price: closureBasePrice,
     closure_final_duration_minutes: row.proposed_final_duration_minutes ?? null,
     has_active_closure_proposal: hasActiveClosureProposal,
+    has_open_issue_report: hasOpenIssueReport,
     needs_closure_input: needsClosureInput,
     can_edit: canEditBooking({
       service_status: normalizedServiceStatus,
@@ -1691,6 +1695,93 @@ function canAutoExpireRequestedBooking(booking, now = new Date()) {
   return expiresAt.getTime() <= normalizedNow.getTime();
 }
 
+function assertBookingStatusUpdateAllowed({
+  booking,
+  nextServiceStatus,
+  isClientOwner,
+  isProviderOwner,
+  isStaff,
+  cancellationReasonCode = null,
+}) {
+  const normalizedCurrentServiceStatus = normalizeServiceStatus(
+    booking?.service_status,
+    'pending_deposit'
+  );
+  const normalizedNextServiceStatus = normalizeServiceStatus(
+    nextServiceStatus,
+    normalizedCurrentServiceStatus
+  );
+  const normalizedCancellationReasonCode = String(cancellationReasonCode || '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+  const throwValidationError = (message) => {
+    const error = new Error(message);
+    error.statusCode = 400;
+    throw error;
+  };
+
+  if (normalizedCurrentServiceStatus === normalizedNextServiceStatus || isStaff) {
+    return {
+      normalizedCurrentServiceStatus,
+      normalizedNextServiceStatus,
+    };
+  }
+
+  switch (normalizedNextServiceStatus) {
+    case 'accepted':
+      if (!isProviderOwner) {
+        throwValidationError('Solo el profesional puede aceptar esta solicitud.');
+      }
+      if (normalizedCurrentServiceStatus !== 'requested') {
+        throwValidationError('Solo se puede aceptar una solicitud pendiente.');
+      }
+      break;
+    case 'in_progress':
+      if (!isProviderOwner) {
+        throwValidationError('Solo el profesional puede iniciar el servicio.');
+      }
+      if (normalizedCurrentServiceStatus !== 'accepted') {
+        throwValidationError('El servicio solo puede iniciarse cuando la reserva está aceptada.');
+      }
+      break;
+    case 'finished':
+      if (!isClientOwner && !isProviderOwner) {
+        throwValidationError('No autorizado para finalizar la reserva.');
+      }
+      if (normalizedCurrentServiceStatus !== 'in_progress') {
+        throwValidationError('El servicio solo puede finalizarse cuando está en progreso.');
+      }
+      break;
+    case 'expired':
+      throwValidationError('El estado expired solo puede aplicarse automáticamente.');
+    case 'canceled':
+      if (!isClientOwner && !isProviderOwner) {
+        throwValidationError('No autorizado para cancelar la reserva.');
+      }
+      if (
+        normalizedCancellationReasonCode === 'rejected'
+        || normalizedCancellationReasonCode === 'provider_rejected'
+        || normalizedCancellationReasonCode === 'rejected_by_provider'
+      ) {
+        if (!isProviderOwner) {
+          throwValidationError('Solo el profesional puede rechazar una solicitud.');
+        }
+        if (normalizedCurrentServiceStatus !== 'requested') {
+          throwValidationError('Solo se puede rechazar una solicitud pendiente.');
+        }
+      }
+      break;
+    default:
+      break;
+  }
+
+  return {
+    normalizedCurrentServiceStatus,
+    normalizedNextServiceStatus,
+  };
+}
+
 function canInitiateDepositRefund(paymentRow) {
   const normalizedPaymentStatus = String(paymentRow?.status || '').trim().toLowerCase();
   return Boolean(paymentRow?.payment_intent_id) && normalizedPaymentStatus === 'succeeded';
@@ -1819,6 +1910,59 @@ async function expireRequestedBookingByIdIfNeeded(bookingId) {
   return {
     expired: true,
     refundRequested: Boolean(refundRequest?.paymentIntentId),
+  };
+}
+
+async function getBookingLifecycleNotificationContext(connection, bookingId) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return null;
+  }
+
+  const [[row]] = await connection.query(
+    `
+    SELECT
+      b.id,
+      COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
+      b.requested_start_datetime,
+      client.email AS client_email,
+      client.first_name AS client_first_name,
+      client.surname AS client_surname,
+      client.username AS client_username,
+      prof.email AS professional_email,
+      prof.first_name AS professional_first_name,
+      prof.surname AS professional_surname,
+      prof.username AS professional_username
+    FROM booking b
+    LEFT JOIN service s ON b.service_id = s.id
+    LEFT JOIN user_account client ON b.client_user_id = client.id
+    LEFT JOIN user_account prof ON b.provider_user_id_snapshot = prof.id
+    WHERE b.id = ?
+    LIMIT 1
+    `,
+    [normalizedBookingId]
+  );
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    serviceTitle: row.service_title,
+    start: row.requested_start_datetime,
+    client: {
+      email: row.client_email,
+      firstName: row.client_first_name,
+      surname: row.client_surname,
+      username: row.client_username,
+    },
+    professional: {
+      email: row.professional_email,
+      firstName: row.professional_first_name,
+      surname: row.professional_surname,
+      username: row.professional_username,
+    },
   };
 }
 
@@ -2257,6 +2401,130 @@ function renderDepositReservationEmail({ booking, depositAmountCents, currency =
     </html>`;
 
   return { subject, text, html };
+}
+
+function renderBookingLifecycleEmail({ kind, booking }) {
+  const normalizedKind = String(kind || '').trim().toLowerCase();
+  const bookingIdText = `#${booking?.id || '—'}`;
+  const serviceTitle = booking?.serviceTitle || 'Servicio sin título';
+  const professionalName = composeDisplayName(booking?.professional || {});
+  const clientName = composeDisplayName(booking?.client || {});
+  const startText = formatDateTimeEs(booking?.start);
+  const eventLabel = normalizedKind === 'started' ? 'ha iniciado el servicio' : 'ha aceptado tu reserva';
+  const subject = normalizedKind === 'started'
+    ? `Tu servicio ${bookingIdText} ya ha empezado`
+    : `Tu reserva ${bookingIdText} ha sido aceptada`;
+  const preheader = normalizedKind === 'started'
+    ? `El profesional ya ha iniciado el servicio de la reserva ${bookingIdText}.`
+    : `El profesional ha aceptado la reserva ${bookingIdText}.`;
+  const headline = normalizedKind === 'started'
+    ? `El profesional ${eventLabel}.`
+    : `El profesional ${eventLabel}.`;
+
+  const detailsRows = [
+    ['Reserva', bookingIdText],
+    ['Servicio', serviceTitle],
+    ['Profesional', professionalName],
+    ['Cliente', clientName],
+    ['Inicio previsto', startText],
+  ];
+
+  const text = [
+    `Hola ${clientName},`,
+    '',
+    `${professionalName} ${eventLabel}.`,
+    '',
+    `Reserva: ${bookingIdText}`,
+    `Servicio: ${serviceTitle}`,
+    `Inicio previsto: ${startText}`,
+    '',
+    normalizedKind === 'started'
+      ? 'Puedes abrir la app para seguir la reserva o reportar una incidencia si algo va mal.'
+      : 'La reserva queda aceptada y el profesional deberá pulsar "Iniciar servicio" cuando realmente empiece.',
+    '',
+    '— Equipo Wisdom',
+  ].join('\n');
+
+  const rowsHtml = detailsRows.map(([label, value]) => `
+      <tr>
+        <td style="padding:6px 0; font-weight:600; color:#111827;">${escapeHtml(label)}</td>
+        <td style="padding:6px 0; color:#374151;">${escapeHtml(value)}</td>
+      </tr>
+    `).join('');
+
+  const html = `<!doctype html>
+    <html lang="es">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="color-scheme" content="light dark">
+      <meta name="supported-color-schemes" content="light dark">
+      <title>${escapeHtml(subject)}</title>
+      <style>
+        .content { font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; font-size:15px; line-height:1.65; }
+        @media (max-width:480px) { .content { font-size:16px !important; line-height:1.7 !important; } }
+        a { text-decoration: underline; color: inherit; }
+        body, table, td, p { margin:0; }
+      </style>
+    </head>
+    <body style="margin:0; padding:0; background:none !important;">
+      <div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden;">
+        ${escapeHtml(preheader)}
+      </div>
+
+      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+        <tr>
+          <td align="center" style="padding:0 16px;">
+            <table role="presentation" width="640" border="0" cellspacing="0" cellpadding="0" style="width:100%; max-width:640px; border-collapse:collapse;">
+              <tr>
+                <td align="left" style="padding:24px 8px 8px 8px;">
+                  <img src="https://storage.googleapis.com/wisdom-images/app_icon.png" width="36" height="36" alt="Wisdom"
+                       style="display:block; border:0; outline:none; text-decoration:none; width:36px; height:36px;">
+                </td>
+              </tr>
+              <tr>
+                <td class="content" style="padding:8px 8px 24px 8px;">
+                  <p style="margin:0 0 16px;">Hola ${escapeHtml(clientName)},</p>
+                  <p style="margin:0 0 16px;">${escapeHtml(headline)}</p>
+                  <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%; max-width:480px; border-collapse:collapse; margin:24px 0;">
+                    ${rowsHtml}
+                  </table>
+                  <p style="margin:0 0 16px;">
+                    ${escapeHtml(
+                      normalizedKind === 'started'
+                        ? 'Puedes abrir la app para seguir la reserva o reportar una incidencia si algo va mal.'
+                        : 'La reserva queda aceptada y el profesional deberá pulsar "Iniciar servicio" cuando realmente empiece.'
+                    )}
+                  </p>
+                  <p style="margin:0;">— Equipo Wisdom</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>`;
+
+  return { subject, text, html };
+}
+
+async function sendBookingLifecycleNotificationEmail({ kind, booking }) {
+  const recipientEmail = typeof booking?.client?.email === 'string'
+    ? booking.client.email.trim()
+    : '';
+  if (!recipientEmail) {
+    return false;
+  }
+
+  const { subject, text, html } = renderBookingLifecycleEmail({ kind, booking });
+  await sendEmail({
+    to: recipientEmail,
+    subject,
+    text,
+    html,
+  });
+  return true;
 }
 // Envía el correo de actualización de términos a todos los usuarios
 async function sendEmailToAll(pool, transporter, options = {}) {
@@ -7673,6 +7941,11 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         cp.proposed_commission_amount_cents,
         cp.proposed_total_amount_cents,
         cp.proposed_final_duration_minutes,
+        bir.id AS open_issue_report_id,
+        bir.issue_type AS open_issue_type,
+        bir.status AS open_issue_status,
+        bir.reported_by_user_id AS open_issue_reported_by_user_id,
+        bir.created_at AS open_issue_created_at,
         p.price,
         COALESCE(p.currency, b.service_currency_snapshot) AS currency,
         COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
@@ -7699,6 +7972,13 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         FROM booking_closure_proposal cp2
         WHERE cp2.booking_id = b.id AND cp2.status = 'active'
         ORDER BY cp2.id DESC
+        LIMIT 1
+      )
+      LEFT JOIN booking_issue_report bir ON bir.id = (
+        SELECT bir2.id
+        FROM booking_issue_report bir2
+        WHERE bir2.booking_id = b.id AND bir2.status = 'open'
+        ORDER BY bir2.created_at DESC, bir2.id DESC
         LIMIT 1
       )
       WHERE b.id = ?
@@ -7927,6 +8207,8 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
 
   const connection = await promisePool.getConnection();
   let refundRequest = null;
+  let lifecycleEmailKind = null;
+  let lifecycleEmailBooking = null;
   try {
     await connection.beginTransaction();
 
@@ -8055,8 +8337,18 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
       extraPatch.cancellation_reason_code = null;
     }
 
-    const normalizedCurrentServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
-    const normalizedNextServiceStatus = normalizeServiceStatus(nextServiceStatus, booking.service_status);
+    const {
+      normalizedCurrentServiceStatus,
+      normalizedNextServiceStatus,
+    } = assertBookingStatusUpdateAllowed({
+      booking,
+      nextServiceStatus,
+      isClientOwner,
+      isProviderOwner,
+      isStaff,
+      cancellationReasonCode: extraPatch.cancellation_reason_code || mappedCancellationReason,
+    });
+
     if (normalizedNextServiceStatus === 'canceled') {
       extraPatch.canceled_by_user_id = req.user?.id || null;
       if (!extraPatch.cancellation_reason_code && normalizedCurrentServiceStatus === 'requested') {
@@ -8144,6 +8436,25 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
 
     await connection.commit();
 
+    if (normalizedCurrentServiceStatus !== normalizedNextServiceStatus) {
+      if (normalizedCurrentServiceStatus === 'requested' && normalizedNextServiceStatus === 'accepted') {
+        lifecycleEmailKind = 'accepted';
+      } else if (normalizedCurrentServiceStatus === 'accepted' && normalizedNextServiceStatus === 'in_progress') {
+        lifecycleEmailKind = 'started';
+      }
+    }
+
+    if (lifecycleEmailKind) {
+      try {
+        lifecycleEmailBooking = await getBookingLifecycleNotificationContext(connection, bookingId);
+      } catch (notificationContextError) {
+        console.error('Error building booking lifecycle notification context:', {
+          bookingId,
+          error: notificationContextError.message,
+        });
+      }
+    }
+
     if (refundRequest?.paymentIntentId) {
       try {
         await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
@@ -8159,11 +8470,160 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
       }
     }
 
+    if (lifecycleEmailKind && lifecycleEmailBooking) {
+      try {
+        await sendBookingLifecycleNotificationEmail({
+          kind: lifecycleEmailKind,
+          booking: lifecycleEmailBooking,
+        });
+      } catch (notificationError) {
+        console.error('Error sending booking lifecycle notification email:', {
+          bookingId,
+          kind: lifecycleEmailKind,
+          error: notificationError.message,
+        });
+      }
+    }
+
     return res.status(200).json({ message: 'Estado actualizado' });
   } catch (error) {
     try { await connection.rollback(); } catch {}
+    if (error?.statusCode === 400 && error?.message) {
+      return res.status(400).json({ error: error.message });
+    }
     console.error('Error al actualizar el estado de la reserva:', error);
     return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        id,
+        client_user_id,
+        provider_user_id_snapshot,
+        service_status,
+        settlement_status,
+        requested_start_datetime
+      FROM booking
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const reporterUserId = normalizeNullableInteger(req.user?.id);
+    const isClientOwner = reporterUserId !== null && reporterUserId === Number(booking.client_user_id);
+    const isProviderOwner = reporterUserId !== null && reporterUserId === Number(booking.provider_user_id_snapshot);
+
+    if (!isClientOwner && !isProviderOwner) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
+
+    if (!canReportBookingIssue(booking)) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: 'La incidencia solo se puede reportar cuando la reserva está en progreso o cuando ya ha pasado la hora de inicio.',
+      });
+    }
+
+    const [[existingOpenIssue]] = await connection.query(
+      `
+      SELECT id
+      FROM booking_issue_report
+      WHERE booking_id = ? AND status = 'open'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (existingOpenIssue) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Ya existe una incidencia abierta para esta reserva.' });
+    }
+
+    const requestedIssueType = String(req.body?.issue_type || '').trim().toLowerCase();
+    let issueType = requestedIssueType || 'general_problem';
+    if (issueType === 'no_show') {
+      issueType = isProviderOwner ? 'no_show_client' : 'no_show_provider';
+    }
+
+    const allowedIssueTypes = new Set(['general_problem']);
+    if (isProviderOwner) {
+      allowedIssueTypes.add('no_show_client');
+    }
+    if (isClientOwner) {
+      allowedIssueTypes.add('no_show_provider');
+    }
+
+    if (!allowedIssueTypes.has(issueType)) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'issue_type inválido para este usuario.' });
+    }
+
+    const defaultDetailsByType = {
+      general_problem: 'Incidencia reportada desde la app.',
+      no_show_client: 'El cliente no se ha presentado.',
+      no_show_provider: 'El profesional no se ha presentado.',
+    };
+    const details = typeof req.body?.details === 'string' && req.body.details.trim()
+      ? req.body.details.trim()
+      : defaultDetailsByType[issueType];
+    const reportedAgainstUserId = isClientOwner
+      ? booking.provider_user_id_snapshot
+      : booking.client_user_id;
+
+    const [insertResult] = await connection.query(
+      `
+      INSERT INTO booking_issue_report
+        (booking_id, reported_by_user_id, reported_against_user_id, issue_type, status, details)
+      VALUES (?, ?, ?, ?, 'open', ?)
+      `,
+      [
+        bookingId,
+        reporterUserId,
+        reportedAgainstUserId || null,
+        issueType,
+        details,
+      ]
+    );
+
+    await connection.commit();
+    return res.status(201).json({
+      message: 'Incidencia registrada.',
+      issue_report: {
+        id: insertResult.insertId,
+        booking_id: bookingId,
+        issue_type: issueType,
+        status: 'open',
+        details,
+      },
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al registrar la incidencia de la reserva:', error);
+    return res.status(500).json({ error: 'Error al registrar la incidencia.' });
   } finally {
     connection.release();
   }
