@@ -27,6 +27,7 @@ const MIN_BOOKING_DURATION_MINUTES = 5;
 const MAX_BOOKING_DURATION_MINUTES = 180 * 24 * 60;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
+const AUTO_CHARGE_TOLERANCE_FACTOR = 1.2;
 
 function isValidDate(value) {
   return value instanceof Date && !Number.isNaN(value.getTime());
@@ -101,6 +102,15 @@ function normalizeMinimumNoticeMinutes(value) {
   const numericValue = Math.round(Number(value));
   if (!Number.isFinite(numericValue) || numericValue < 0) {
     return null;
+  }
+
+  return numericValue;
+}
+
+function normalizeAmountCents(value) {
+  const numericValue = Math.round(Number(value));
+  if (!Number.isFinite(numericValue) || numericValue < 0) {
+    return 0;
   }
 
   return numericValue;
@@ -199,6 +209,29 @@ function deriveLastMinuteWindowStartsAt(createdAtInput, requestedStartDateTimeIn
   return new Date(requestedStartDateTime.getTime() - clampedWindowMs);
 }
 
+function isWithinLastMinuteWindow({
+  createdAt,
+  requestedStartDateTime,
+  lastMinuteWindowStartsAt = null,
+  now = new Date(),
+} = {}) {
+  const normalizedNow = parseDateInput(now) || new Date();
+  const normalizedRequestedStartDateTime = parseDateInput(requestedStartDateTime);
+
+  if (!normalizedRequestedStartDateTime) {
+    return false;
+  }
+
+  const windowStartsAt = parseDateInput(lastMinuteWindowStartsAt)
+    || deriveLastMinuteWindowStartsAt(createdAt, normalizedRequestedStartDateTime);
+
+  if (!windowStartsAt) {
+    return false;
+  }
+
+  return normalizedNow.getTime() >= windowStartsAt.getTime();
+}
+
 function hasRequestedStartDateTimePassed(requestedStartDateTimeInput, now = new Date()) {
   const requestedStartDateTime = parseDateInput(requestedStartDateTimeInput);
   const normalizedNow = parseDateInput(now) || new Date();
@@ -225,6 +258,133 @@ function canReportBookingIssue(booking, now = new Date()) {
     booking?.requested_start_datetime ?? booking?.booking_start_datetime,
     now
   );
+}
+
+function computeSettlementAmounts({
+  depositAlreadyPaidAmountCents,
+  proposedTotalAmountCents,
+  providerPayoutAmountCents,
+  minimumChargeAmountCents = 0,
+} = {}) {
+  const depositAmount = normalizeAmountCents(depositAlreadyPaidAmountCents);
+  const proposedTotalAmount = normalizeAmountCents(proposedTotalAmountCents);
+  const providerPayoutAmount = normalizeAmountCents(providerPayoutAmountCents);
+  const minimumChargeAmount = normalizeAmountCents(minimumChargeAmountCents);
+
+  let effectiveTotalAmount = proposedTotalAmount;
+  if (depositAmount > proposedTotalAmount && depositAmount > 0) {
+    effectiveTotalAmount = Math.max(proposedTotalAmount, minimumChargeAmount);
+  }
+  effectiveTotalAmount = Math.max(effectiveTotalAmount, providerPayoutAmount);
+
+  return {
+    depositAlreadyPaidAmountCents: depositAmount,
+    proposedTotalAmountCents: proposedTotalAmount,
+    effectiveTotalAmountCents: effectiveTotalAmount,
+    amountDueFromClientCents: Math.max(0, effectiveTotalAmount - depositAmount),
+    amountToRefundCents: Math.max(0, depositAmount - effectiveTotalAmount),
+    providerPayoutAmountCents: providerPayoutAmount,
+    platformAmountCents: Math.max(0, effectiveTotalAmount - providerPayoutAmount),
+  };
+}
+
+function evaluateAutoChargeEligibility({
+  priceType,
+  estimatedTotalAmountCents,
+  proposedTotalAmountCents,
+  estimatedDurationMinutes = null,
+  proposedFinalDurationMinutes = null,
+  zeroChargeMode = false,
+  toleranceFactor = AUTO_CHARGE_TOLERANCE_FACTOR,
+} = {}) {
+  const normalizedPriceType = String(priceType || "").trim().toLowerCase();
+  const estimatedTotalAmount = Number.isFinite(Number(estimatedTotalAmountCents))
+    ? normalizeAmountCents(estimatedTotalAmountCents)
+    : null;
+  const proposedTotalAmount = normalizeAmountCents(proposedTotalAmountCents);
+  const normalizedEstimatedDurationMinutes = normalizeDurationMinutes(estimatedDurationMinutes);
+  const normalizedProposedFinalDurationMinutes = normalizeDurationMinutes(proposedFinalDurationMinutes);
+
+  if (zeroChargeMode || proposedTotalAmount <= 0) {
+    return {
+      eligible: true,
+      reason: "zero_charge",
+      needsAdjustmentNotice: false,
+      toleranceLimitAmountCents: estimatedTotalAmount,
+    };
+  }
+
+  if (normalizedPriceType === "budget") {
+    return {
+      eligible: false,
+      reason: "budget_requires_manual_approval",
+      needsAdjustmentNotice: false,
+      toleranceLimitAmountCents: estimatedTotalAmount,
+    };
+  }
+
+  if (normalizedPriceType === "hour" && normalizedEstimatedDurationMinutes === null) {
+    return {
+      eligible: false,
+      reason: "hour_missing_estimate",
+      needsAdjustmentNotice: false,
+      toleranceLimitAmountCents: estimatedTotalAmount,
+    };
+  }
+
+  if (estimatedTotalAmount === null || estimatedTotalAmount <= 0) {
+    return {
+      eligible: false,
+      reason: "missing_estimate",
+      needsAdjustmentNotice: false,
+      toleranceLimitAmountCents: estimatedTotalAmount,
+    };
+  }
+
+  if (
+    normalizedPriceType === "hour"
+    && normalizedProposedFinalDurationMinutes !== null
+    && normalizedEstimatedDurationMinutes !== null
+    && normalizedProposedFinalDurationMinutes <= normalizedEstimatedDurationMinutes
+    && proposedTotalAmount <= estimatedTotalAmount
+  ) {
+    return {
+      eligible: true,
+      reason: "within_estimate",
+      needsAdjustmentNotice: false,
+      toleranceLimitAmountCents: estimatedTotalAmount,
+    };
+  }
+
+  if (proposedTotalAmount <= estimatedTotalAmount) {
+    return {
+      eligible: true,
+      reason: "within_estimate",
+      needsAdjustmentNotice: false,
+      toleranceLimitAmountCents: estimatedTotalAmount,
+    };
+  }
+
+  const safeToleranceFactor = Number.isFinite(Number(toleranceFactor)) && Number(toleranceFactor) > 1
+    ? Number(toleranceFactor)
+    : AUTO_CHARGE_TOLERANCE_FACTOR;
+  const toleranceLimitAmountCents = Math.round(estimatedTotalAmount * safeToleranceFactor);
+
+  if (proposedTotalAmount <= toleranceLimitAmountCents) {
+    return {
+      eligible: true,
+      reason: "within_tolerance",
+      needsAdjustmentNotice: true,
+      toleranceLimitAmountCents,
+    };
+  }
+
+  return {
+    eligible: false,
+    reason: "above_tolerance",
+    needsAdjustmentNotice: true,
+    toleranceLimitAmountCents,
+  };
 }
 
 function buildBookingSchedule({
@@ -424,6 +584,7 @@ function normalizeLegacyStatusUpdate(status, currentBooking = null) {
 }
 
 module.exports = {
+  AUTO_CHARGE_TOLERANCE_FACTOR,
   SERVICE_STATUSES,
   SETTLEMENT_STATUSES,
   MIN_BOOKING_DURATION_MINUTES,
@@ -439,8 +600,11 @@ module.exports = {
   deriveAcceptDeadlineAt,
   deriveExpiresAt,
   deriveLastMinuteWindowStartsAt,
+  isWithinLastMinuteWindow,
   hasRequestedStartDateTimePassed,
   canReportBookingIssue,
+  computeSettlementAmounts,
+  evaluateAutoChargeEligibility,
   buildBookingSchedule,
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,

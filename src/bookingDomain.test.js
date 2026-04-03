@@ -4,18 +4,22 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  AUTO_CHARGE_TOLERANCE_FACTOR,
   buildBookingSchedule,
   buildTransitionPatch,
   canReportBookingIssue,
   canEditBooking,
+  computeSettlementAmounts,
   deriveAcceptDeadlineAt,
   deriveLastMinuteWindowStartsAt,
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
+  evaluateAutoChargeEligibility,
   meetsMinimumNotice,
   deriveRequestedEndDateTime,
   deriveExpiresAt,
   hasRequestedStartDateTimePassed,
+  isWithinLastMinuteWindow,
   normalizeMinimumNoticeMinutes,
   normalizeLegacyStatusUpdate,
 } = require("./bookingDomain");
@@ -121,6 +125,25 @@ test("deriveLastMinuteWindowStartsAt clamps to twenty four hours maximum", () =>
   assert.equal(result.toISOString(), "2026-03-10T10:00:00.000Z");
 });
 
+test("isWithinLastMinuteWindow turns true once the computed window starts", () => {
+  assert.equal(
+    isWithinLastMinuteWindow({
+      createdAt: "2026-03-29T10:00:00.000Z",
+      requestedStartDateTime: "2026-03-29T16:00:00.000Z",
+      now: "2026-03-29T13:59:59.000Z",
+    }),
+    false
+  );
+  assert.equal(
+    isWithinLastMinuteWindow({
+      createdAt: "2026-03-29T10:00:00.000Z",
+      requestedStartDateTime: "2026-03-29T16:00:00.000Z",
+      now: "2026-03-29T14:00:00.000Z",
+    }),
+    true
+  );
+});
+
 test("buildBookingSchedule returns the normalized lifecycle dates together", () => {
   const schedule = buildBookingSchedule({
     createdAt: "2026-03-29T10:00:00.000Z",
@@ -166,6 +189,79 @@ test("canReportBookingIssue only enables accepted bookings after the start and i
       "2026-03-29T08:00:00.000Z"
     ),
     true
+  );
+});
+
+test("computeSettlementAmounts keeps the one euro floor when refunding excess deposit", () => {
+  assert.deepEqual(
+    computeSettlementAmounts({
+      depositAlreadyPaidAmountCents: 500,
+      proposedTotalAmountCents: 0,
+      providerPayoutAmountCents: 0,
+      minimumChargeAmountCents: 100,
+    }),
+    {
+      depositAlreadyPaidAmountCents: 500,
+      proposedTotalAmountCents: 0,
+      effectiveTotalAmountCents: 100,
+      amountDueFromClientCents: 0,
+      amountToRefundCents: 400,
+      providerPayoutAmountCents: 0,
+      platformAmountCents: 100,
+    }
+  );
+});
+
+test("computeSettlementAmounts charges the delta when the final total exceeds the deposit", () => {
+  assert.deepEqual(
+    computeSettlementAmounts({
+      depositAlreadyPaidAmountCents: 500,
+      proposedTotalAmountCents: 1650,
+      providerPayoutAmountCents: 1500,
+      minimumChargeAmountCents: 100,
+    }),
+    {
+      depositAlreadyPaidAmountCents: 500,
+      proposedTotalAmountCents: 1650,
+      effectiveTotalAmountCents: 1650,
+      amountDueFromClientCents: 1150,
+      amountToRefundCents: 0,
+      providerPayoutAmountCents: 1500,
+      platformAmountCents: 150,
+    }
+  );
+});
+
+test("evaluateAutoChargeEligibility blocks budget closures and allows small hourly adjustments", () => {
+  assert.deepEqual(
+    evaluateAutoChargeEligibility({
+      priceType: "budget",
+      estimatedTotalAmountCents: 5000,
+      proposedTotalAmountCents: 5000,
+    }),
+    {
+      eligible: false,
+      reason: "budget_requires_manual_approval",
+      needsAdjustmentNotice: false,
+      toleranceLimitAmountCents: 5000,
+    }
+  );
+
+  assert.deepEqual(
+    evaluateAutoChargeEligibility({
+      priceType: "hour",
+      estimatedTotalAmountCents: 5000,
+      proposedTotalAmountCents: 5900,
+      estimatedDurationMinutes: 120,
+      proposedFinalDurationMinutes: 140,
+      toleranceFactor: AUTO_CHARGE_TOLERANCE_FACTOR,
+    }),
+    {
+      eligible: true,
+      reason: "within_tolerance",
+      needsAdjustmentNotice: true,
+      toleranceLimitAmountCents: 6000,
+    }
   );
 });
 
