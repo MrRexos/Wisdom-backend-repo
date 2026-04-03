@@ -23,6 +23,14 @@ const SETTLEMENT_STATUSES = Object.freeze([
   "in_dispute",
 ]);
 
+const BOOKING_CHANGE_REQUEST_STATUSES = Object.freeze([
+  "pending",
+  "accepted",
+  "rejected",
+  "canceled",
+  "expired",
+]);
+
 const MIN_BOOKING_DURATION_MINUTES = 5;
 const MAX_BOOKING_DURATION_MINUTES = 180 * 24 * 60;
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -79,6 +87,10 @@ function normalizeServiceStatus(value, fallbackValue = "pending_deposit") {
 
 function normalizeSettlementStatus(value, fallbackValue = "none") {
   return normalizeEnumValue(value, SETTLEMENT_STATUSES, fallbackValue);
+}
+
+function normalizeBookingChangeRequestStatus(value, fallbackValue = "pending") {
+  return normalizeEnumValue(value, BOOKING_CHANGE_REQUEST_STATUSES, fallbackValue);
 }
 
 function normalizeDurationMinutes(value) {
@@ -467,6 +479,32 @@ function canEditBooking(booking) {
   ].includes(normalizedSettlementStatus);
 }
 
+function hasBookingChangeRequestExpired(changeRequest, {
+  now = new Date(),
+  ttlMs = ONE_DAY_MS,
+} = {}) {
+  const normalizedStatus = normalizeBookingChangeRequestStatus(
+    changeRequest?.status,
+    "pending"
+  );
+
+  if (normalizedStatus !== "pending") {
+    return false;
+  }
+
+  const createdAt = parseDateInput(changeRequest?.created_at ?? changeRequest?.createdAt);
+  const normalizedNow = parseDateInput(now) || new Date();
+  const normalizedTtlMs = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0
+    ? Number(ttlMs)
+    : ONE_DAY_MS;
+
+  if (!createdAt) {
+    return false;
+  }
+
+  return normalizedNow.getTime() >= createdAt.getTime() + normalizedTtlMs;
+}
+
 function buildTransitionPatch(
   currentBooking,
   {
@@ -587,11 +625,13 @@ module.exports = {
   AUTO_CHARGE_TOLERANCE_FACTOR,
   SERVICE_STATUSES,
   SETTLEMENT_STATUSES,
+  BOOKING_CHANGE_REQUEST_STATUSES,
   MIN_BOOKING_DURATION_MINUTES,
   MAX_BOOKING_DURATION_MINUTES,
   parseDateInput,
   normalizeServiceStatus,
   normalizeSettlementStatus,
+  normalizeBookingChangeRequestStatus,
   normalizeDurationMinutes,
   normalizeMinimumNoticeMinutes,
   isDurationMinutesInRange,
@@ -609,6 +649,7 @@ module.exports = {
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
   canEditBooking,
+  hasBookingChangeRequestExpired,
   buildTransitionPatch,
   normalizeLegacyStatusUpdate,
 };

@@ -15,6 +15,7 @@ const {
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
   evaluateAutoChargeEligibility,
+  hasBookingChangeRequestExpired,
   meetsMinimumNotice,
   deriveRequestedEndDateTime,
   deriveExpiresAt,
@@ -317,6 +318,30 @@ test("canEditBooking only allows accepted and in_progress bookings outside block
   assert.equal(canEditBooking({ service_status: "accepted", settlement_status: "none" }), true);
   assert.equal(canEditBooking({ service_status: "in_progress", settlement_status: "awaiting_payment" }), true);
   assert.equal(canEditBooking({ service_status: "accepted", settlement_status: "in_dispute" }), false);
+});
+
+test("hasBookingChangeRequestExpired only expires pending requests once the ttl is reached", () => {
+  assert.equal(
+    hasBookingChangeRequestExpired(
+      { status: "pending", created_at: "2026-03-29T10:00:00.000Z" },
+      { now: "2026-03-30T09:59:59.000Z" }
+    ),
+    false
+  );
+  assert.equal(
+    hasBookingChangeRequestExpired(
+      { status: "pending", created_at: "2026-03-29T10:00:00.000Z" },
+      { now: "2026-03-30T10:00:00.000Z" }
+    ),
+    true
+  );
+  assert.equal(
+    hasBookingChangeRequestExpired(
+      { status: "accepted", created_at: "2026-03-29T10:00:00.000Z" },
+      { now: "2026-03-30T12:00:00.000Z" }
+    ),
+    false
+  );
 });
 
 test("legacy helpers preserve compatibility for old UI assumptions", () => {

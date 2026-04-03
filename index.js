@@ -34,6 +34,7 @@ const {
   MAX_BOOKING_DURATION_MINUTES,
   normalizeServiceStatus,
   normalizeSettlementStatus,
+  normalizeBookingChangeRequestStatus,
   normalizeDurationMinutes,
   normalizeMinimumNoticeMinutes,
   isDurationMinutesInRange,
@@ -43,6 +44,7 @@ const {
   meetsMinimumNotice,
   canReportBookingIssue,
   canEditBooking,
+  hasBookingChangeRequestExpired,
   buildTransitionPatch,
   computeSettlementAmounts,
   evaluateAutoChargeEligibility,
@@ -130,6 +132,12 @@ const emailProvider = (process.env.EMAIL_PROVIDER || (process.env.BREVO_API_KEY 
 const configuredEmailFrom = (process.env.EMAIL_FROM || '').trim();
 const defaultSmtpEmailFrom = '"Wisdom" <wisdom.helpcontact@gmail.com>';
 const configuredEmailReplyTo = (process.env.EMAIL_REPLY_TO || '').trim();
+const bookingSupportEmail = (
+  process.env.BOOKING_SUPPORT_EMAIL
+  || process.env.SUPPORT_EMAIL
+  || configuredEmailReplyTo
+  || ''
+).trim();
 const brevoApiKey = (process.env.BREVO_API_KEY || '').trim();
 const brevoApiBaseUrl = (process.env.BREVO_API_BASE_URL || 'https://api.brevo.com/v3').trim().replace(/\/+$/, '');
 const emailPort = Number(process.env.EMAIL_PORT || 587);
@@ -507,6 +515,12 @@ const mapStatus = (piStatus) => {
 
 // Helpers adicionales para pagos
 const stableKey = (parts) => parts.join(':');
+const BOOKING_CHANGE_REQUEST_TTL_MS = (
+  Number.isFinite(Number(process.env.BOOKING_CHANGE_REQUEST_TTL_MS))
+  && Number(process.env.BOOKING_CHANGE_REQUEST_TTL_MS) > 0
+)
+  ? Number(process.env.BOOKING_CHANGE_REQUEST_TTL_MS)
+  : 24 * 60 * 60 * 1000;
 
 // Redondeos consistentes con frontend (BookingScreen)
 const round1 = (n) => {
@@ -1533,6 +1547,50 @@ function mapStoredPaymentMethodForApi(row = {}) {
   };
 }
 
+function parseJsonObject(value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function mapEmbeddedBookingChangeRequestForApi(row = {}) {
+  const changeRequestId = normalizeNullableInteger(row.change_request_id);
+  if (!changeRequestId) {
+    return null;
+  }
+
+  return {
+    id: changeRequestId,
+    booking_id: normalizeNullableInteger(row.booking_id ?? row.id),
+    requested_by_user_id: normalizeNullableInteger(row.change_request_requested_by_user_id),
+    target_user_id: normalizeNullableInteger(row.change_request_target_user_id),
+    status: normalizeBookingChangeRequestStatus(row.change_request_status, 'pending'),
+    changes: parseJsonObject(row.change_request_changes_json),
+    message: typeof row.change_request_message === 'string' && row.change_request_message.trim()
+      ? row.change_request_message.trim()
+      : null,
+    created_at: row.change_request_created_at ?? null,
+    resolved_at: row.change_request_resolved_at ?? null,
+  };
+}
+
 function mapBookingRecordForApi(row = {}) {
   const normalizedServiceStatus = normalizeServiceStatus(row.service_status, 'pending_deposit');
   const normalizedSettlementStatus = normalizeSettlementStatus(row.settlement_status, 'none');
@@ -1595,6 +1653,13 @@ function mapBookingRecordForApi(row = {}) {
     : closureProposalId !== null && closureProposalId !== undefined;
   const hasOpenIssueReport = row.open_issue_report_id !== null
     && row.open_issue_report_id !== undefined;
+  const latestChangeRequest = mapEmbeddedBookingChangeRequestForApi(row);
+  const hasPendingChangeRequest = latestChangeRequest?.status === 'pending';
+  const baseCanEditBooking = canEditBooking({
+    service_status: normalizedServiceStatus,
+    settlement_status: normalizedSettlementStatus,
+  });
+  const isActionableChangeRequest = hasPendingChangeRequest && baseCanEditBooking;
   const needsClosureInput = (normalizedServiceStatus === 'finished' || normalizedServiceStatus === 'in_progress')
     && normalizedSettlementStatus === 'none'
     && ['hour', 'budget'].includes(effectivePriceType)
@@ -1677,11 +1742,11 @@ function mapBookingRecordForApi(row = {}) {
     closure_auto_charge_scheduled_at: row.auto_charge_scheduled_at ?? null,
     has_active_closure_proposal: hasActiveClosureProposal,
     has_open_issue_report: hasOpenIssueReport,
+    has_pending_change_request: hasPendingChangeRequest,
+    has_actionable_change_request: isActionableChangeRequest,
+    latest_change_request: latestChangeRequest,
     needs_closure_input: needsClosureInput,
-    can_edit: canEditBooking({
-      service_status: normalizedServiceStatus,
-      settlement_status: normalizedSettlementStatus,
-    }),
+    can_edit: baseCanEditBooking && !hasPendingChangeRequest,
     selected_customer_payment_method: selectedCustomerPaymentMethod,
     price_type: row.price_type ?? row.price_type_snapshot ?? null,
     currency: normalizeCurrencyCode(row.currency, serviceCurrency),
@@ -2342,6 +2407,305 @@ async function expireRequestedBookingByIdIfNeeded(bookingId) {
     expired: true,
     refundRequested: Boolean(refundRequest?.paymentIntentId),
   };
+}
+
+function normalizeNullableText(value) {
+  return typeof value === 'string' && value.trim()
+    ? value.trim()
+    : null;
+}
+
+function buildBookingEditableComparableFields(source = {}) {
+  return {
+    requested_start_datetime: toDbDateTime(
+      source.requested_start_datetime
+      ?? source.booking_start_datetime
+      ?? null
+    ),
+    requested_duration_minutes: normalizeDurationMinutes(
+      source.requested_duration_minutes
+      ?? source.service_duration
+      ?? null
+    ),
+    address_id: normalizeNullableInteger(source.address_id),
+    description: normalizeNullableText(source.description),
+  };
+}
+
+function bookingEditableFieldsAreEqual(left = {}, right = {}) {
+  return left.requested_start_datetime === right.requested_start_datetime
+    && left.requested_duration_minutes === right.requested_duration_minutes
+    && left.address_id === right.address_id
+    && left.description === right.description;
+}
+
+async function prepareBookingEditableUpdate(connection, currentBooking, requestBody = {}) {
+  const hasStartField = Object.prototype.hasOwnProperty.call(requestBody, 'requested_start_datetime')
+    || Object.prototype.hasOwnProperty.call(requestBody, 'booking_start_datetime');
+  const hasDurationField = Object.prototype.hasOwnProperty.call(requestBody, 'requested_duration_minutes')
+    || Object.prototype.hasOwnProperty.call(requestBody, 'service_duration');
+  const hasDescriptionField = Object.prototype.hasOwnProperty.call(requestBody, 'description');
+  const hasAddressField = Object.prototype.hasOwnProperty.call(requestBody, 'address_id');
+
+  let nextAddressId = currentBooking.address_id;
+  let nextAddressSnapshot = null;
+  if (hasAddressField) {
+    nextAddressId = normalizeNullableInteger(requestBody.address_id);
+    if (nextAddressId !== null) {
+      const [[existingAddress]] = await connection.query(
+        `
+        SELECT
+          id,
+          address_type,
+          street_number,
+          address_1,
+          address_2,
+          postal_code,
+          city,
+          state,
+          country
+        FROM address
+        WHERE id = ?
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [nextAddressId]
+      );
+      if (!existingAddress) {
+        const error = new Error('address_id no existe.');
+        error.statusCode = 400;
+        throw error;
+      }
+      nextAddressSnapshot = {
+        id: existingAddress.id,
+        address_type: existingAddress.address_type,
+        street_number: existingAddress.street_number,
+        address_1: existingAddress.address_1,
+        address_2: existingAddress.address_2,
+        postal_code: existingAddress.postal_code,
+        city: existingAddress.city,
+        state: existingAddress.state,
+        country: existingAddress.country,
+      };
+    }
+  }
+
+  const requestedStartInput = hasStartField
+    ? (requestBody.requested_start_datetime ?? requestBody.booking_start_datetime ?? null)
+    : currentBooking.requested_start_datetime;
+  const requestedStartDateTime = parseDateTimeInput(requestedStartInput);
+  const requestedDurationMinutes = hasDurationField
+    ? normalizeDurationMinutes(requestBody.requested_duration_minutes ?? requestBody.service_duration ?? null)
+    : normalizeDurationMinutes(currentBooking.requested_duration_minutes);
+
+  if (!isDurationMinutesInRange(requestedDurationMinutes)) {
+    const error = new Error(`La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`);
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (requestedStartDateTime && requestedStartDateTime.getTime() < Date.now()) {
+    const error = new Error('No se puede reprogramar la reserva en el pasado.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const minimumNoticePolicyMinutes = normalizeMinimumNoticeMinutes(currentBooking.minimum_notice_policy_snapshot);
+  if (!meetsMinimumNotice({
+    requestedStartDateTime,
+    minimumNoticeMinutes: minimumNoticePolicyMinutes,
+    now: new Date(),
+  })) {
+    const error = new Error(`Este servicio exige una antelación mínima de ${formatLeadTimeLabel(minimumNoticePolicyMinutes)}.`);
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const schedule = buildBookingSchedule({
+    createdAt: currentBooking.order_datetime ?? currentBooking.created_at,
+    requestedStartDateTime,
+    requestedDurationMinutes,
+  });
+  const bookingCurrency = normalizeCurrencyCode(currentBooking.service_currency_snapshot, 'EUR');
+  const unitPriceAmount = currentBooking.unit_price_amount_cents_snapshot === null || currentBooking.unit_price_amount_cents_snapshot === undefined
+    ? 0
+    : fromMinorUnits(currentBooking.unit_price_amount_cents_snapshot, bookingCurrency);
+  const pricingSnapshot = computeBookingPricingSnapshot({
+    priceType: currentBooking.price_type_snapshot,
+    unitPrice: unitPriceAmount,
+    durationMinutes: requestedDurationMinutes,
+    currency: bookingCurrency,
+  });
+  const nextDescription = hasDescriptionField
+    ? normalizeNullableText(requestBody.description)
+    : normalizeNullableText(currentBooking.description);
+  const estimatedBaseAmountCents = pricingSnapshot.final === null && pricingSnapshot.type !== 'fix'
+    ? null
+    : toMinorUnits(pricingSnapshot.base, bookingCurrency);
+  const estimatedCommissionAmountCents = toMinorUnits(pricingSnapshot.commission || 0, bookingCurrency);
+  const estimatedTotalAmountCents = pricingSnapshot.final === null
+    ? null
+    : toMinorUnits(pricingSnapshot.final, bookingCurrency);
+
+  const comparableFields = {
+    requested_start_datetime: toDbDateTime(schedule.requestedStartDateTime),
+    requested_duration_minutes: schedule.requestedDurationMinutes,
+    address_id: nextAddressId,
+    description: nextDescription,
+  };
+
+  return {
+    comparableFields,
+    updatePatch: {
+      requested_start_datetime: comparableFields.requested_start_datetime,
+      requested_duration_minutes: comparableFields.requested_duration_minutes,
+      requested_end_datetime: toDbDateTime(schedule.requestedEndDateTime),
+      accept_deadline_at: toDbDateTime(schedule.acceptDeadlineAt),
+      expires_at: toDbDateTime(schedule.expiresAt),
+      last_minute_window_starts_at: toDbDateTime(schedule.lastMinuteWindowStartsAt),
+      address_id: nextAddressId,
+      description: nextDescription,
+      estimated_base_amount_cents: estimatedBaseAmountCents,
+      estimated_commission_amount_cents: estimatedCommissionAmountCents,
+      estimated_total_amount_cents: estimatedTotalAmountCents,
+      deposit_amount_cents_snapshot: estimatedCommissionAmountCents,
+    },
+    changeRequestPayload: {
+      ...comparableFields,
+      address_snapshot: nextAddressSnapshot,
+    },
+  };
+}
+
+async function applyPreparedBookingEditableUpdate(connection, bookingId, preparedUpdate) {
+  const patch = preparedUpdate?.updatePatch;
+  if (!patch) {
+    return;
+  }
+
+  await connection.query(
+    `
+    UPDATE booking
+    SET requested_start_datetime = ?,
+        requested_duration_minutes = ?,
+        requested_end_datetime = ?,
+        accept_deadline_at = ?,
+        expires_at = ?,
+        last_minute_window_starts_at = ?,
+        address_id = ?,
+        description = ?,
+        estimated_base_amount_cents = ?,
+        estimated_commission_amount_cents = ?,
+        estimated_total_amount_cents = ?,
+        deposit_amount_cents_snapshot = ?
+    WHERE id = ?
+    `,
+    [
+      patch.requested_start_datetime,
+      patch.requested_duration_minutes,
+      patch.requested_end_datetime,
+      patch.accept_deadline_at,
+      patch.expires_at,
+      patch.last_minute_window_starts_at,
+      patch.address_id,
+      patch.description,
+      patch.estimated_base_amount_cents,
+      patch.estimated_commission_amount_cents,
+      patch.estimated_total_amount_cents,
+      patch.deposit_amount_cents_snapshot,
+      bookingId,
+    ]
+  );
+}
+
+async function getLatestBookingChangeRequest(connection, bookingId, {
+  forUpdate = false,
+  pendingOnly = false,
+} = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return null;
+  }
+
+  const whereClauses = ['booking_id = ?'];
+  const params = [normalizedBookingId];
+  if (pendingOnly) {
+    whereClauses.push(`status = 'pending'`);
+  }
+
+  const [rows] = await connection.query(
+    `
+    SELECT
+      id,
+      booking_id,
+      requested_by_user_id,
+      target_user_id,
+      status,
+      changes_json,
+      message,
+      created_at,
+      resolved_at
+    FROM booking_change_request
+    WHERE ${whereClauses.join(' AND ')}
+    ORDER BY
+      CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+      created_at DESC,
+      id DESC
+    LIMIT 1
+    ${forUpdate ? 'FOR UPDATE' : ''}
+    `,
+    params
+  );
+  return rows[0] || null;
+}
+
+async function expirePendingBookingChangeRequestsForBooking(connection, booking, {
+  force = false,
+  now = new Date(),
+} = {}) {
+  const normalizedBookingId = normalizeNullableInteger(booking?.id ?? booking?.booking_id);
+  if (!normalizedBookingId) {
+    return [];
+  }
+
+  const [rows] = await connection.query(
+    `
+    SELECT id, booking_id, status, created_at
+    FROM booking_change_request
+    WHERE booking_id = ?
+      AND status = 'pending'
+    ORDER BY created_at ASC, id ASC
+    FOR UPDATE
+    `,
+    [normalizedBookingId]
+  );
+
+  const expiredIds = [];
+  for (const row of rows || []) {
+    const shouldExpire = force
+      || !canEditBooking(booking)
+      || hasBookingChangeRequestExpired(row, {
+        now,
+        ttlMs: BOOKING_CHANGE_REQUEST_TTL_MS,
+      });
+
+    if (!shouldExpire) {
+      continue;
+    }
+
+    await connection.query(
+      `
+      UPDATE booking_change_request
+      SET status = 'expired',
+          resolved_at = ?
+      WHERE id = ?
+      `,
+      [toDbDateTime(now), row.id]
+    );
+    expiredIds.push(row.id);
+  }
+
+  return expiredIds;
 }
 
 async function getBookingLifecycleNotificationContext(connection, bookingId) {
@@ -3343,6 +3707,21 @@ async function markBookingSettlementForReview(bookingId, {
     });
 
     await connection.commit();
+
+    try {
+      await sendBookingSupportAlertEmail({
+        bookingId: normalizedBookingId,
+        headline: 'Reserva en revisión manual',
+        details,
+        category: issueType,
+      });
+    } catch (emailError) {
+      console.error('Error sending booking support alert email:', {
+        bookingId: normalizedBookingId,
+        error: emailError.message,
+      });
+    }
+
     return true;
   } catch (error) {
     try { await connection.rollback(); } catch {}
@@ -4344,6 +4723,333 @@ async function sendBookingLifecycleNotificationEmail({ kind, booking }) {
   return true;
 }
 
+function formatBookingChangeRequestAddress(addressSnapshot = null) {
+  if (!addressSnapshot || typeof addressSnapshot !== 'object') {
+    return 'Sin dirección';
+  }
+
+  const line1 = [
+    addressSnapshot.address_1,
+    addressSnapshot.street_number,
+  ].filter(Boolean).join(' ');
+  const line2 = [
+    addressSnapshot.postal_code,
+    addressSnapshot.city,
+    addressSnapshot.state,
+    addressSnapshot.country,
+  ].filter(Boolean).join(', ');
+
+  return [line1, addressSnapshot.address_2, line2].filter(Boolean).join(' · ') || 'Sin dirección';
+}
+
+function buildBookingChangeRequestSummaryLines(changes = {}) {
+  const lines = [];
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'requested_start_datetime')) {
+    lines.push(`Inicio solicitado: ${changes.requested_start_datetime || 'Sin fecha ni hora'}`);
+  }
+  if (Object.prototype.hasOwnProperty.call(changes, 'requested_duration_minutes')) {
+    lines.push(
+      `Duración solicitada: ${
+        changes.requested_duration_minutes === null || changes.requested_duration_minutes === undefined
+          ? 'Sin duración definida'
+          : `${changes.requested_duration_minutes} minutos`
+      }`
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(changes, 'address_id')) {
+    lines.push(`Dirección solicitada: ${formatBookingChangeRequestAddress(changes.address_snapshot)}`);
+  }
+  if (Object.prototype.hasOwnProperty.call(changes, 'description')) {
+    lines.push(`Descripción: ${changes.description || 'Sin descripción'}`);
+  }
+
+  return lines;
+}
+
+async function getBookingChangeRequestNotificationContext(changeRequestId) {
+  const normalizedChangeRequestId = normalizeNullableInteger(changeRequestId);
+  if (!normalizedChangeRequestId) {
+    return null;
+  }
+
+  const connection = await pool.promise().getConnection();
+  try {
+    const [rows] = await connection.query(
+      `
+      SELECT
+        bcr.id,
+        bcr.booking_id,
+        bcr.requested_by_user_id,
+        bcr.target_user_id,
+        bcr.status,
+        bcr.changes_json,
+        bcr.message,
+        bcr.created_at,
+        bcr.resolved_at,
+        COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
+        requester.email AS requester_email,
+        requester.first_name AS requester_first_name,
+        requester.surname AS requester_surname,
+        requester.username AS requester_username,
+        target.email AS target_email,
+        target.first_name AS target_first_name,
+        target.surname AS target_surname,
+        target.username AS target_username
+      FROM booking_change_request bcr
+      INNER JOIN booking b ON b.id = bcr.booking_id
+      LEFT JOIN service s ON s.id = b.service_id
+      LEFT JOIN user_account requester ON requester.id = bcr.requested_by_user_id
+      LEFT JOIN user_account target ON target.id = bcr.target_user_id
+      WHERE bcr.id = ?
+      LIMIT 1
+      `,
+      [normalizedChangeRequestId]
+    );
+
+    const row = rows[0] || null;
+    if (!row) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      bookingId: row.booking_id,
+      serviceTitle: row.service_title || 'Servicio sin título',
+      status: normalizeBookingChangeRequestStatus(row.status, 'pending'),
+      changes: parseJsonObject(row.changes_json) || {},
+      message: normalizeNullableText(row.message),
+      requester: {
+        email: row.requester_email,
+        name: composeDisplayName({
+          firstName: row.requester_first_name,
+          surname: row.requester_surname,
+          username: row.requester_username,
+          email: row.requester_email,
+        }),
+      },
+      target: {
+        email: row.target_email,
+        name: composeDisplayName({
+          firstName: row.target_first_name,
+          surname: row.target_surname,
+          username: row.target_username,
+          email: row.target_email,
+        }),
+      },
+    };
+  } finally {
+    connection.release();
+  }
+}
+
+function renderBookingChangeRequestEmail({ mode, context }) {
+  const normalizedMode = String(mode || '').trim().toLowerCase();
+  const summaryLines = buildBookingChangeRequestSummaryLines(context?.changes);
+  const summaryHtml = summaryLines.length > 0
+    ? `<ul>${summaryLines.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>`
+    : '<p>La solicitud no incluye un resumen legible.</p>';
+  const summaryText = summaryLines.length > 0
+    ? summaryLines.map((line) => `- ${line}`).join('\n')
+    : '- Sin resumen disponible';
+  const bookingIdText = `#${context?.bookingId || '—'}`;
+  const serviceTitle = context?.serviceTitle || 'Servicio sin título';
+  const requesterName = context?.requester?.name || 'La otra parte';
+
+  if (normalizedMode === 'created') {
+    return {
+      subject: `Nueva solicitud de modificación para la reserva ${bookingIdText}`,
+      text: [
+        `Hola ${context?.target?.name || 'usuario'},`,
+        '',
+        `${requesterName} ha enviado una solicitud de modificación para la reserva ${bookingIdText}.`,
+        `Servicio: ${serviceTitle}`,
+        '',
+        summaryText,
+        '',
+        'Abre Wisdom para aceptarla o rechazarla.',
+        '',
+        '— Equipo Wisdom',
+      ].join('\n'),
+      html: `<p>Hola ${escapeHtml(context?.target?.name || 'usuario')},</p>
+        <p><strong>${escapeHtml(requesterName)}</strong> ha enviado una solicitud de modificación para la reserva <strong>${escapeHtml(bookingIdText)}</strong>.</p>
+        <p><strong>Servicio:</strong> ${escapeHtml(serviceTitle)}</p>
+        ${summaryHtml}
+        <p>Abre Wisdom para aceptarla o rechazarla.</p>
+        <p>— Equipo Wisdom</p>`,
+    };
+  }
+
+  const resultLabels = {
+    accepted: 'aceptada',
+    rejected: 'rechazada',
+    canceled: 'cancelada',
+    expired: 'caducada',
+  };
+  const resolvedLabel = resultLabels[normalizedMode] || 'actualizada';
+
+  return {
+    subject: `Tu solicitud de modificación ${bookingIdText} ha sido ${resolvedLabel}`,
+    text: [
+      `Hola ${context?.requester?.name || 'usuario'},`,
+      '',
+      `Tu solicitud de modificación para la reserva ${bookingIdText} ha sido ${resolvedLabel}.`,
+      `Servicio: ${serviceTitle}`,
+      '',
+      summaryText,
+      '',
+      normalizedMode === 'accepted'
+        ? 'Los cambios ya se han aplicado a la reserva.'
+        : 'Puedes revisar la reserva en la app para ver su estado actual.',
+      '',
+      '— Equipo Wisdom',
+    ].join('\n'),
+    html: `<p>Hola ${escapeHtml(context?.requester?.name || 'usuario')},</p>
+      <p>Tu solicitud de modificación para la reserva <strong>${escapeHtml(bookingIdText)}</strong> ha sido <strong>${escapeHtml(resolvedLabel)}</strong>.</p>
+      <p><strong>Servicio:</strong> ${escapeHtml(serviceTitle)}</p>
+      ${summaryHtml}
+      <p>${escapeHtml(
+        normalizedMode === 'accepted'
+          ? 'Los cambios ya se han aplicado a la reserva.'
+          : 'Puedes revisar la reserva en la app para ver su estado actual.'
+      )}</p>
+      <p>— Equipo Wisdom</p>`,
+  };
+}
+
+async function sendBookingChangeRequestNotificationEmail({ changeRequestId, mode }) {
+  const context = await getBookingChangeRequestNotificationContext(changeRequestId);
+  if (!context) {
+    return false;
+  }
+
+  const normalizedMode = String(mode || '').trim().toLowerCase();
+  const recipientEmail = normalizedMode === 'created'
+    ? context.target?.email
+    : context.requester?.email;
+  if (!recipientEmail) {
+    return false;
+  }
+
+  const { subject, text, html } = renderBookingChangeRequestEmail({ mode: normalizedMode, context });
+  await sendEmail({
+    to: recipientEmail,
+    subject,
+    text,
+    html,
+  });
+  return true;
+}
+
+async function getBookingSupportAlertContext(bookingId) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return null;
+  }
+
+  const connection = await pool.promise().getConnection();
+  try {
+    const [rows] = await connection.query(
+      `
+      SELECT
+        b.id,
+        b.service_status,
+        b.settlement_status,
+        COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
+        client.email AS client_email,
+        client.first_name AS client_first_name,
+        client.surname AS client_surname,
+        client.username AS client_username,
+        provider.email AS provider_email,
+        provider.first_name AS provider_first_name,
+        provider.surname AS provider_surname,
+        provider.username AS provider_username
+      FROM booking b
+      LEFT JOIN service s ON s.id = b.service_id
+      LEFT JOIN user_account client ON client.id = b.client_user_id
+      LEFT JOIN user_account provider ON provider.id = b.provider_user_id_snapshot
+      WHERE b.id = ?
+      LIMIT 1
+      `,
+      [normalizedBookingId]
+    );
+
+    const row = rows[0] || null;
+    if (!row) {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      serviceStatus: normalizeServiceStatus(row.service_status, 'pending_deposit'),
+      settlementStatus: normalizeSettlementStatus(row.settlement_status, 'none'),
+      serviceTitle: row.service_title || 'Servicio sin título',
+      clientName: composeDisplayName({
+        firstName: row.client_first_name,
+        surname: row.client_surname,
+        username: row.client_username,
+        email: row.client_email,
+      }),
+      providerName: composeDisplayName({
+        firstName: row.provider_first_name,
+        surname: row.provider_surname,
+        username: row.provider_username,
+        email: row.provider_email,
+      }),
+    };
+  } finally {
+    connection.release();
+  }
+}
+
+async function sendBookingSupportAlertEmail({
+  bookingId,
+  headline,
+  details = null,
+  category = 'booking_support_case',
+}) {
+  if (!bookingSupportEmail) {
+    return false;
+  }
+
+  const context = await getBookingSupportAlertContext(bookingId);
+  if (!context) {
+    return false;
+  }
+
+  const bookingIdText = `#${context.id}`;
+  const subject = `[Wisdom][Booking] ${headline} ${bookingIdText}`;
+  const detailText = normalizeNullableText(details) || 'Sin detalles adicionales.';
+  const text = [
+    `Caso de soporte para la reserva ${bookingIdText}.`,
+    `Motivo: ${headline}`,
+    `Categoría: ${category}`,
+    `Servicio: ${context.serviceTitle}`,
+    `Cliente: ${context.clientName}`,
+    `Profesional: ${context.providerName}`,
+    `Estado servicio: ${context.serviceStatus}`,
+    `Estado liquidación: ${context.settlementStatus}`,
+    `Detalles: ${detailText}`,
+  ].join('\n');
+  const html = `<p><strong>Caso de soporte para la reserva ${escapeHtml(bookingIdText)}</strong></p>
+    <p><strong>Motivo:</strong> ${escapeHtml(headline)}<br/>
+    <strong>Categoría:</strong> ${escapeHtml(category)}<br/>
+    <strong>Servicio:</strong> ${escapeHtml(context.serviceTitle)}<br/>
+    <strong>Cliente:</strong> ${escapeHtml(context.clientName)}<br/>
+    <strong>Profesional:</strong> ${escapeHtml(context.providerName)}<br/>
+    <strong>Estado servicio:</strong> ${escapeHtml(context.serviceStatus)}<br/>
+    <strong>Estado liquidación:</strong> ${escapeHtml(context.settlementStatus)}<br/>
+    <strong>Detalles:</strong> ${escapeHtml(detailText)}</p>`;
+
+  await sendEmail({
+    to: bookingSupportEmail,
+    subject,
+    text,
+    html,
+  });
+  return true;
+}
+
 async function getClosureAutoChargeEmailContext(bookingId) {
   const normalizedBookingId = normalizeNullableInteger(bookingId);
   if (!normalizedBookingId) {
@@ -5215,6 +5921,84 @@ cron.schedule('*/10 * * * *', async () => {
     }
   } catch (error) {
     console.error('Error en cron de expiración de reservas:', error);
+  }
+});
+
+// cron cada 10 minutos para expirar solicitudes de modificación pendientes
+cron.schedule('*/10 * * * *', async () => {
+  try {
+    const [rows] = await pool.promise().query(
+      `
+      SELECT DISTINCT booking_id
+      FROM booking_change_request
+      WHERE status = 'pending'
+      ORDER BY booking_id ASC
+      LIMIT 100
+      `
+    );
+
+    let expiredCount = 0;
+    const expiredIdsToNotify = [];
+
+    for (const row of rows || []) {
+      const connection = await pool.promise().getConnection();
+      try {
+        await connection.beginTransaction();
+        const [[booking]] = await connection.query(
+          `
+          SELECT
+            id,
+            service_status,
+            settlement_status
+          FROM booking
+          WHERE id = ?
+          LIMIT 1
+          FOR UPDATE
+          `,
+          [row.booking_id]
+        );
+
+        if (!booking) {
+          await connection.rollback();
+          continue;
+        }
+
+        const expiredIds = await expirePendingBookingChangeRequestsForBooking(connection, booking, {
+          now: new Date(),
+        });
+        await connection.commit();
+
+        if (expiredIds.length > 0) {
+          expiredCount += expiredIds.length;
+          expiredIdsToNotify.push(...expiredIds);
+        }
+      } catch (error) {
+        try { await connection.rollback(); } catch {}
+        console.error('Error en cron de expiración de solicitudes de modificación:', error);
+      } finally {
+        connection.release();
+      }
+    }
+
+    for (const changeRequestId of expiredIdsToNotify) {
+      try {
+        await sendBookingChangeRequestNotificationEmail({
+          changeRequestId,
+          mode: 'expired',
+        });
+      } catch (emailError) {
+        console.error('Error sending expired booking change request email:', {
+          changeRequestId,
+          error: emailError.message,
+        });
+      }
+    }
+
+    if (expiredCount > 0) {
+      console.log(`[CRON] Expiradas ${expiredCount} solicitudes de modificación`);
+    }
+  } catch (error) {
+    console.error('Error en cron de solicitudes de modificación:', error);
   }
 });
 
@@ -9971,6 +10755,14 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         bir.status AS open_issue_status,
         bir.reported_by_user_id AS open_issue_reported_by_user_id,
         bir.created_at AS open_issue_created_at,
+        bcr.id AS change_request_id,
+        bcr.requested_by_user_id AS change_request_requested_by_user_id,
+        bcr.target_user_id AS change_request_target_user_id,
+        bcr.status AS change_request_status,
+        bcr.changes_json AS change_request_changes_json,
+        bcr.message AS change_request_message,
+        bcr.created_at AS change_request_created_at,
+        bcr.resolved_at AS change_request_resolved_at,
         p.price,
         COALESCE(p.currency, b.service_currency_snapshot) AS currency,
         COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
@@ -10005,6 +10797,16 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         FROM booking_issue_report bir2
         WHERE bir2.booking_id = b.id AND bir2.status = 'open'
         ORDER BY bir2.created_at DESC, bir2.id DESC
+        LIMIT 1
+      )
+      LEFT JOIN booking_change_request bcr ON bcr.id = (
+        SELECT bcr2.id
+        FROM booking_change_request bcr2
+        WHERE bcr2.booking_id = b.id
+        ORDER BY
+          CASE WHEN bcr2.status = 'pending' THEN 0 ELSE 1 END,
+          bcr2.created_at DESC,
+          bcr2.id DESC
         LIMIT 1
       )
       WHERE b.id = ?
@@ -10048,6 +10850,7 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
   }
 
   const connection = await promisePool.getConnection();
+  let createdChangeRequestId = null;
   try {
     await connection.beginTransaction();
 
@@ -10099,126 +10902,276 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
       return res.status(409).json({ error: 'La reserva ya no se puede editar en este estado.' });
     }
 
-    const hasStartField = Object.prototype.hasOwnProperty.call(req.body, 'requested_start_datetime')
-      || Object.prototype.hasOwnProperty.call(req.body, 'booking_start_datetime');
-    const hasDurationField = Object.prototype.hasOwnProperty.call(req.body, 'requested_duration_minutes')
-      || Object.prototype.hasOwnProperty.call(req.body, 'service_duration');
-    const hasDescriptionField = Object.prototype.hasOwnProperty.call(req.body, 'description');
-    const hasAddressField = Object.prototype.hasOwnProperty.call(req.body, 'address_id');
+    await expirePendingBookingChangeRequestsForBooking(connection, currentBooking, {
+      now: new Date(),
+    });
 
-    let nextAddressId = currentBooking.address_id;
-    if (hasAddressField) {
-      nextAddressId = normalizeNullableInteger(req.body.address_id);
-      if (nextAddressId !== null) {
-        const [[existingAddress]] = await connection.query(
-          'SELECT id FROM address WHERE id = ? LIMIT 1 FOR UPDATE',
-          [nextAddressId]
-        );
-        if (!existingAddress) {
-          await connection.rollback();
-          return res.status(400).json({ error: 'address_id no existe.' });
-        }
+    const preparedUpdate = await prepareBookingEditableUpdate(connection, currentBooking, req.body || {});
+    const currentComparableFields = buildBookingEditableComparableFields(currentBooking);
+    if (bookingEditableFieldsAreEqual(currentComparableFields, preparedUpdate.comparableFields)) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'No hay cambios nuevos para enviar.' });
+    }
+
+    if (isStaff) {
+      await applyPreparedBookingEditableUpdate(connection, bookingId, preparedUpdate);
+      await expirePendingBookingChangeRequestsForBooking(connection, currentBooking, {
+        force: true,
+        now: new Date(),
+      });
+      await connection.commit();
+      return res.status(200).json({ message: 'Reserva actualizada con éxito' });
+    }
+
+    const existingPendingChangeRequest = await getLatestBookingChangeRequest(connection, bookingId, {
+      forUpdate: true,
+      pendingOnly: true,
+    });
+    if (existingPendingChangeRequest) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'Ya existe una solicitud de modificación pendiente para esta reserva.' });
+    }
+
+    const requesterUserId = isClientOwner
+      ? normalizeNullableInteger(currentBooking.client_user_id)
+      : normalizeNullableInteger(currentBooking.provider_user_id_snapshot);
+    const targetUserId = isClientOwner
+      ? normalizeNullableInteger(currentBooking.provider_user_id_snapshot)
+      : normalizeNullableInteger(currentBooking.client_user_id);
+    if (!requesterUserId || !targetUserId) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'La reserva no tiene ambas partes asociadas para crear la solicitud.' });
+    }
+
+    const changeRequestMessage = normalizeNullableText(req.body?.message);
+    const [insertResult] = await connection.query(
+      `
+      INSERT INTO booking_change_request
+        (booking_id, requested_by_user_id, target_user_id, status, changes_json, message)
+      VALUES (?, ?, ?, 'pending', ?, ?)
+      `,
+      [
+        bookingId,
+        requesterUserId,
+        targetUserId,
+        JSON.stringify(preparedUpdate.changeRequestPayload),
+        changeRequestMessage,
+      ]
+    );
+    createdChangeRequestId = insertResult.insertId;
+
+    await connection.commit();
+
+    try {
+      await sendBookingChangeRequestNotificationEmail({
+        changeRequestId: createdChangeRequestId,
+        mode: 'created',
+      });
+    } catch (emailError) {
+      console.error('Error sending booking change request email:', {
+        bookingId,
+        changeRequestId: createdChangeRequestId,
+        error: emailError.message,
+      });
+    }
+
+    return res.status(202).json({
+      message: 'Solicitud de modificación enviada.',
+      requires_approval: true,
+      change_request: {
+        id: createdChangeRequestId,
+        booking_id: bookingId,
+        requested_by_user_id: requesterUserId,
+        target_user_id: targetUserId,
+        status: 'pending',
+        changes: preparedUpdate.changeRequestPayload,
+        message: changeRequestMessage,
+      },
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    console.error('Error al actualizar la reserva:', error);
+    return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToken, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  const changeRequestId = normalizeNullableInteger(req.params.changeRequestId);
+  if (!bookingId || !changeRequestId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const action = normalizeBookingChangeRequestStatus(req.body?.action, null);
+  if (!['accepted', 'rejected', 'canceled'].includes(action)) {
+    return res.status(400).json({ error: 'action inválida.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  let shouldNotifyRequester = false;
+  try {
+    await connection.beginTransaction();
+
+    const [[currentBooking]] = await connection.query(
+      `
+      SELECT
+        b.id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
+        b.service_status,
+        b.settlement_status,
+        b.order_datetime AS created_at,
+        b.order_datetime,
+        b.requested_start_datetime,
+        b.requested_duration_minutes,
+        b.requested_end_datetime,
+        b.description,
+        b.address_id,
+        b.price_type_snapshot,
+        b.service_currency_snapshot,
+        b.unit_price_amount_cents_snapshot,
+        b.minimum_notice_policy_snapshot,
+        b.estimated_base_amount_cents,
+        b.estimated_commission_amount_cents,
+        b.estimated_total_amount_cents
+      FROM booking b
+      WHERE b.id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!currentBooking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const requesterUserId = normalizeNullableInteger(req.user?.id);
+    const isClientOwner = requesterUserId !== null && requesterUserId === Number(currentBooking.client_user_id);
+    const isProviderOwner = requesterUserId !== null && requesterUserId === Number(currentBooking.provider_user_id_snapshot);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isClientOwner && !isProviderOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
+
+    await expirePendingBookingChangeRequestsForBooking(connection, currentBooking, {
+      now: new Date(),
+    });
+
+    const [[changeRequest]] = await connection.query(
+      `
+      SELECT
+        id,
+        booking_id,
+        requested_by_user_id,
+        target_user_id,
+        status,
+        changes_json,
+        message,
+        created_at,
+        resolved_at
+      FROM booking_change_request
+      WHERE id = ?
+        AND booking_id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [changeRequestId, bookingId]
+    );
+
+    if (!changeRequest) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Solicitud de modificación no encontrada.' });
+    }
+
+    if (normalizeBookingChangeRequestStatus(changeRequest.status, 'pending') !== 'pending') {
+      await connection.rollback();
+      return res.status(409).json({ error: 'La solicitud de modificación ya no está pendiente.' });
+    }
+
+    const isRequestOwner = requesterUserId !== null && requesterUserId === Number(changeRequest.requested_by_user_id);
+    const isRequestTarget = requesterUserId !== null && requesterUserId === Number(changeRequest.target_user_id);
+
+    if (action === 'canceled' && !isRequestOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo quien creó la solicitud puede cancelarla.' });
+    }
+
+    if ((action === 'accepted' || action === 'rejected') && !isRequestTarget && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo la otra parte puede responder la solicitud.' });
+    }
+
+    if (action === 'accepted') {
+      if (!canEditBooking(currentBooking)) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'La reserva ya no se puede modificar en este estado.' });
+      }
+
+      const requestedChanges = parseJsonObject(changeRequest.changes_json) || {};
+      const preparedUpdate = await prepareBookingEditableUpdate(connection, currentBooking, requestedChanges);
+      const currentComparableFields = buildBookingEditableComparableFields(currentBooking);
+      if (!bookingEditableFieldsAreEqual(currentComparableFields, preparedUpdate.comparableFields)) {
+        await applyPreparedBookingEditableUpdate(connection, bookingId, preparedUpdate);
       }
     }
 
-    const requestedStartInput = hasStartField
-      ? (req.body.requested_start_datetime ?? req.body.booking_start_datetime ?? null)
-      : currentBooking.requested_start_datetime;
-    const requestedStartDateTime = parseDateTimeInput(requestedStartInput);
-    const requestedDurationMinutes = hasDurationField
-      ? normalizeDurationMinutes(req.body.requested_duration_minutes ?? req.body.service_duration ?? null)
-      : normalizeDurationMinutes(currentBooking.requested_duration_minutes);
-
-    if (!isDurationMinutesInRange(requestedDurationMinutes)) {
-      await connection.rollback();
-      return res.status(400).json({
-        error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
-      });
-    }
-
-    if (requestedStartDateTime && requestedStartDateTime.getTime() < Date.now()) {
-      await connection.rollback();
-      return res.status(400).json({ error: 'No se puede reprogramar la reserva en el pasado.' });
-    }
-
-    const minimumNoticePolicyMinutes = normalizeMinimumNoticeMinutes(currentBooking.minimum_notice_policy_snapshot);
-    if (!meetsMinimumNotice({
-      requestedStartDateTime,
-      minimumNoticeMinutes: minimumNoticePolicyMinutes,
-      now: new Date(),
-    })) {
-      await connection.rollback();
-      return res.status(400).json({
-        error: `Este servicio exige una antelación mínima de ${formatLeadTimeLabel(minimumNoticePolicyMinutes)}.`,
-      });
-    }
-
-    const schedule = buildBookingSchedule({
-      createdAt: currentBooking.order_datetime ?? currentBooking.created_at,
-      requestedStartDateTime,
-      requestedDurationMinutes,
-    });
-    const bookingCurrency = normalizeCurrencyCode(currentBooking.service_currency_snapshot, 'EUR');
-    const unitPriceAmount = currentBooking.unit_price_amount_cents_snapshot === null || currentBooking.unit_price_amount_cents_snapshot === undefined
-      ? 0
-      : fromMinorUnits(currentBooking.unit_price_amount_cents_snapshot, bookingCurrency);
-    const pricingSnapshot = computeBookingPricingSnapshot({
-      priceType: currentBooking.price_type_snapshot,
-      unitPrice: unitPriceAmount,
-      durationMinutes: requestedDurationMinutes,
-      currency: bookingCurrency,
-    });
-    const nextDescription = hasDescriptionField
-      ? (typeof req.body.description === 'string' && req.body.description.trim() ? req.body.description.trim() : null)
-      : currentBooking.description;
-    const estimatedBaseAmountCents = pricingSnapshot.final === null && pricingSnapshot.type !== 'fix'
-      ? null
-      : toMinorUnits(pricingSnapshot.base, bookingCurrency);
-    const estimatedCommissionAmountCents = toMinorUnits(pricingSnapshot.commission || 0, bookingCurrency);
-    const estimatedTotalAmountCents = pricingSnapshot.final === null
-      ? null
-      : toMinorUnits(pricingSnapshot.final, bookingCurrency);
-
     await connection.query(
       `
-      UPDATE booking
-      SET requested_start_datetime = ?,
-          requested_duration_minutes = ?,
-          requested_end_datetime = ?,
-          accept_deadline_at = ?,
-          expires_at = ?,
-          last_minute_window_starts_at = ?,
-          address_id = ?,
-          description = ?,
-          estimated_base_amount_cents = ?,
-          estimated_commission_amount_cents = ?,
-          estimated_total_amount_cents = ?,
-          deposit_amount_cents_snapshot = ?
+      UPDATE booking_change_request
+      SET status = ?,
+          resolved_at = ?
       WHERE id = ?
       `,
-      [
-        toDbDateTime(schedule.requestedStartDateTime),
-        schedule.requestedDurationMinutes,
-        toDbDateTime(schedule.requestedEndDateTime),
-        toDbDateTime(schedule.acceptDeadlineAt),
-        toDbDateTime(schedule.expiresAt),
-        toDbDateTime(schedule.lastMinuteWindowStartsAt),
-        nextAddressId,
-        nextDescription,
-        estimatedBaseAmountCents,
-        estimatedCommissionAmountCents,
-        estimatedTotalAmountCents,
-        estimatedCommissionAmountCents,
-        bookingId,
-      ]
+      [action, toDbDateTime(new Date()), changeRequestId]
     );
 
+    if (action === 'accepted') {
+      await expirePendingBookingChangeRequestsForBooking(connection, currentBooking, {
+        force: true,
+        now: new Date(),
+      });
+    }
+
     await connection.commit();
-    return res.status(200).json({ message: 'Reserva actualizada con éxito' });
+    shouldNotifyRequester = action !== 'canceled' || isStaff;
+
+    if (shouldNotifyRequester) {
+      try {
+        await sendBookingChangeRequestNotificationEmail({
+          changeRequestId,
+          mode: action,
+        });
+      } catch (emailError) {
+        console.error('Error sending booking change request resolution email:', {
+          bookingId,
+          changeRequestId,
+          error: emailError.message,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      message: action === 'accepted'
+        ? 'Solicitud aceptada.'
+        : action === 'rejected'
+          ? 'Solicitud rechazada.'
+          : 'Solicitud cancelada.',
+    });
   } catch (error) {
     try { await connection.rollback(); } catch {}
-    console.error('Error al actualizar la reserva:', error);
-    return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    console.error('Error al responder la solicitud de modificación:', error);
+    return res.status(500).json({ error: 'Error al responder la solicitud de modificación.' });
   } finally {
     connection.release();
   }
@@ -10885,6 +11838,21 @@ app.post('/api/bookings/:id/dispute', authenticateToken, async (req, res) => {
     });
 
     await connection.commit();
+
+    try {
+      await sendBookingSupportAlertEmail({
+        bookingId,
+        headline: 'Disputa abierta por el cliente',
+        details: disputeDetails,
+        category: 'payment_dispute',
+      });
+    } catch (emailError) {
+      console.error('Error sending booking dispute support alert:', {
+        bookingId,
+        error: emailError.message,
+      });
+    }
+
     return res.status(201).json({
       message: 'Disputa abierta.',
       issue_report: {
@@ -11037,6 +12005,21 @@ app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
     );
 
     await connection.commit();
+
+    try {
+      await sendBookingSupportAlertEmail({
+        bookingId,
+        headline: 'Nueva incidencia abierta en una reserva',
+        details,
+        category: issueType,
+      });
+    } catch (emailError) {
+      console.error('Error sending booking issue support alert:', {
+        bookingId,
+        error: emailError.message,
+      });
+    }
+
     return res.status(201).json({
       message: 'Incidencia registrada.',
       issue_report: {
@@ -11053,6 +12036,175 @@ app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
     return res.status(500).json({ error: 'Error al registrar la incidencia.' });
   } finally {
     connection.release();
+  }
+});
+
+app.get('/api/booking-support/cases', authenticateToken, async (req, res) => {
+  const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+  if (!isStaff) {
+    return res.status(403).json({ error: 'No autorizado.' });
+  }
+
+  const statusFilter = String(req.query?.status || 'open').trim().toLowerCase();
+  if (!['open', 'resolved', 'dismissed', 'all'].includes(statusFilter)) {
+    return res.status(400).json({ error: 'status inválido.' });
+  }
+
+  const limit = Math.min(100, Math.max(1, Number(req.query?.limit || 50)));
+  const offset = Math.max(0, Number(req.query?.offset || 0));
+  const issueJoinStatusClause = statusFilter === 'all' ? '' : 'AND bir2.status = ?';
+  const issueExistsStatusClause = statusFilter === 'all' ? '' : 'AND bir3.status = ?';
+  const params = [];
+  if (statusFilter !== 'all') {
+    params.push(statusFilter, statusFilter);
+  }
+  params.push(limit, offset);
+
+  try {
+    const [rows] = await pool.promise().query(
+      `
+      SELECT
+        b.id AS booking_id,
+        b.service_status,
+        b.settlement_status,
+        b.order_datetime,
+        b.updated_at,
+        COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
+        client.id AS client_user_id,
+        client.email AS client_email,
+        client.first_name AS client_first_name,
+        client.surname AS client_surname,
+        provider.id AS provider_user_id,
+        provider.email AS provider_email,
+        provider.first_name AS provider_first_name,
+        provider.surname AS provider_surname,
+        bir.id AS issue_report_id,
+        bir.issue_type,
+        bir.status AS issue_status,
+        bir.details AS issue_details,
+        bir.created_at AS issue_created_at,
+        bir.resolved_at AS issue_resolved_at
+      FROM booking b
+      LEFT JOIN service s ON s.id = b.service_id
+      LEFT JOIN user_account client ON client.id = b.client_user_id
+      LEFT JOIN user_account provider ON provider.id = b.provider_user_id_snapshot
+      LEFT JOIN booking_issue_report bir ON bir.id = (
+        SELECT bir2.id
+        FROM booking_issue_report bir2
+        WHERE bir2.booking_id = b.id
+          ${issueJoinStatusClause}
+        ORDER BY
+          CASE WHEN bir2.status = 'open' THEN 0 ELSE 1 END,
+          bir2.created_at DESC,
+          bir2.id DESC
+        LIMIT 1
+      )
+      WHERE (
+        b.settlement_status IN ('manual_review_required', 'in_dispute')
+        OR EXISTS (
+          SELECT 1
+          FROM booking_issue_report bir3
+          WHERE bir3.booking_id = b.id
+            ${issueExistsStatusClause}
+        )
+      )
+      ORDER BY
+        CASE WHEN b.settlement_status IN ('manual_review_required', 'in_dispute') THEN 0 ELSE 1 END,
+        COALESCE(bir.created_at, b.updated_at, b.order_datetime) DESC
+      LIMIT ?
+      OFFSET ?
+      `,
+      params
+    );
+
+    return res.status(200).json((rows || []).map((row) => ({
+      booking_id: row.booking_id,
+      service_title: row.service_title,
+      service_status: normalizeServiceStatus(row.service_status, 'pending_deposit'),
+      settlement_status: normalizeSettlementStatus(row.settlement_status, 'none'),
+      needs_manual_review: ['manual_review_required', 'in_dispute'].includes(
+        normalizeSettlementStatus(row.settlement_status, 'none')
+      ),
+      client: {
+        id: normalizeNullableInteger(row.client_user_id),
+        email: row.client_email || null,
+        name: composeDisplayName({
+          firstName: row.client_first_name,
+          surname: row.client_surname,
+          email: row.client_email,
+        }),
+      },
+      provider: {
+        id: normalizeNullableInteger(row.provider_user_id),
+        email: row.provider_email || null,
+        name: composeDisplayName({
+          firstName: row.provider_first_name,
+          surname: row.provider_surname,
+          email: row.provider_email,
+        }),
+      },
+      issue_report: row.issue_report_id
+        ? {
+          id: row.issue_report_id,
+          issue_type: row.issue_type,
+          status: row.issue_status,
+          details: row.issue_details,
+          created_at: row.issue_created_at,
+          resolved_at: row.issue_resolved_at,
+        }
+        : null,
+    })));
+  } catch (error) {
+    console.error('Error al listar casos de soporte de reservas:', error);
+    return res.status(500).json({ error: 'Error al listar los casos de soporte de reservas.' });
+  }
+});
+
+app.patch('/api/booking-support/issues/:issueReportId', authenticateToken, async (req, res) => {
+  const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+  if (!isStaff) {
+    return res.status(403).json({ error: 'No autorizado.' });
+  }
+
+  const issueReportId = normalizeNullableInteger(req.params.issueReportId);
+  if (!issueReportId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const nextStatus = String(req.body?.status || '').trim().toLowerCase();
+  if (!['open', 'resolved', 'dismissed'].includes(nextStatus)) {
+    return res.status(400).json({ error: 'status inválido.' });
+  }
+
+  const nextDetails = normalizeNullableText(req.body?.details);
+
+  try {
+    const [result] = await pool.promise().query(
+      `
+      UPDATE booking_issue_report
+      SET status = ?,
+          details = COALESCE(?, details),
+          resolved_at = ?
+      WHERE id = ?
+      `,
+      [
+        nextStatus,
+        nextDetails,
+        nextStatus === 'resolved' || nextStatus === 'dismissed'
+          ? toDbDateTime(new Date())
+          : null,
+        issueReportId,
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Incidencia no encontrada.' });
+    }
+
+    return res.status(200).json({ message: 'Incidencia actualizada.' });
+  } catch (error) {
+    console.error('Error al actualizar la incidencia de soporte:', error);
+    return res.status(500).json({ error: 'Error al actualizar la incidencia de soporte.' });
   }
 });
 
