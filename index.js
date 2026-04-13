@@ -21,6 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const { computeServiceResponseTime, computeServiceSuccessRate } = require('./src/serviceMetrics');
 const { createVisionIdDetector } = require('./src/visionIdDetection');
+const { getFirestore } = require('./src/firestore');
 const {
   buildServiceSearchCandidateClause,
   buildServiceSearchPlan,
@@ -75,6 +76,53 @@ async function handleStripeRollbackIfNeeded(error) {
     }
   } catch (cancelErr) {
     console.error("Error cancelling payment intent:", cancelErr);
+  }
+}
+
+async function syncPreBookingConversationUnlock({
+  serviceId,
+  clientUserId,
+  providerUserId,
+  bookingId,
+}) {
+  const normalizedServiceId = Number(serviceId);
+  const normalizedClientUserId = Number(clientUserId);
+  const normalizedProviderUserId = Number(providerUserId);
+
+  if (
+    !Number.isFinite(normalizedServiceId)
+    || !Number.isFinite(normalizedClientUserId)
+    || !Number.isFinite(normalizedProviderUserId)
+  ) {
+    return;
+  }
+
+  const firestore = getFirestore();
+  if (!firestore) {
+    return;
+  }
+
+  const conversationId = [normalizedClientUserId, normalizedProviderUserId]
+    .sort((left, right) => left - right)
+    .join('_');
+
+  try {
+    await firestore.collection('conversations').doc(conversationId).set({
+      contextType: 'service_prebooking',
+      serviceId: normalizedServiceId,
+      serviceOwnerId: normalizedProviderUserId,
+      preBookingMessageLimit: 5,
+      bookingUnlocked: true,
+      unlockedBookingId: Number.isFinite(Number(bookingId)) ? Number(bookingId) : null,
+    }, { merge: true });
+  } catch (error) {
+    console.error('Error syncing pre-booking chat unlock:', {
+      serviceId: normalizedServiceId,
+      clientUserId: normalizedClientUserId,
+      providerUserId: normalizedProviderUserId,
+      bookingId,
+      error: error.message,
+    });
   }
 }
 
@@ -5698,6 +5746,20 @@ function parseExperienceYearsInput(value, defaultValue) {
   return parsedValue;
 }
 
+function parseMinimumNoticePolicyInput(value, defaultValue = 1440) {
+  const parsedValue = parseIntegerInput(
+    value,
+    defaultValue === null || defaultValue === undefined ? 1440 : defaultValue,
+    'minimum_notice_policy'
+  );
+
+  if (![0, 120, 1440, 2880, 10080].includes(parsedValue)) {
+    throw invalidInputError('invalid_minimum_notice_policy');
+  }
+
+  return parsedValue;
+}
+
 function toMySQLDatetime(value) {
   if (!value) return null;
   const date = new Date(value);
@@ -7930,6 +7992,7 @@ app.post('/api/service', (req, res) => {
     consult_via_provide,
     consult_via_username,
     consult_via_url,
+    minimum_notice_policy,
     is_individual,
     allow_discounts,
     discount_rate,
@@ -7951,10 +8014,12 @@ app.post('/api/service', (req, res) => {
   const normalizedIsIndividual = is_individual === undefined || is_individual === null ? true : Boolean(is_individual);
   const normalizedHobbies = typeof hobbies === 'string' && hobbies.trim().length > 0 ? hobbies : null;
   let normalizedExperienceYears;
+  let normalizedMinimumNoticePolicy;
   try {
     normalizedExperienceYears = parseExperienceYearsInput(experience_years, 1);
+    normalizedMinimumNoticePolicy = parseMinimumNoticePolicyInput(minimum_notice_policy, 1440);
   } catch (parseError) {
-    return res.status(parseError.status || 400).json({ error: parseError.message || 'invalid_experience_years' });
+    return res.status(parseError.status || 400).json({ error: parseError.message || 'invalid_service_fields' });
   }
 
   pool.getConnection((err, connection) => {
@@ -8012,12 +8077,12 @@ app.post('/api/service', (req, res) => {
             // 3. Insertar en la tabla 'service'
             const serviceQuery = `
               INSERT INTO service (
-                service_title, user_id, description, service_category_id, price_id, latitude, longitude, action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, allow_discounts, discount_rate, hobbies, experience_years, service_created_datetime, is_hidden, last_edit_datetime
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
+                service_title, user_id, description, service_category_id, price_id, latitude, longitude, action_rate, user_can_ask, user_can_consult, price_consult, consult_via_id, is_individual, minimum_notice_policy, allow_discounts, discount_rate, hobbies, experience_years, service_created_datetime, is_hidden, last_edit_datetime
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
             `;
             const serviceValues = [
               service_title, user_id, description, service_category_id, price_id, latitude, longitude,
-              action_rate, normalizedUserCanAsk, normalizedUserCanConsult, normalizedPriceConsult, consult_via_id, normalizedIsIndividual, normalizedAllowDiscounts, normalizedDiscountRate, normalizedHobbies, normalizedExperienceYears, isHiddenValue, null
+              action_rate, normalizedUserCanAsk, normalizedUserCanConsult, normalizedPriceConsult, consult_via_id, normalizedIsIndividual, normalizedMinimumNoticePolicy, normalizedAllowDiscounts, normalizedDiscountRate, normalizedHobbies, normalizedExperienceYears, isHiddenValue, null
             ];
 
             connection.query(serviceQuery, serviceValues, (err, result) => {
@@ -8460,6 +8525,7 @@ app.put('/api/services/:id', async (req, res) => {
     let allowDiscounts;
     let discountRate;
     let experienceYears;
+    let minimumNoticePolicy;
     let hobbies;
     let isHidden;
     let consultProvider;
@@ -8518,6 +8584,7 @@ app.put('/api/services/:id', async (req, res) => {
       allowDiscounts = parseBooleanInput(body.allow_discounts, Boolean(service.allow_discounts), 'allow_discounts');
       discountRate = parseNumberInput(body.discount_rate, service.discount_rate, 'discount_rate');
       experienceYears = parseExperienceYearsInput(body.experience_years, service.experience_years ?? 1);
+      minimumNoticePolicy = parseMinimumNoticePolicyInput(body.minimum_notice_policy, service.minimum_notice_policy ?? 1440);
       hobbies = body.hobbies !== undefined ? body.hobbies : service.hobbies;
       if (hobbies !== undefined && hobbies !== null) {
         hobbies = String(hobbies);
@@ -8562,6 +8629,7 @@ app.put('/api/services/:id', async (req, res) => {
               price_consult = ?,
               consult_via_id = ?,
               is_individual = ?,
+              minimum_notice_policy = ?,
               allow_discounts = ?,
               discount_rate = ?,
               experience_years = ?,
@@ -8581,6 +8649,7 @@ app.put('/api/services/:id', async (req, res) => {
         priceConsult,
         consultViaId,
         isIndividual ? 1 : 0,
+        minimumNoticePolicy,
         allowDiscounts ? 1 : 0,
         discountRate,
         experienceYears,
@@ -9119,6 +9188,64 @@ app.get('/api/service/:id', (req, res) => {
       }
     });
   });
+});
+
+app.get('/api/services/:id/pre-booking-chat-status', authenticateToken, async (req, res) => {
+  const serviceId = normalizeNullableInteger(req.params.id);
+  const requesterUserId = normalizeNullableInteger(req.user?.id);
+
+  if (!serviceId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  if (!requesterUserId) {
+    return res.status(401).json({ error: 'No autenticado.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    const [[serviceRow]] = await connection.query(
+      `
+      SELECT id, user_id
+      FROM service
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [serviceId]
+    );
+
+    if (!serviceRow) {
+      return res.status(404).json({ error: 'Servicio no encontrado.' });
+    }
+
+    if (Number(serviceRow.user_id) === requesterUserId) {
+      return res.status(200).json({ unlocked: true, booking_id: null });
+    }
+
+    const [[bookingRow]] = await connection.query(
+      `
+      SELECT id
+      FROM booking
+      WHERE service_id = ?
+        AND client_user_id = ?
+        AND provider_user_id_snapshot = ?
+        AND service_status IN ('accepted', 'in_progress', 'finished')
+      ORDER BY id DESC
+      LIMIT 1
+      `,
+      [serviceId, requesterUserId, serviceRow.user_id]
+    );
+
+    return res.status(200).json({
+      unlocked: Boolean(bookingRow),
+      booking_id: bookingRow?.id ?? null,
+    });
+  } catch (error) {
+    console.error('Error resolving pre-booking chat status:', error);
+    return res.status(500).json({ error: 'Error al comprobar el estado del chat previo.' });
+  } finally {
+    connection.release();
+  }
 });
 
 //Ruta para obtener los 10 profesionales de la tabla
@@ -10561,6 +10688,8 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
     })) {
       await connection.rollback();
       return res.status(400).json({
+        error_code: 'minimum_notice_not_met',
+        minimum_notice_policy: minimumNoticePolicyMinutes,
         error: `Este servicio exige una antelación mínima de ${formatLeadTimeLabel(minimumNoticePolicyMinutes)}.`,
       });
     }
@@ -10858,6 +10987,7 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
       `
       SELECT
         b.id,
+        b.service_id,
         b.client_user_id,
         b.provider_user_id_snapshot,
         b.service_status,
@@ -11477,6 +11607,15 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
           error: notificationContextError.message,
         });
       }
+    }
+
+    if (normalizedCurrentServiceStatus === 'requested' && normalizedNextServiceStatus === 'accepted') {
+      await syncPreBookingConversationUnlock({
+        serviceId: booking.service_id,
+        clientUserId: booking.client_user_id,
+        providerUserId: booking.provider_user_id_snapshot,
+        bookingId,
+      });
     }
 
     if (refundRequest?.paymentIntentId) {
@@ -13099,6 +13238,10 @@ function formatLeadTimeLabel(minutes) {
   const normalizedMinutes = normalizeMinimumNoticeMinutes(minutes);
   if (normalizedMinutes === null || normalizedMinutes <= 0) {
     return null;
+  }
+
+  if (normalizedMinutes === 2880) {
+    return '48 horas';
   }
 
   if (normalizedMinutes % (7 * 24 * 60) === 0) {
