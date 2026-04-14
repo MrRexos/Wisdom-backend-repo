@@ -2487,6 +2487,34 @@ function bookingEditableFieldsAreEqual(left = {}, right = {}) {
     && left.description === right.description;
 }
 
+function formatLeadTimeLabel(minutes) {
+  const normalizedMinutes = normalizeMinimumNoticeMinutes(minutes);
+  if (normalizedMinutes === null || normalizedMinutes <= 0) {
+    return null;
+  }
+
+  if (normalizedMinutes === 2880) {
+    return '48 horas';
+  }
+
+  if (normalizedMinutes % (7 * 24 * 60) === 0) {
+    const weeks = normalizedMinutes / (7 * 24 * 60);
+    return weeks === 1 ? '1 semana' : `${weeks} semanas`;
+  }
+
+  if (normalizedMinutes % (24 * 60) === 0) {
+    const days = normalizedMinutes / (24 * 60);
+    return days === 1 ? '24 horas' : `${days} días`;
+  }
+
+  if (normalizedMinutes % 60 === 0) {
+    const hours = normalizedMinutes / 60;
+    return hours === 1 ? '1 hora' : `${hours} horas`;
+  }
+
+  return normalizedMinutes === 1 ? '1 minuto' : `${normalizedMinutes} minutos`;
+}
+
 async function prepareBookingEditableUpdate(connection, currentBooking, requestBody = {}) {
   const hasStartField = Object.prototype.hasOwnProperty.call(requestBody, 'requested_start_datetime')
     || Object.prototype.hasOwnProperty.call(requestBody, 'booking_start_datetime');
@@ -13233,34 +13261,6 @@ const round2 = (n) => {
   if (!Number.isFinite(x)) return 0;
   return Math.round((x + Number.EPSILON) * 100) / 100;
 };
-
-function formatLeadTimeLabel(minutes) {
-  const normalizedMinutes = normalizeMinimumNoticeMinutes(minutes);
-  if (normalizedMinutes === null || normalizedMinutes <= 0) {
-    return null;
-  }
-
-  if (normalizedMinutes === 2880) {
-    return '48 horas';
-  }
-
-  if (normalizedMinutes % (7 * 24 * 60) === 0) {
-    const weeks = normalizedMinutes / (7 * 24 * 60);
-    return weeks === 1 ? '1 semana' : `${weeks} semanas`;
-  }
-
-  if (normalizedMinutes % (24 * 60) === 0) {
-    const days = normalizedMinutes / (24 * 60);
-    return days === 1 ? '24 horas' : `${days} días`;
-  }
-
-  if (normalizedMinutes % 60 === 0) {
-    const hours = normalizedMinutes / 60;
-    return hours === 1 ? '1 hora' : `${hours} horas`;
-  }
-
-  return normalizedMinutes === 1 ? '1 minuto' : `${normalizedMinutes} minutos`;
-}
 
     // Duración efectiva
     const storedDurationMin = Number.isFinite(Number(booking.service_duration)) ? Number(booking.service_duration) : null;
