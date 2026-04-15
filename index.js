@@ -1309,6 +1309,173 @@ function buildDistanceExpression({
   };
 }
 
+function normalizeCoordinateValue(value, {
+  min = -180,
+  max = 180,
+} = {}) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue) || numericValue < min || numericValue > max) {
+    return null;
+  }
+
+  return numericValue;
+}
+
+function buildLocationObject(latitude, longitude) {
+  const normalizedLatitude = normalizeCoordinateValue(latitude, { min: -90, max: 90 });
+  const normalizedLongitude = normalizeCoordinateValue(longitude, { min: -180, max: 180 });
+
+  if (normalizedLatitude === null || normalizedLongitude === null) {
+    return null;
+  }
+
+  return {
+    lat: normalizedLatitude,
+    lng: normalizedLongitude,
+  };
+}
+
+function calculateDistanceKmBetweenLocations(origin, target) {
+  if (!origin || !target) {
+    return null;
+  }
+
+  const earthRadiusKm = 6371;
+  const toRadians = (value) => value * (Math.PI / 180);
+  const deltaLat = toRadians(target.lat - origin.lat);
+  const deltaLng = toRadians(target.lng - origin.lng);
+  const originLat = toRadians(origin.lat);
+  const targetLat = toRadians(target.lat);
+
+  const haversine = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2)
+    + Math.cos(originLat) * Math.cos(targetLat)
+    * Math.sin(deltaLng / 2) * Math.sin(deltaLng / 2);
+  const centralAngle = 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+  return earthRadiusKm * centralAngle;
+}
+
+function getBookingAddressRuleForService(serviceRow = {}) {
+  const serviceLocation = buildLocationObject(serviceRow.latitude, serviceRow.longitude);
+  const rawActionRate = Number(serviceRow.action_rate);
+  const actionRate = Number.isFinite(rawActionRate) ? rawActionRate : null;
+
+  if (!serviceLocation) {
+    return {
+      mode: 'hidden',
+      actionRate,
+      serviceLocation: null,
+    };
+  }
+
+  if (actionRate === null || actionRate <= 0) {
+    return {
+      mode: 'fixed',
+      actionRate,
+      serviceLocation,
+    };
+  }
+
+  return {
+    mode: 'required',
+    actionRate,
+    serviceLocation,
+  };
+}
+
+function hasInlineAddressFields(body = {}) {
+  return Boolean(
+    body.address_type
+    && body.address_1
+    && body.postal_code
+    && body.city
+    && body.state
+    && body.country
+  );
+}
+
+function extractAddressLocationFromSource(source = {}) {
+  return buildLocationObject(
+    source.latitude
+    ?? source.address_latitude
+    ?? source.lat
+    ?? source.location?.lat
+    ?? source.location?.latitude,
+    source.longitude
+    ?? source.address_longitude
+    ?? source.lng
+    ?? source.location?.lng
+    ?? source.location?.longitude
+  );
+}
+
+function assertBookingAddressRulesForService({
+  serviceRow,
+  addressRow = null,
+  requestBody = {},
+  allowUnknownAddressLocation = false,
+}) {
+  const rule = getBookingAddressRuleForService(serviceRow);
+  const hasAddress = Boolean(addressRow) || hasInlineAddressFields(requestBody);
+
+  if (rule.mode === 'hidden') {
+    return {
+      rule,
+      addressLocation: null,
+      distanceKm: null,
+    };
+  }
+
+  if (!hasAddress) {
+    const error = new Error(
+      rule.mode === 'fixed'
+        ? 'Este servicio tiene una ubicación fija y la reserva debe conservar esa dirección.'
+        : 'Este servicio requiere una dirección dentro del radio de acción del profesional.'
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const addressLocation = extractAddressLocationFromSource(addressRow || requestBody);
+  if (!addressLocation) {
+    if (allowUnknownAddressLocation) {
+      return {
+        rule,
+        addressLocation: null,
+        distanceKm: null,
+      };
+    }
+
+    const error = new Error('No se ha podido validar la dirección seleccionada. Vuelve a seleccionarla.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const distanceKm = calculateDistanceKmBetweenLocations(rule.serviceLocation, addressLocation);
+  if (!Number.isFinite(distanceKm)) {
+    return {
+      rule,
+      addressLocation,
+      distanceKm: null,
+    };
+  }
+
+  if (rule.mode === 'required' && Number.isFinite(rule.actionRate) && distanceKm > rule.actionRate) {
+    const error = new Error('La dirección indicada está fuera del radio de acción del profesional para este servicio.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return {
+    rule,
+    addressLocation,
+    distanceKm,
+  };
+}
+
 function generateObjectName(originalName = '') {
   const extension = path.extname(originalName || '') || '';
   const uniqueId = typeof crypto.randomUUID === 'function'
@@ -1795,10 +1962,14 @@ function mapBookingRecordForApi(row = {}) {
     has_actionable_change_request: isActionableChangeRequest,
     latest_change_request: latestChangeRequest,
     needs_closure_input: needsClosureInput,
-    can_edit: baseCanEditBooking && !hasPendingChangeRequest,
+    can_edit: baseCanEditBooking,
     selected_customer_payment_method: selectedCustomerPaymentMethod,
     price_type: row.price_type ?? row.price_type_snapshot ?? null,
     currency: normalizeCurrencyCode(row.currency, serviceCurrency),
+    location: buildLocationObject(
+      row.address_latitude ?? row.latitude ?? null,
+      row.address_longitude ?? row.longitude ?? null
+    ),
   };
 }
 
@@ -2010,6 +2181,11 @@ function assertBookingStatusUpdateAllowed({
         if (normalizedCurrentServiceStatus !== 'requested') {
           throwValidationError('Solo se puede rechazar una solicitud pendiente.');
         }
+      } else if (
+        normalizedCurrentServiceStatus === 'accepted'
+        && hasRequestedStartDateTimePassed(booking?.requested_start_datetime)
+      ) {
+        throwValidationError('Una vez superada la hora de inicio ya no se puede cancelar la reserva desde este estado.');
       }
       break;
     default:
@@ -2524,8 +2700,68 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
   const hasDescriptionField = Object.prototype.hasOwnProperty.call(requestBody, 'description');
   const hasAddressField = Object.prototype.hasOwnProperty.call(requestBody, 'address_id');
 
+  const [[serviceSnapshot]] = await connection.query(
+    `
+    SELECT
+      id,
+      latitude,
+      longitude,
+      action_rate
+    FROM service
+    WHERE id = ?
+    LIMIT 1
+    `,
+    [currentBooking.service_id]
+  );
+  if (!serviceSnapshot) {
+    const error = new Error('Servicio no encontrado.');
+    error.statusCode = 404;
+    throw error;
+  }
+
   let nextAddressId = currentBooking.address_id;
+  let currentAddressSnapshot = null;
   let nextAddressSnapshot = null;
+  if (currentBooking.address_id !== null && currentBooking.address_id !== undefined) {
+    const [[existingCurrentAddress]] = await connection.query(
+      `
+      SELECT
+        id,
+        address_type,
+        street_number,
+        address_1,
+        address_2,
+        postal_code,
+        city,
+        state,
+        country,
+        latitude,
+        longitude
+      FROM address
+      WHERE id = ?
+      LIMIT 1
+      ${hasAddressField ? 'FOR UPDATE' : ''}
+      `,
+      [currentBooking.address_id]
+    );
+    currentAddressSnapshot = existingCurrentAddress || null;
+    nextAddressSnapshot = currentAddressSnapshot
+      ? {
+        id: existingCurrentAddress.id,
+        address_type: existingCurrentAddress.address_type,
+        street_number: existingCurrentAddress.street_number,
+        address_1: existingCurrentAddress.address_1,
+        address_2: existingCurrentAddress.address_2,
+        postal_code: existingCurrentAddress.postal_code,
+        city: existingCurrentAddress.city,
+        state: existingCurrentAddress.state,
+        country: existingCurrentAddress.country,
+        latitude: existingCurrentAddress.latitude,
+        longitude: existingCurrentAddress.longitude,
+      }
+      : null;
+  }
+
   if (hasAddressField) {
     nextAddressId = normalizeNullableInteger(requestBody.address_id);
     if (nextAddressId !== null) {
@@ -2540,7 +2776,9 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
           postal_code,
           city,
           state,
-          country
+          country,
+          latitude,
+          longitude
         FROM address
         WHERE id = ?
         LIMIT 1
@@ -2563,8 +2801,28 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
         city: existingAddress.city,
         state: existingAddress.state,
         country: existingAddress.country,
+        latitude: existingAddress.latitude,
+        longitude: existingAddress.longitude,
       };
+    } else {
+      nextAddressSnapshot = null;
     }
+  }
+
+  const bookingAddressRule = getBookingAddressRuleForService(serviceSnapshot);
+  if (bookingAddressRule.mode === 'hidden') {
+    if (hasAddressField) {
+      nextAddressId = null;
+      nextAddressSnapshot = null;
+    }
+  } else {
+    const addressRowForValidation = hasAddressField ? nextAddressSnapshot : currentAddressSnapshot;
+    assertBookingAddressRulesForService({
+      serviceRow: serviceSnapshot,
+      addressRow: addressRowForValidation,
+      requestBody,
+      allowUnknownAddressLocation: !hasAddressField,
+    });
   }
 
   const requestedStartInput = hasStartField
@@ -2583,17 +2841,6 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
 
   if (requestedStartDateTime && requestedStartDateTime.getTime() < Date.now()) {
     const error = new Error('No se puede reprogramar la reserva en el pasado.');
-    error.statusCode = 400;
-    throw error;
-  }
-
-  const minimumNoticePolicyMinutes = normalizeMinimumNoticeMinutes(currentBooking.minimum_notice_policy_snapshot);
-  if (!meetsMinimumNotice({
-    requestedStartDateTime,
-    minimumNoticeMinutes: minimumNoticePolicyMinutes,
-    now: new Date(),
-  })) {
-    const error = new Error(`Este servicio exige una antelación mínima de ${formatLeadTimeLabel(minimumNoticePolicyMinutes)}.`);
     error.statusCode = 400;
     throw error;
   }
@@ -11051,7 +11298,25 @@ app.post('/api/user/:id/strike', authenticateToken, (req, res) => {
 
 //Ruta para guardar address + direction
 app.post('/api/directions', (req, res) => {
-  const { user_id, address_type, street_number, address_1, address_2, postal_code, city, state, country } = req.body;
+  const {
+    user_id,
+    address_type,
+    street_number,
+    address_1,
+    address_2,
+    postal_code,
+    city,
+    state,
+    country,
+  } = req.body;
+  const latitude = normalizeCoordinateValue(req.body?.latitude ?? req.body?.address_latitude, {
+    min: -90,
+    max: 90,
+  });
+  const longitude = normalizeCoordinateValue(req.body?.longitude ?? req.body?.address_longitude, {
+    min: -180,
+    max: 180,
+  });
 
   // Verificar que los campos requeridos estén presentes, excepto address_2 y street_number que pueden ser nulos
   if (!user_id || !address_type || !address_1 || !postal_code || !city || !state || !country) {
@@ -11069,8 +11334,8 @@ app.post('/api/directions', (req, res) => {
     }
 
     // Primero insertar la dirección en la tabla address
-    const addressQuery = 'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)';
-    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country];
+    const addressQuery = 'INSERT INTO address (address_type, street_number, address_1, address_2, postal_code, city, state, country, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
+    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country, latitude, longitude];
 
     connection.query(addressQuery, addressValues, (err, result) => {
       if (err) {
@@ -11115,7 +11380,7 @@ app.get('/api/directions/:user_id', (req, res) => {
 
     // Consulta para obtener todas las direcciones del usuario junto con los detalles de address
     const query = `
-      SELECT d.id AS direction_id, a.id AS address_id, a.address_type, a.street_number, a.address_1, a.address_2, a.postal_code, a.city, a.state, a.country
+      SELECT d.id AS direction_id, a.id AS address_id, a.address_type, a.street_number, a.address_1, a.address_2, a.postal_code, a.city, a.state, a.country, a.latitude, a.longitude
       FROM directions d
       JOIN address a ON d.address_id = a.id
       WHERE d.user_id = ?
@@ -11141,7 +11406,24 @@ app.get('/api/directions/:user_id', (req, res) => {
 //Actualziar address 
 app.put('/api/address/:id', (req, res) => {
   const { id } = req.params; // ID de la address a actualizar
-  const { address_type, street_number, address_1, address_2, postal_code, city, state, country } = req.body;
+  const {
+    address_type,
+    street_number,
+    address_1,
+    address_2,
+    postal_code,
+    city,
+    state,
+    country,
+  } = req.body;
+  const latitude = normalizeCoordinateValue(req.body?.latitude ?? req.body?.address_latitude, {
+    min: -90,
+    max: 90,
+  });
+  const longitude = normalizeCoordinateValue(req.body?.longitude ?? req.body?.address_longitude, {
+    min: -180,
+    max: 180,
+  });
 
   // Verificar que los campos requeridos estén presentes
   if (!address_type || !address_1 || !postal_code || !city || !state || !country) {
@@ -11159,11 +11441,11 @@ app.put('/api/address/:id', (req, res) => {
     }
 
     // Actualizar la dirección en la tabla address
-    const addressQuery = `
-      UPDATE address 
-      SET address_type = ?, street_number = ?, address_1 = ?, address_2 = ?, postal_code = ?, city = ?, state = ?, country = ?
-      WHERE id = ?`;
-    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country, id];
+      const addressQuery = `
+        UPDATE address 
+        SET address_type = ?, street_number = ?, address_1 = ?, address_2 = ?, postal_code = ?, city = ?, state = ?, country = ?, latitude = ?, longitude = ?
+        WHERE id = ?`;
+    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country, latitude, longitude, id];
 
     connection.query(addressQuery, addressValues, (err, result) => {
       connection.release(); // Liberar la conexión después de usarla
@@ -11255,41 +11537,6 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    if (addressId !== null) {
-      const [[existingAddress]] = await connection.query(
-        'SELECT id FROM address WHERE id = ? LIMIT 1 FOR UPDATE',
-        [addressId]
-      );
-      if (!existingAddress) {
-        await connection.rollback();
-        return res.status(400).json({ error: 'address_id no existe.' });
-      }
-    } else if (
-      req.body.address_type &&
-      req.body.address_1 &&
-      req.body.postal_code &&
-      req.body.city &&
-      req.body.state &&
-      req.body.country
-    ) {
-      const [addressInsertResult] = await connection.query(
-        `INSERT INTO address
-          (address_type, street_number, address_1, address_2, postal_code, city, state, country)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          req.body.address_type,
-          streetNumberValue,
-          req.body.address_1,
-          address2Value,
-          req.body.postal_code,
-          req.body.city,
-          req.body.state,
-          req.body.country,
-        ]
-      );
-      addressId = addressInsertResult.insertId;
-    }
-
     const [[serviceSnapshot]] = await connection.query(
       `
       SELECT
@@ -11297,6 +11544,9 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
         s.user_id AS provider_user_id_snapshot,
         s.service_title,
         s.minimum_notice_policy,
+        s.latitude,
+        s.longitude,
+        s.action_rate,
         p.price,
         p.currency AS currency,
         p.price_type
@@ -11327,6 +11577,78 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
         minimum_notice_policy: minimumNoticePolicyMinutes,
         error: `Este servicio exige una antelación mínima de ${formatLeadTimeLabel(minimumNoticePolicyMinutes)}.`,
       });
+    }
+
+    const bookingAddressRule = getBookingAddressRuleForService(serviceSnapshot);
+    if (bookingAddressRule.mode === 'hidden') {
+      addressId = null;
+    } else if (addressId !== null) {
+      const [[existingAddress]] = await connection.query(
+        `
+        SELECT
+          id,
+          address_type,
+          street_number,
+          address_1,
+          address_2,
+          postal_code,
+          city,
+          state,
+          country,
+          latitude,
+          longitude
+        FROM address
+        WHERE id = ?
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [addressId]
+      );
+      if (!existingAddress) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'address_id no existe.' });
+      }
+
+      assertBookingAddressRulesForService({
+        serviceRow: serviceSnapshot,
+        addressRow: existingAddress,
+        requestBody: req.body || {},
+      });
+    } else if (hasInlineAddressFields(req.body || {})) {
+      assertBookingAddressRulesForService({
+        serviceRow: serviceSnapshot,
+        requestBody: req.body || {},
+      });
+
+      const inlineAddressLocation = extractAddressLocationFromSource(req.body || {});
+      const [addressInsertResult] = await connection.query(
+        `INSERT INTO address
+          (address_type, street_number, address_1, address_2, postal_code, city, state, country, latitude, longitude)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          req.body.address_type,
+          streetNumberValue,
+          req.body.address_1,
+          address2Value,
+          req.body.postal_code,
+          req.body.city,
+          req.body.state,
+          req.body.country,
+          inlineAddressLocation?.lat ?? null,
+          inlineAddressLocation?.lng ?? null,
+        ]
+      );
+      addressId = addressInsertResult.insertId;
+    } else {
+      try {
+        assertBookingAddressRulesForService({
+          serviceRow: serviceSnapshot,
+          requestBody: req.body || {},
+        });
+      } catch (addressError) {
+        await connection.rollback();
+        return res.status(addressError.statusCode || 400).json({ error: addressError.message });
+      }
     }
 
     const schedule = buildBookingSchedule({
@@ -11442,6 +11764,9 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     try { await connection.rollback(); } catch {}
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
     console.error('Error al insertar la reserva:', error);
     return res.status(500).json({ error: 'Error al insertar la reserva.' });
   } finally {
@@ -11543,7 +11868,9 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         a.postal_code,
         a.city,
         a.state,
-        a.country
+        a.country,
+        a.latitude AS address_latitude,
+        a.longitude AS address_longitude
       FROM booking b
       LEFT JOIN service s ON b.service_id = s.id
       LEFT JOIN price p ON s.price_id = p.id
@@ -11662,6 +11989,47 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'No autorizado.' });
     }
 
+    const normalizedCurrentServiceStatus = normalizeServiceStatus(
+      currentBooking.service_status,
+      'pending_deposit'
+    );
+    const requestedUpdateKeys = Object.keys(req.body || {});
+    const isRequestedDescriptionOnlyEdit = normalizedCurrentServiceStatus === 'requested'
+      && isClientOwner
+      && !isStaff;
+
+    if (isRequestedDescriptionOnlyEdit) {
+      const unsupportedRequestedKeys = requestedUpdateKeys.filter((key) => key !== 'description');
+      if (unsupportedRequestedKeys.length > 0) {
+        await connection.rollback();
+        return res.status(400).json({
+          error: 'Mientras la reserva está en solicitud solo se puede editar la descripción.',
+        });
+      }
+
+      if (!requestedUpdateKeys.includes('description')) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'No hay cambios nuevos para enviar.' });
+      }
+
+      const nextDescription = normalizeNullableText(req.body?.description);
+      if (normalizeNullableText(currentBooking.description) === nextDescription) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'No hay cambios nuevos para enviar.' });
+      }
+
+      await connection.query(
+        `
+        UPDATE booking
+        SET description = ?
+        WHERE id = ?
+        `,
+        [nextDescription, bookingId]
+      );
+      await connection.commit();
+      return res.status(200).json({ message: 'Descripción actualizada con éxito.' });
+    }
+
     if (!canEditBooking(currentBooking)) {
       await connection.rollback();
       return res.status(409).json({ error: 'La reserva ya no se puede editar en este estado.' });
@@ -11688,15 +12056,6 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
       return res.status(200).json({ message: 'Reserva actualizada con éxito' });
     }
 
-    const existingPendingChangeRequest = await getLatestBookingChangeRequest(connection, bookingId, {
-      forUpdate: true,
-      pendingOnly: true,
-    });
-    if (existingPendingChangeRequest) {
-      await connection.rollback();
-      return res.status(409).json({ error: 'Ya existe una solicitud de modificación pendiente para esta reserva.' });
-    }
-
     const requesterUserId = isClientOwner
       ? normalizeNullableInteger(currentBooking.client_user_id)
       : normalizeNullableInteger(currentBooking.provider_user_id_snapshot);
@@ -11708,22 +12067,50 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
       return res.status(409).json({ error: 'La reserva no tiene ambas partes asociadas para crear la solicitud.' });
     }
 
+    const existingPendingChangeRequest = await getLatestBookingChangeRequest(connection, bookingId, {
+      forUpdate: true,
+      pendingOnly: true,
+    });
     const changeRequestMessage = normalizeNullableText(req.body?.message);
-    const [insertResult] = await connection.query(
-      `
-      INSERT INTO booking_change_request
-        (booking_id, requested_by_user_id, target_user_id, status, changes_json, message)
-      VALUES (?, ?, ?, 'pending', ?, ?)
-      `,
-      [
-        bookingId,
-        requesterUserId,
-        targetUserId,
-        JSON.stringify(preparedUpdate.changeRequestPayload),
-        changeRequestMessage,
-      ]
-    );
-    createdChangeRequestId = insertResult.insertId;
+    if (existingPendingChangeRequest) {
+      if (Number(existingPendingChangeRequest.requested_by_user_id) !== Number(requesterUserId)) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'Ya existe una solicitud de modificación pendiente para esta reserva.' });
+      }
+
+      await connection.query(
+        `
+        UPDATE booking_change_request
+        SET changes_json = ?,
+            message = ?,
+            created_at = CURRENT_TIMESTAMP,
+            resolved_at = NULL
+        WHERE id = ?
+        `,
+        [
+          JSON.stringify(preparedUpdate.changeRequestPayload),
+          changeRequestMessage,
+          existingPendingChangeRequest.id,
+        ]
+      );
+      createdChangeRequestId = existingPendingChangeRequest.id;
+    } else {
+      const [insertResult] = await connection.query(
+        `
+        INSERT INTO booking_change_request
+          (booking_id, requested_by_user_id, target_user_id, status, changes_json, message)
+        VALUES (?, ?, ?, 'pending', ?, ?)
+        `,
+        [
+          bookingId,
+          requesterUserId,
+          targetUserId,
+          JSON.stringify(preparedUpdate.changeRequestPayload),
+          changeRequestMessage,
+        ]
+      );
+      createdChangeRequestId = insertResult.insertId;
+    }
 
     await connection.commit();
 
@@ -12731,7 +13118,7 @@ app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
     if (!canReportBookingIssue(booking)) {
       await connection.rollback();
       return res.status(400).json({
-        error: 'La incidencia solo se puede reportar cuando la reserva está en progreso o cuando ya ha pasado la hora de inicio.',
+        error: 'La incidencia solo se puede reportar cuando la reserva está en progreso, no tiene fecha de inicio o ya ha pasado la hora de inicio.',
       });
     }
 

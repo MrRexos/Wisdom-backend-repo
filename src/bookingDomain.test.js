@@ -175,7 +175,7 @@ test("hasRequestedStartDateTimePassed only returns true once the requested start
   );
 });
 
-test("canReportBookingIssue only enables accepted bookings after the start and in progress bookings", () => {
+test("canReportBookingIssue enables accepted bookings without start, accepted bookings after the start, and in progress bookings", () => {
   assert.equal(
     canReportBookingIssue(
       { service_status: "accepted", requested_start_datetime: "2026-03-29T10:00:00.000Z" },
@@ -187,6 +187,13 @@ test("canReportBookingIssue only enables accepted bookings after the start and i
     canReportBookingIssue(
       { service_status: "accepted", requested_start_datetime: "2026-03-29T10:00:00.000Z" },
       "2026-03-29T10:00:00.000Z"
+    ),
+    true
+  );
+  assert.equal(
+    canReportBookingIssue(
+      { service_status: "accepted", requested_start_datetime: null },
+      "2026-03-29T08:00:00.000Z"
     ),
     true
   );

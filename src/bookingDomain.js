@@ -274,8 +274,13 @@ function canReportBookingIssue(booking, now = new Date()) {
     return false;
   }
 
+   const requestedStartDateTime = booking?.requested_start_datetime ?? booking?.booking_start_datetime;
+   if (!parseDateInput(requestedStartDateTime)) {
+     return true;
+   }
+
   return hasRequestedStartDateTimePassed(
-    booking?.requested_start_datetime ?? booking?.booking_start_datetime,
+    requestedStartDateTime,
     now
   );
 }

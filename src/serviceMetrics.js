@@ -372,12 +372,12 @@ function collectIdentifiersByKey(data, keywords) {
               if (nested) identifiers.add(nested);
             }
           }
-        } else if (typeof value === 'object') {
+        } else if (value && typeof value === 'object') {
           const nested = normalizeIdentifier(value.id || value.uid || value.userId || value.user_id);
           if (nested) identifiers.add(nested);
           visit(value, depth + 1);
         }
-      } else if (typeof value === 'object') {
+      } else if (value && typeof value === 'object') {
         visit(value, depth + 1);
       }
     }
