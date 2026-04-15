@@ -35,6 +35,7 @@ const MIN_BOOKING_DURATION_MINUTES = 5;
 const MAX_BOOKING_DURATION_MINUTES = 180 * 24 * 60;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
+const ONE_WEEK_MS = 7 * ONE_DAY_MS;
 const AUTO_CHARGE_TOLERANCE_FACTOR = 1.2;
 
 function isValidDate(value) {
@@ -190,16 +191,23 @@ function deriveExpiresAt(createdAtInput, requestedStartDateTimeInput) {
     return null;
   }
 
-  const defaultExpiryDate = new Date(createdAt.getTime() + ONE_DAY_MS);
   const acceptDeadlineAt = deriveAcceptDeadlineAt(createdAt, requestedStartDateTimeInput);
 
   if (!acceptDeadlineAt) {
-    return defaultExpiryDate;
+    return new Date(createdAt.getTime() + ONE_DAY_MS);
   }
 
-  return acceptDeadlineAt.getTime() < defaultExpiryDate.getTime()
-    ? acceptDeadlineAt
-    : defaultExpiryDate;
+  return acceptDeadlineAt;
+}
+
+function deriveProviderPayoutEligibleAt(referenceDateTimeInput) {
+  const referenceDateTime = parseDateInput(referenceDateTimeInput);
+
+  if (!referenceDateTime) {
+    return null;
+  }
+
+  return new Date(referenceDateTime.getTime() + ONE_WEEK_MS);
 }
 
 function deriveLastMinuteWindowStartsAt(createdAtInput, requestedStartDateTimeInput) {
@@ -623,6 +631,7 @@ function normalizeLegacyStatusUpdate(status, currentBooking = null) {
 
 module.exports = {
   AUTO_CHARGE_TOLERANCE_FACTOR,
+  ONE_WEEK_MS,
   SERVICE_STATUSES,
   SETTLEMENT_STATUSES,
   BOOKING_CHANGE_REQUEST_STATUSES,
@@ -639,6 +648,7 @@ module.exports = {
   meetsMinimumNotice,
   deriveAcceptDeadlineAt,
   deriveExpiresAt,
+  deriveProviderPayoutEligibleAt,
   deriveLastMinuteWindowStartsAt,
   isWithinLastMinuteWindow,
   hasRequestedStartDateTimePassed,

@@ -14,6 +14,7 @@ const {
   deriveLastMinuteWindowStartsAt,
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
+  deriveProviderPayoutEligibleAt,
   evaluateAutoChargeEligibility,
   hasBookingChangeRequestExpired,
   meetsMinimumNotice,
@@ -102,12 +103,12 @@ test("deriveExpiresAt falls back to created_at plus 24 hours when no start exist
   assert.equal(result.toISOString(), "2026-03-30T10:00:00.000Z");
 });
 
-test("deriveExpiresAt chooses the earliest deadline between 24 hours and acceptance deadline", () => {
+test("deriveExpiresAt uses the full 33 percent window when a start exists even beyond 24 hours", () => {
   const result = deriveExpiresAt(
     "2026-03-29T10:00:00.000Z",
-    "2026-03-29T16:00:00.000Z"
+    "2026-04-02T10:00:00.000Z"
   );
-  assert.equal(result.toISOString(), "2026-03-29T14:00:00.000Z");
+  assert.equal(result.toISOString(), "2026-04-01T02:00:00.000Z");
 });
 
 test("deriveLastMinuteWindowStartsAt clamps to one hour minimum", () => {
@@ -124,6 +125,11 @@ test("deriveLastMinuteWindowStartsAt clamps to twenty four hours maximum", () =>
     "2026-03-11T10:00:00.000Z"
   );
   assert.equal(result.toISOString(), "2026-03-10T10:00:00.000Z");
+});
+
+test("deriveProviderPayoutEligibleAt adds a seven day hold to the payment reference", () => {
+  const result = deriveProviderPayoutEligibleAt("2026-03-29T10:00:00.000Z");
+  assert.equal(result.toISOString(), "2026-04-05T10:00:00.000Z");
 });
 
 test("isWithinLastMinuteWindow turns true once the computed window starts", () => {
