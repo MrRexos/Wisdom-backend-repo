@@ -35,8 +35,27 @@ const MIN_BOOKING_DURATION_MINUTES = 5;
 const MAX_BOOKING_DURATION_MINUTES = 180 * 24 * 60;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
+const THREE_DAYS_MS = 3 * ONE_DAY_MS;
 const ONE_WEEK_MS = 7 * ONE_DAY_MS;
 const AUTO_CHARGE_TOLERANCE_FACTOR = 1.2;
+const ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES = Object.freeze([
+  Object.freeze({
+    key: "1h",
+    delayMs: ONE_HOUR_MS,
+    reasonCode: "accepted_inactivity_reminder_1h",
+  }),
+  Object.freeze({
+    key: "24h",
+    delayMs: ONE_DAY_MS,
+    reasonCode: "accepted_inactivity_reminder_24h",
+  }),
+  Object.freeze({
+    key: "72h",
+    delayMs: THREE_DAYS_MS,
+    reasonCode: "accepted_inactivity_reminder_72h",
+  }),
+]);
+const ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE = "accepted_inactivity_auto_canceled";
 
 function isValidDate(value) {
   return value instanceof Date && !Number.isNaN(value.getTime());
@@ -261,6 +280,73 @@ function hasRequestedStartDateTimePassed(requestedStartDateTimeInput, now = new 
   }
 
   return requestedStartDateTime.getTime() <= normalizedNow.getTime();
+}
+
+function getAcceptedBookingInactivityStage(booking, {
+  now = new Date(),
+  isReminderSent = () => false,
+  reminderStages = ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
+  autoCancelDelayMs = ONE_WEEK_MS,
+} = {}) {
+  const normalizedServiceStatus = normalizeServiceStatus(booking?.service_status, "pending_deposit");
+  const normalizedSettlementStatus = normalizeSettlementStatus(booking?.settlement_status, "none");
+  if (normalizedServiceStatus !== "accepted" || normalizedSettlementStatus !== "none") {
+    return null;
+  }
+
+  const requestedStartDateTime = parseDateInput(
+    booking?.requested_start_datetime ?? booking?.booking_start_datetime
+  );
+  const normalizedNow = parseDateInput(now) || new Date();
+  if (!requestedStartDateTime || normalizedNow.getTime() < requestedStartDateTime.getTime()) {
+    return null;
+  }
+
+  const updatedAt = parseDateInput(booking?.updated_at);
+  if (updatedAt && updatedAt.getTime() > requestedStartDateTime.getTime()) {
+    return null;
+  }
+
+  const elapsedMs = normalizedNow.getTime() - requestedStartDateTime.getTime();
+  const normalizedAutoCancelDelayMs = Number.isFinite(Number(autoCancelDelayMs)) && Number(autoCancelDelayMs) > 0
+    ? Number(autoCancelDelayMs)
+    : ONE_WEEK_MS;
+
+  if (elapsedMs >= normalizedAutoCancelDelayMs) {
+    return {
+      type: "auto_cancel",
+      key: "7d",
+      elapsedMs,
+      thresholdMs: normalizedAutoCancelDelayMs,
+      reasonCode: ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
+    };
+  }
+
+  const normalizedReminderStages = Array.isArray(reminderStages)
+    ? [...reminderStages]
+      .filter((stage) => Number.isFinite(Number(stage?.delayMs)) && Number(stage.delayMs) > 0)
+      .sort((left, right) => Number(right.delayMs) - Number(left.delayMs))
+    : [];
+
+  for (const stage of normalizedReminderStages) {
+    if (elapsedMs < Number(stage.delayMs)) {
+      continue;
+    }
+
+    if (typeof isReminderSent === "function" && isReminderSent(stage.reasonCode, stage)) {
+      continue;
+    }
+
+    return {
+      type: "reminder",
+      key: stage.key || null,
+      elapsedMs,
+      thresholdMs: Number(stage.delayMs),
+      reasonCode: stage.reasonCode || null,
+    };
+  }
+
+  return null;
 }
 
 function canReportBookingIssue(booking, now = new Date()) {
@@ -637,9 +723,12 @@ function normalizeLegacyStatusUpdate(status, currentBooking = null) {
 module.exports = {
   AUTO_CHARGE_TOLERANCE_FACTOR,
   ONE_WEEK_MS,
+  THREE_DAYS_MS,
   SERVICE_STATUSES,
   SETTLEMENT_STATUSES,
   BOOKING_CHANGE_REQUEST_STATUSES,
+  ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
+  ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
   MIN_BOOKING_DURATION_MINUTES,
   MAX_BOOKING_DURATION_MINUTES,
   parseDateInput,
@@ -657,6 +746,7 @@ module.exports = {
   deriveLastMinuteWindowStartsAt,
   isWithinLastMinuteWindow,
   hasRequestedStartDateTimePassed,
+  getAcceptedBookingInactivityStage,
   canReportBookingIssue,
   computeSettlementAmounts,
   evaluateAutoChargeEligibility,

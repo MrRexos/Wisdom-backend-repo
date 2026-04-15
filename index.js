@@ -51,7 +51,10 @@ const {
   computeSettlementAmounts,
   evaluateAutoChargeEligibility,
   isWithinLastMinuteWindow,
+  getAcceptedBookingInactivityStage,
   normalizeLegacyStatusUpdate,
+  ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
+  ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
 } = require('./src/bookingDomain');
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
 const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
@@ -126,6 +129,11 @@ async function syncPreBookingConversationUnlock({
     });
   }
 }
+
+const ACCEPTED_BOOKING_INACTIVITY_REASON_CODES = [
+  ...ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES.map((stage) => stage.reasonCode),
+  ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
+];
 
 
 
@@ -3085,6 +3093,124 @@ async function getBookingLifecycleNotificationContext(connection, bookingId) {
   };
 }
 
+async function processAcceptedBookingInactivity(bookingId) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return { handled: false, reason: 'invalid_booking_id' };
+  }
+
+  const connection = await pool.promise().getConnection();
+  let notificationBooking = null;
+  let autoCancelRefundRequest = null;
+  let stage = null;
+
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        id,
+        service_id,
+        client_user_id,
+        provider_user_id_snapshot,
+        service_status,
+        settlement_status,
+        requested_start_datetime,
+        updated_at
+      FROM booking
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [normalizedBookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return { handled: false, reason: 'booking_not_found' };
+    }
+
+    const [historyRows] = await connection.query(
+      `
+      SELECT reason_code
+      FROM booking_status_history
+      WHERE booking_id = ?
+        AND reason_code IN (${ACCEPTED_BOOKING_INACTIVITY_REASON_CODES.map(() => '?').join(', ')})
+      `,
+      [normalizedBookingId, ...ACCEPTED_BOOKING_INACTIVITY_REASON_CODES]
+    );
+    const sentReasonCodes = new Set(
+      (historyRows || [])
+        .map((row) => String(row.reason_code || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+
+    stage = getAcceptedBookingInactivityStage(booking, {
+      now: new Date(),
+      isReminderSent: (reasonCode) => sentReasonCodes.has(String(reasonCode || '').trim().toLowerCase()),
+    });
+
+    if (!stage) {
+      await connection.rollback();
+      return { handled: false, reason: 'stage_not_due' };
+    }
+
+    notificationBooking = await getBookingLifecycleNotificationContext(connection, normalizedBookingId);
+
+    if (stage.type === 'reminder') {
+      await insertBookingStatusHistory(connection, {
+        bookingId: normalizedBookingId,
+        fromServiceStatus: booking.service_status,
+        toServiceStatus: booking.service_status,
+        fromSettlementStatus: booking.settlement_status,
+        toSettlementStatus: booking.settlement_status,
+        reasonCode: stage.reasonCode,
+        note: `Aviso automático ${stage.key || ''} por reserva accepted sin actividad tras el inicio previsto.`.trim(),
+      });
+
+      await connection.commit();
+      return { handled: true, type: 'reminder', stage, booking: notificationBooking };
+    }
+
+    autoCancelRefundRequest = (
+      await transitionBookingWithOptionalDepositRefund(connection, booking, {
+        nextServiceStatus: 'canceled',
+        nextSettlementStatus: 'none',
+        changedByUserId: null,
+        reasonCode: stage.reasonCode,
+        note: 'Cancelación automática tras 7 días en accepted sin actividad.',
+        extraPatch: {
+          canceled_by_user_id: null,
+          cancellation_reason_code: stage.reasonCode,
+          client_approval_deadline_at: null,
+        },
+        requestDepositRefund: true,
+      })
+    ).refundRequest;
+
+    await incrementUserStrikeCount(connection, booking.provider_user_id_snapshot, 1);
+    await connection.commit();
+
+    return {
+      handled: true,
+      type: 'auto_cancel',
+      stage,
+      booking: notificationBooking,
+      refundRequest: autoCancelRefundRequest,
+    };
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error processing accepted booking inactivity:', {
+      bookingId: normalizedBookingId,
+      error: error.message,
+    });
+    return { handled: false, reason: 'processing_failed', error };
+  } finally {
+    connection.release();
+  }
+}
+
 function getMinimumChargeAmountCentsForCurrency(currency = 'EUR') {
   const minimumChargeAmount = convertAmount(1, 'EUR', normalizeCurrencyCode(currency, 'EUR'));
   return Math.max(0, toMinorUnits(minimumChargeAmount, currency));
@@ -5450,6 +5576,156 @@ async function sendBookingLifecycleNotificationEmail({ kind, booking }) {
   return true;
 }
 
+function getAcceptedBookingInactivityCopy(kind, recipientRole = 'client') {
+  const normalizedKind = String(kind || '').trim().toLowerCase();
+  const normalizedRecipientRole = String(recipientRole || '').trim().toLowerCase();
+
+  if (normalizedKind === ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE) {
+    return normalizedRecipientRole === 'professional'
+      ? {
+        subjectPrefix: 'Reserva cancelada automáticamente por inactividad',
+        intro: 'Hemos cancelado automáticamente esta reserva porque han pasado 7 días desde la hora de inicio prevista sin ninguna acción registrada.',
+        action: 'Además, se ha aplicado un strike automático a tu cuenta por abandono de la reserva.',
+      }
+      : {
+        subjectPrefix: 'Tu reserva se ha cancelado automáticamente',
+        intro: 'Hemos cancelado automáticamente esta reserva porque han pasado 7 días desde la hora de inicio prevista sin ninguna acción registrada.',
+        action: 'Hemos solicitado el reembolso íntegro del depósito al método de pago original.',
+      };
+  }
+
+  const reminderLabelByCode = {
+    accepted_inactivity_reminder_1h: '1 hora',
+    accepted_inactivity_reminder_24h: '24 horas',
+    accepted_inactivity_reminder_72h: '72 horas',
+  };
+  const reminderLabel = reminderLabelByCode[normalizedKind] || 'varias horas';
+
+  return {
+    subjectPrefix: 'Recordatorio de reserva pendiente',
+    intro: `Esta reserva sigue en estado aceptado ${reminderLabel} después de la hora de inicio prevista y todavía no se ha registrado ninguna acción.`,
+    action: 'Si el servicio ya ha empezado, inicia el servicio o reporta la incidencia correspondiente desde la app para evitar una cancelación automática.',
+  };
+}
+
+function renderAcceptedBookingInactivityEmail({ kind, booking, recipientRole = 'client' }) {
+  const recipient = recipientRole === 'professional'
+    ? booking?.professional
+    : booking?.client;
+  const recipientName = composeDisplayName(recipient || {});
+  const counterpartName = composeDisplayName(
+    recipientRole === 'professional' ? booking?.client || {} : booking?.professional || {}
+  );
+  const bookingIdText = `#${booking?.id || '—'}`;
+  const serviceTitle = booking?.serviceTitle || 'Servicio sin título';
+  const startText = formatDateTimeEs(booking?.start);
+  const copy = getAcceptedBookingInactivityCopy(kind, recipientRole);
+  const subject = `${copy.subjectPrefix} ${bookingIdText}`;
+  const preheader = `${copy.subjectPrefix} en ${serviceTitle}.`;
+  const detailsRows = [
+    ['Reserva', bookingIdText],
+    ['Servicio', serviceTitle],
+    ['Inicio previsto', startText],
+    [recipientRole === 'professional' ? 'Cliente' : 'Profesional', counterpartName],
+  ];
+
+  const text = [
+    `Hola ${recipientName},`,
+    '',
+    copy.intro,
+    '',
+    `Reserva: ${bookingIdText}`,
+    `Servicio: ${serviceTitle}`,
+    `Inicio previsto: ${startText}`,
+    recipientRole === 'professional'
+      ? `Cliente: ${counterpartName}`
+      : `Profesional: ${counterpartName}`,
+    '',
+    copy.action,
+    '',
+    '— Equipo Wisdom',
+  ].join('\n');
+
+  const rowsHtml = detailsRows.map(([label, value]) => `
+      <tr>
+        <td style="padding:6px 0; font-weight:600; color:#111827;">${escapeHtml(label)}</td>
+        <td style="padding:6px 0; color:#374151;">${escapeHtml(value)}</td>
+      </tr>
+    `).join('');
+
+  const html = `<!doctype html>
+    <html lang="es">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta name="color-scheme" content="light dark">
+      <meta name="supported-color-schemes" content="light dark">
+      <title>${escapeHtml(subject)}</title>
+      <style>
+        .content { font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; font-size:15px; line-height:1.65; }
+        @media (max-width:480px) { .content { font-size:16px !important; line-height:1.7 !important; } }
+        a { text-decoration: underline; color: inherit; }
+        body, table, td, p { margin:0; }
+      </style>
+    </head>
+    <body style="margin:0; padding:0; background:none !important;">
+      <div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden;">
+        ${escapeHtml(preheader)}
+      </div>
+      <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
+        <tr>
+          <td align="center" style="padding:0 16px;">
+            <table role="presentation" width="640" border="0" cellspacing="0" cellpadding="0" style="width:100%; max-width:640px; border-collapse:collapse;">
+              <tr>
+                <td align="left" style="padding:24px 8px 8px 8px;">
+                  <img src="https://storage.googleapis.com/wisdom-images/app_icon.png" width="36" height="36" alt="Wisdom"
+                       style="display:block; border:0; outline:none; text-decoration:none; width:36px; height:36px;">
+                </td>
+              </tr>
+              <tr>
+                <td class="content" style="padding:8px 8px 24px 8px;">
+                  <p style="margin:0 0 16px;">Hola ${escapeHtml(recipientName)},</p>
+                  <p style="margin:0 0 16px;">${escapeHtml(copy.intro)}</p>
+                  <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%; max-width:480px; border-collapse:collapse; margin:24px 0;">
+                    ${rowsHtml}
+                  </table>
+                  <p style="margin:0 0 16px;">${escapeHtml(copy.action)}</p>
+                  <p style="margin:0;">— Equipo Wisdom</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>`;
+
+  return { subject, text, html };
+}
+
+async function sendAcceptedBookingInactivityEmail({ kind, booking, recipientRole = 'client' }) {
+  const recipientEmail = recipientRole === 'professional'
+    ? booking?.professional?.email
+    : booking?.client?.email;
+  const normalizedRecipientEmail = typeof recipientEmail === 'string' ? recipientEmail.trim() : '';
+  if (!normalizedRecipientEmail) {
+    return false;
+  }
+
+  const { subject, text, html } = renderAcceptedBookingInactivityEmail({
+    kind,
+    booking,
+    recipientRole,
+  });
+  await sendEmail({
+    to: normalizedRecipientEmail,
+    subject,
+    text,
+    html,
+  });
+  return true;
+}
+
 function formatBookingChangeRequestAddress(addressSnapshot = null) {
   if (!addressSnapshot || typeof addressSnapshot !== 'object') {
     return 'Sin dirección';
@@ -6929,6 +7205,112 @@ cron.schedule('*/10 * * * *', async () => {
     }
   } catch (error) {
     console.error('Error en cron de solicitudes de modificación:', error);
+  }
+});
+
+// cron cada 10 minutos para recordar y caducar reservas accepted sin actividad tras la hora prevista
+cron.schedule('*/10 * * * *', async () => {
+  try {
+    const [rows] = await pool.promise().query(
+      `
+      SELECT id
+      FROM booking
+      WHERE service_status = 'accepted'
+        AND settlement_status = 'none'
+        AND requested_start_datetime IS NOT NULL
+        AND requested_start_datetime <= (UTC_TIMESTAMP() - INTERVAL 1 HOUR)
+      ORDER BY requested_start_datetime ASC
+      LIMIT 100
+      `
+    );
+
+    let reminderCount = 0;
+    let autoCanceledCount = 0;
+
+    for (const row of rows || []) {
+      const result = await processAcceptedBookingInactivity(row.id);
+      if (!result?.handled || !result?.stage || !result?.booking) {
+        continue;
+      }
+
+      if (result.type === 'reminder') {
+        try {
+          await Promise.allSettled([
+            sendAcceptedBookingInactivityEmail({
+              kind: result.stage.reasonCode,
+              booking: result.booking,
+              recipientRole: 'client',
+            }),
+            sendAcceptedBookingInactivityEmail({
+              kind: result.stage.reasonCode,
+              booking: result.booking,
+              recipientRole: 'professional',
+            }),
+          ]);
+        } catch (emailError) {
+          console.error('Error sending accepted booking inactivity reminder emails:', {
+            bookingId: row.id,
+            reasonCode: result.stage.reasonCode,
+            error: emailError.message,
+          });
+        }
+        reminderCount += 1;
+        continue;
+      }
+
+      if (result.refundRequest?.paymentIntentId) {
+        try {
+          await triggerStripeRefundForPaymentIntent(result.refundRequest.paymentIntentId, {
+            booking_id: String(result.refundRequest.bookingId),
+            source: 'accepted_inactivity_auto_canceled',
+          });
+        } catch (refundError) {
+          console.error('Error refunding deposit after accepted inactivity auto-cancel:', {
+            bookingId: result.refundRequest.bookingId,
+            paymentIntentId: result.refundRequest.paymentIntentId,
+            error: refundError.message,
+          });
+        }
+      } else {
+        try {
+          await releaseEphemeralBookingPaymentMethodsIfClosed(row.id);
+        } catch (cleanupError) {
+          console.error('Error releasing ephemeral payment methods after inactivity auto-cancel:', {
+            bookingId: row.id,
+            error: cleanupError.message,
+          });
+        }
+      }
+
+      try {
+        await Promise.allSettled([
+          sendAcceptedBookingInactivityEmail({
+            kind: result.stage.reasonCode,
+            booking: result.booking,
+            recipientRole: 'client',
+          }),
+          sendAcceptedBookingInactivityEmail({
+            kind: result.stage.reasonCode,
+            booking: result.booking,
+            recipientRole: 'professional',
+          }),
+        ]);
+      } catch (emailError) {
+        console.error('Error sending accepted booking inactivity auto-cancel emails:', {
+          bookingId: row.id,
+          reasonCode: result.stage.reasonCode,
+          error: emailError.message,
+        });
+      }
+
+      autoCanceledCount += 1;
+    }
+
+    if (reminderCount > 0 || autoCanceledCount > 0) {
+      console.log(`[CRON] Reservas accepted sin actividad: ${reminderCount} avisos y ${autoCanceledCount} cancelaciones automáticas`);
+    }
+  } catch (error) {
+    console.error('Error en cron de reservas accepted sin actividad:', error);
   }
 });
 
@@ -13069,6 +13451,137 @@ app.post('/api/bookings/:id/dispute', authenticateToken, async (req, res) => {
     try { await connection.rollback(); } catch {}
     console.error('Error al abrir la disputa de la reserva:', error);
     return res.status(500).json({ error: 'Error al abrir la disputa.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/bookings/:id/dispute/cancel', authenticateToken, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        id,
+        client_user_id,
+        provider_user_id_snapshot,
+        service_status,
+        settlement_status
+      FROM booking
+      WHERE id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const [[openIssue]] = await connection.query(
+      `
+      SELECT
+        id,
+        issue_type,
+        status,
+        reported_by_user_id,
+        details
+      FROM booking_issue_report
+      WHERE booking_id = ?
+        AND status = 'open'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!openIssue) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'No hay ninguna disputa abierta para esta reserva.' });
+    }
+
+    const isReporter = req.user && Number(req.user.id) === Number(openIssue.reported_by_user_id);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isReporter && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo el creador de la disputa puede anularla.' });
+    }
+
+    await connection.query(
+      `
+      UPDATE booking_issue_report
+      SET status = 'dismissed',
+          resolved_at = ?,
+          details = COALESCE(?, details)
+      WHERE id = ?
+      `,
+      [
+        toDbDateTime(new Date()),
+        normalizeNullableText(req.body?.details) || null,
+        openIssue.id,
+      ]
+    );
+
+    const normalizedIssueType = String(openIssue.issue_type || '').trim().toLowerCase();
+    if (normalizedIssueType === 'payment_dispute') {
+      const latestProposal = await getLatestClosureProposal(connection, bookingId, { forUpdate: true });
+      const shouldRestorePendingApproval = latestProposal && latestProposal.status === 'rejected';
+
+      if (shouldRestorePendingApproval) {
+        await updateClosureProposalStatus(connection, latestProposal.id, 'active', new Date());
+      }
+
+      await transitionBookingStateRecord(connection, booking, {
+        nextServiceStatus: booking.service_status,
+        nextSettlementStatus: shouldRestorePendingApproval ? 'pending_client_approval' : 'awaiting_payment',
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'booking_dispute_canceled',
+        extraPatch: {
+          client_approval_deadline_at: shouldRestorePendingApproval
+            ? buildClientApprovalDeadline()
+            : null,
+        },
+      });
+    } else if (
+      ['in_dispute', 'manual_review_required'].includes(
+        normalizeSettlementStatus(booking.settlement_status, 'none')
+      )
+    ) {
+      await transitionBookingStateRecord(connection, booking, {
+        nextServiceStatus: booking.service_status,
+        nextSettlementStatus: 'none',
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'booking_dispute_canceled',
+        extraPatch: {
+          client_approval_deadline_at: null,
+        },
+      });
+    }
+
+    await connection.commit();
+    return res.status(200).json({
+      message: 'Disputa anulada.',
+      issue_report: {
+        id: openIssue.id,
+        booking_id: bookingId,
+        issue_type: normalizedIssueType,
+        status: 'dismissed',
+      },
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al anular la disputa de la reserva:', error);
+    return res.status(500).json({ error: 'Error al anular la disputa.' });
   } finally {
     connection.release();
   }

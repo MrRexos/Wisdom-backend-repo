@@ -10,6 +10,7 @@ const {
   canReportBookingIssue,
   canEditBooking,
   computeSettlementAmounts,
+  getAcceptedBookingInactivityStage,
   deriveAcceptDeadlineAt,
   deriveLastMinuteWindowStartsAt,
   deriveLegacyBookingStatus,
@@ -203,6 +204,83 @@ test("canReportBookingIssue enables accepted bookings without start, accepted bo
       "2026-03-29T08:00:00.000Z"
     ),
     true
+  );
+});
+
+test("getAcceptedBookingInactivityStage returns the next unsent reminder for inactive accepted bookings", () => {
+  assert.deepEqual(
+    getAcceptedBookingInactivityStage(
+      {
+        service_status: "accepted",
+        settlement_status: "none",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+        updated_at: "2026-03-29T09:00:00.000Z",
+      },
+      { now: "2026-03-29T11:00:00.000Z" }
+    ),
+    {
+      type: "reminder",
+      key: "1h",
+      elapsedMs: 60 * 60 * 1000,
+      thresholdMs: 60 * 60 * 1000,
+      reasonCode: "accepted_inactivity_reminder_1h",
+    }
+  );
+
+  assert.deepEqual(
+    getAcceptedBookingInactivityStage(
+      {
+        service_status: "accepted",
+        settlement_status: "none",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+        updated_at: "2026-03-29T09:00:00.000Z",
+      },
+      {
+        now: "2026-03-30T10:00:00.000Z",
+        isReminderSent: (reasonCode) => reasonCode === "accepted_inactivity_reminder_1h",
+      }
+    ),
+    {
+      type: "reminder",
+      key: "24h",
+      elapsedMs: 24 * 60 * 60 * 1000,
+      thresholdMs: 24 * 60 * 60 * 1000,
+      reasonCode: "accepted_inactivity_reminder_24h",
+    }
+  );
+});
+
+test("getAcceptedBookingInactivityStage ignores accepted bookings with interaction and auto-cancels after seven days", () => {
+  assert.equal(
+    getAcceptedBookingInactivityStage(
+      {
+        service_status: "accepted",
+        settlement_status: "none",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+        updated_at: "2026-03-29T10:00:01.000Z",
+      },
+      { now: "2026-03-29T11:00:00.000Z" }
+    ),
+    null
+  );
+
+  assert.deepEqual(
+    getAcceptedBookingInactivityStage(
+      {
+        service_status: "accepted",
+        settlement_status: "none",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+        updated_at: "2026-03-29T09:00:00.000Z",
+      },
+      { now: "2026-04-05T10:00:00.000Z" }
+    ),
+    {
+      type: "auto_cancel",
+      key: "7d",
+      elapsedMs: 7 * 24 * 60 * 60 * 1000,
+      thresholdMs: 7 * 24 * 60 * 60 * 1000,
+      reasonCode: "accepted_inactivity_auto_canceled",
+    }
   );
 });
 
