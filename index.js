@@ -1762,12 +1762,36 @@ function mapStoredPaymentMethodForApi(row = {}) {
     record_id: normalizeNullableInteger(row.selected_customer_payment_method_id ?? row.id),
     id: stripePaymentMethodId,
     last4,
+    brand: typeof row.brand === 'string' && row.brand.trim().length > 0 ? row.brand.trim() : null,
     expiryMonth: parsedExpiry.month,
     expiryYear: parsedExpiry.year,
     expiryLabel: row.expiry_date || null,
     isSaved: row.is_safed === true || row.is_safed === 1,
     isDefault: row.is_default === true || row.is_default === 1,
     provider: row.provider || 'STRIPE',
+  };
+}
+
+function mapBookingPaymentSummaryForApi(row = null, fallbackCurrency = 'EUR') {
+  if (!row) {
+    return null;
+  }
+
+  const summaryCurrency = normalizeCurrencyCode(row.currency, fallbackCurrency);
+  const amount = row.amount_cents !== null && row.amount_cents !== undefined
+    ? fromMinorUnits(row.amount_cents, summaryCurrency)
+    : null;
+
+  return {
+    type: row.type || null,
+    status: row.status || null,
+    currency: summaryCurrency,
+    amount,
+    payment_method_id: row.payment_method_id || null,
+    last4: row.payment_method_last4 || null,
+    brand: typeof row.payment_method_brand === 'string' && row.payment_method_brand.trim().length > 0
+      ? row.payment_method_brand.trim()
+      : null,
   };
 }
 
@@ -12239,6 +12263,7 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
         pm.payment_type AS customer_payment_method_stripe_id,
         pm.provider,
+        pm.brand,
         pm.card_number,
         pm.expiry_date,
         pm.is_safed,
@@ -12308,7 +12333,56 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    return res.status(200).json(mapBookingRecordForApi(bookingRows[0]));
+    let depositPaymentSummary = null;
+    let finalPaymentSummary = null;
+
+    try {
+      const [paymentRows] = await promisePool.query(
+        `
+        SELECT
+          p.type,
+          p.amount_cents,
+          p.currency,
+          p.status,
+          p.payment_method_id,
+          p.payment_method_last4,
+          pm.brand AS payment_method_brand
+        FROM payments p
+        LEFT JOIN payment_method pm ON pm.payment_type = p.payment_method_id
+        WHERE p.booking_id = ?
+        ORDER BY p.id DESC
+        `,
+        [bookingId]
+      );
+
+      const pickPayment = (type) => (
+        paymentRows.find((row) => row.type === type && row.status === 'succeeded')
+        || paymentRows.find((row) => row.type === type)
+        || null
+      );
+
+      const fallbackCurrency = normalizeCurrencyCode(
+        bookingRows[0]?.service_currency_snapshot,
+        normalizeCurrencyCode(bookingRows[0]?.currency, 'EUR')
+      );
+
+      depositPaymentSummary = mapBookingPaymentSummaryForApi(
+        pickPayment('deposit'),
+        fallbackCurrency
+      );
+      finalPaymentSummary = mapBookingPaymentSummaryForApi(
+        pickPayment('final'),
+        fallbackCurrency
+      );
+    } catch (paymentLookupError) {
+      console.error('Error al obtener el resumen de pagos de la reserva:', paymentLookupError);
+    }
+
+    const bookingResponse = mapBookingRecordForApi(bookingRows[0]);
+    bookingResponse.deposit_payment_summary = depositPaymentSummary;
+    bookingResponse.final_payment_summary = finalPaymentSummary;
+
+    return res.status(200).json(bookingResponse);
   } catch (error) {
     console.error('Error al obtener la reserva:', error);
     return res.status(500).json({ error: 'Error al obtener la reserva.' });
