@@ -3506,6 +3506,7 @@ async function getDefaultSavedCustomerPaymentMethod(conn, userId, { forUpdate = 
       user_id,
       payment_type AS customer_payment_method_stripe_id,
       provider,
+      brand,
       card_number,
       expiry_date,
       is_safed,
@@ -3542,6 +3543,7 @@ async function getStoredCustomerPaymentMethodByStripeId(conn, userId, stripePaym
       user_id,
       payment_type AS customer_payment_method_stripe_id,
       provider,
+      brand,
       card_number,
       expiry_date,
       is_safed,
@@ -3563,6 +3565,7 @@ async function upsertStoredCustomerPaymentMethod(conn, {
   userId,
   stripePaymentMethodId,
   last4,
+  brand = null,
   expMonth,
   expYear,
   saveForFuture = false,
@@ -3586,6 +3589,9 @@ async function upsertStoredCustomerPaymentMethod(conn, {
   const maskedLast4 = typeof last4 === 'string' && last4.trim()
     ? last4.trim().slice(-4)
     : (existingRow?.card_number ? String(existingRow.card_number).slice(-4) : '0000');
+  const normalizedBrand = typeof brand === 'string' && brand.trim().length > 0
+    ? brand.trim()
+    : (existingRow?.brand || null);
   const shouldRemainSaved = saveForFuture || existingRow?.is_safed === 1;
   const shouldBeDefault = saveForFuture || existingRow?.is_default === 1;
 
@@ -3601,6 +3607,7 @@ async function upsertStoredCustomerPaymentMethod(conn, {
       `
       UPDATE payment_method
       SET provider = 'STRIPE',
+          brand = ?,
           card_number = ?,
           expiry_date = ?,
           is_safed = ?,
@@ -3608,6 +3615,7 @@ async function upsertStoredCustomerPaymentMethod(conn, {
       WHERE id = ?
       `,
       [
+        normalizedBrand,
         maskedLast4,
         expiryLabel || '00/00',
         shouldRemainSaved ? 1 : 0,
@@ -3622,12 +3630,13 @@ async function upsertStoredCustomerPaymentMethod(conn, {
   const [insertResult] = await conn.query(
     `
     INSERT INTO payment_method
-      (user_id, payment_type, provider, card_number, expiry_date, is_safed, is_default)
-    VALUES (?, ?, 'STRIPE', ?, ?, ?, ?)
+      (user_id, payment_type, provider, brand, card_number, expiry_date, is_safed, is_default)
+    VALUES (?, ?, 'STRIPE', ?, ?, ?, ?, ?)
     `,
     [
       normalizedUserId,
       normalizedStripePaymentMethodId,
+      normalizedBrand,
       maskedLast4,
       expiryLabel || '00/00',
       shouldRemainSaved ? 1 : 0,
@@ -3664,6 +3673,7 @@ async function syncBookingSelectedPaymentMethod(conn, {
     userId: normalizedUserId,
     stripePaymentMethodId: normalizedStripePaymentMethodId,
     last4: effectivePaymentMethodDetails?.card?.last4 || null,
+    brand: effectivePaymentMethodDetails?.card?.brand || null,
     expMonth: effectivePaymentMethodDetails?.card?.exp_month || null,
     expYear: effectivePaymentMethodDetails?.card?.exp_year || null,
     saveForFuture,

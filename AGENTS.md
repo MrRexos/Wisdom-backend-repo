@@ -192,6 +192,7 @@
 - `user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
 - `payment_type` (VARCHAR(100), NOT NULL)
 - `provider` (VARCHAR(100), NULL)
+- `brand` (VARCHAR(50), NULL)
 - `card_number` (VARCHAR(25), NOT NULL)
 - `expiry_date` (CHAR(5), NOT NULL)
 - `is_safed` (TINYINT(1), NOT NULL, DEFAULT 0)
