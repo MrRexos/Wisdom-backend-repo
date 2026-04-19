@@ -6366,6 +6366,30 @@ pool.on('connection', (connection) => {
 });
 
 const promisePool = pool.promise();
+let reviewBookingColumnAvailabilityPromise = null;
+
+async function reviewTableHasBookingIdColumn() {
+  if (!reviewBookingColumnAvailabilityPromise) {
+    reviewBookingColumnAvailabilityPromise = promisePool.query(
+      `
+      SELECT 1
+      FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'review'
+        AND COLUMN_NAME = 'booking_id'
+      LIMIT 1
+      `
+    )
+      .then(([rows]) => Array.isArray(rows) && rows.length > 0)
+      .catch((error) => {
+        console.error('Error checking review.booking_id column availability:', error);
+        return false;
+      });
+  }
+
+  return reviewBookingColumnAvailabilityPromise;
+}
+
 refreshExchangeRates({ force: true }).catch((error) => {
   console.error('Initial exchange-rates refresh failed:', error?.message || error);
 });
@@ -12345,6 +12369,7 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
 
     let depositPaymentSummary = null;
     let finalPaymentSummary = null;
+    let clientReview = null;
 
     try {
       const [paymentRows] = await promisePool.query(
@@ -12388,9 +12413,48 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
       console.error('Error al obtener el resumen de pagos de la reserva:', paymentLookupError);
     }
 
+    const reviewTrackingSupported = await reviewTableHasBookingIdColumn();
+    if (reviewTrackingSupported && req.user?.id) {
+      try {
+        const [reviewRows] = await promisePool.query(
+          `
+          SELECT
+            id,
+            booking_id,
+            user_id,
+            service_id,
+            rating,
+            comment,
+            review_datetime
+          FROM review
+          WHERE booking_id = ? AND user_id = ?
+          ORDER BY review_datetime DESC, id DESC
+          LIMIT 1
+          `,
+          [bookingId, req.user.id]
+        );
+        clientReview = reviewRows[0] || null;
+      } catch (reviewLookupError) {
+        console.error('Error al obtener la valoración de la reserva:', reviewLookupError);
+      }
+    }
+
     const bookingResponse = mapBookingRecordForApi(bookingRows[0]);
     bookingResponse.deposit_payment_summary = depositPaymentSummary;
     bookingResponse.final_payment_summary = finalPaymentSummary;
+    bookingResponse.review_tracking_supported = reviewTrackingSupported;
+    bookingResponse.client_has_review = clientReview !== null;
+    bookingResponse.client_review = clientReview
+      ? {
+        id: clientReview.id,
+        booking_id: clientReview.booking_id,
+        user_id: clientReview.user_id,
+        service_id: clientReview.service_id,
+        rating: clientReview.rating,
+        comment: clientReview.comment,
+        review_datetime: clientReview.review_datetime,
+      }
+      : null;
 
     return res.status(200).json(bookingResponse);
   } catch (error) {
@@ -17803,36 +17867,103 @@ app.get('/api/services/:id', (req, res) => {
   });
 });
 
-app.post('/api/services/:id/reviews', (req, res) => {
-  const { id } = req.params;
-  const { rating, comment } = req.body;
+app.post('/api/services/:id/reviews', async (req, res) => {
+  const serviceId = normalizeNullableInteger(req.params.id);
+  const normalizedBookingId = normalizeNullableInteger(req.body?.booking_id);
+  const numericRating = Number(req.body?.rating);
+  const comment = typeof req.body?.comment === 'string' && req.body.comment.trim().length > 0
+    ? req.body.comment.trim()
+    : null;
   const userId = req.user.id;
 
-  if (!rating) {
+  if (!serviceId) {
+    return res.status(400).json({ error: 'service_id inválido.' });
+  }
+
+  if (!Number.isFinite(numericRating) || numericRating <= 0 || numericRating > 5) {
     return res.status(400).json({ error: 'rating es requerido.' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
+  try {
+    const reviewTrackingSupported = await reviewTableHasBookingIdColumn();
 
-    const query = `
-      INSERT INTO review (user_id, service_id, rating, comment, review_datetime)
-      VALUES (?, ?, ?, ?, NOW());
-    `;
-    connection.query(query, [userId, id, rating, comment], (err, result) => {
-      connection.release();
+    if (reviewTrackingSupported && normalizedBookingId) {
+      const [bookingRows] = await promisePool.query(
+        `
+        SELECT
+          id,
+          client_user_id,
+          service_id,
+          service_status,
+          settlement_status
+        FROM booking
+        WHERE id = ?
+        LIMIT 1
+        `,
+        [normalizedBookingId]
+      );
 
-      if (err) {
-        console.error('Error al añadir la review:', err);
-        return res.status(500).json({ error: 'Error al añadir la review.' });
+      const booking = bookingRows[0];
+      if (!booking) {
+        return res.status(404).json({ error: 'Reserva no encontrada.' });
       }
 
-      res.status(201).json({ message: 'Review añadida con éxito', reviewId: result.insertId });
-    });
-  });
+      if (Number(booking.client_user_id) !== Number(userId)) {
+        return res.status(403).json({ error: 'No autorizado para valorar esta reserva.' });
+      }
+
+      if (Number(booking.service_id) !== Number(serviceId)) {
+        return res.status(400).json({ error: 'La reserva no corresponde a este servicio.' });
+      }
+
+      if (
+        normalizeServiceStatus(booking.service_status, 'pending_deposit') !== 'finished'
+        || normalizeSettlementStatus(booking.settlement_status, 'none') !== 'paid'
+      ) {
+        return res.status(400).json({ error: 'Solo puedes valorar una reserva finalizada y pagada.' });
+      }
+
+      const [existingReviewRows] = await promisePool.query(
+        `
+        SELECT id
+        FROM review
+        WHERE booking_id = ? AND user_id = ?
+        LIMIT 1
+        `,
+        [normalizedBookingId, userId]
+      );
+
+      if (existingReviewRows.length > 0) {
+        return res.status(409).json({
+          error: 'Ya has dejado una valoración para esta reserva.',
+          error_code: 'booking_review_already_exists',
+        });
+      }
+
+      const [result] = await promisePool.query(
+        `
+        INSERT INTO review (user_id, service_id, booking_id, rating, comment, review_datetime)
+        VALUES (?, ?, ?, ?, ?, NOW())
+        `,
+        [userId, serviceId, normalizedBookingId, numericRating, comment]
+      );
+
+      return res.status(201).json({ message: 'Review añadida con éxito', reviewId: result.insertId });
+    }
+
+    const [result] = await promisePool.query(
+      `
+      INSERT INTO review (user_id, service_id, rating, comment, review_datetime)
+      VALUES (?, ?, ?, ?, NOW())
+      `,
+      [userId, serviceId, numericRating, comment]
+    );
+
+    return res.status(201).json({ message: 'Review añadida con éxito', reviewId: result.insertId });
+  } catch (err) {
+    console.error('Error al añadir la review:', err);
+    return res.status(500).json({ error: 'Error al añadir la review.' });
+  }
 });
 
 // Crear denuncia de servicio

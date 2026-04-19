@@ -260,6 +260,7 @@
 - `id` (INT, PK, auto_increment, NOT NULL)
 - `user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
 - `service_id` (INT, FK -> service.id, NOT NULL)
+- `booking_id` (INT, FK -> booking.id, NULL)
 - `rating` (DECIMAL(2,1), NOT NULL)
 - `comment` (TEXT, NULL)
 - `review_datetime` (DATETIME, NOT NULL)
@@ -504,6 +505,7 @@
 
 ### Tabla: `review`
 - `id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_review_booking_id_booking_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
 - `service_id`: **FK** -> `service`.`id` (Key Name: `fk_review_service_id_service_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
 - `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_review_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
 
