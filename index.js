@@ -12619,9 +12619,9 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
 });
 
 app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToken, async (req, res) => {
-  const bookingId = normalizeNullableInteger(req.params.id);
+  const routeBookingId = normalizeNullableInteger(req.params.id);
   const changeRequestId = normalizeNullableInteger(req.params.changeRequestId);
-  if (!bookingId || !changeRequestId) {
+  if (!routeBookingId || !changeRequestId) {
     return res.status(400).json({ error: 'Id inválido.' });
   }
 
@@ -12633,6 +12633,24 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
   const connection = await promisePool.getConnection();
   let shouldNotifyRequester = false;
   try {
+    const [[changeRequestReference]] = await connection.query(
+      `
+      SELECT
+        id,
+        booking_id
+      FROM booking_change_request
+      WHERE id = ?
+      LIMIT 1
+      `,
+      [changeRequestId]
+    );
+
+    if (!changeRequestReference) {
+      return res.status(404).json({ error: 'Solicitud de modificación no encontrada.' });
+    }
+
+    const effectiveBookingId = normalizeNullableInteger(changeRequestReference.booking_id) || routeBookingId;
+
     await connection.beginTransaction();
 
     const [[currentBooking]] = await connection.query(
@@ -12662,7 +12680,7 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
       LIMIT 1
       FOR UPDATE
       `,
-      [bookingId]
+      [effectiveBookingId]
     );
 
     if (!currentBooking) {
@@ -12701,7 +12719,7 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
       LIMIT 1
       FOR UPDATE
       `,
-      [changeRequestId, bookingId]
+      [changeRequestId, effectiveBookingId]
     );
 
     if (!changeRequest) {
@@ -12737,7 +12755,7 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
       const preparedUpdate = await prepareBookingEditableUpdate(connection, currentBooking, requestedChanges);
       const currentComparableFields = buildBookingEditableComparableFields(currentBooking);
       if (!bookingEditableFieldsAreEqual(currentComparableFields, preparedUpdate.comparableFields)) {
-        await applyPreparedBookingEditableUpdate(connection, bookingId, preparedUpdate);
+        await applyPreparedBookingEditableUpdate(connection, effectiveBookingId, preparedUpdate);
       }
     }
 
@@ -12769,7 +12787,7 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
         });
       } catch (emailError) {
         console.error('Error sending booking change request resolution email:', {
-          bookingId,
+          bookingId: effectiveBookingId,
           changeRequestId,
           error: emailError.message,
         });
