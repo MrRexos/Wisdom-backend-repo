@@ -6366,7 +6366,76 @@ pool.on('connection', (connection) => {
 });
 
 const promisePool = pool.promise();
+const RECENTLY_SEEN_LIST_NAME = 'Recently seen';
+const RECENTLY_SEEN_MAX_ITEMS = 15;
 let reviewBookingColumnAvailabilityPromise = null;
+
+async function getOrCreateRecentlySeenListId(connection, userId) {
+  const [rows] = await connection.query(
+    'SELECT id FROM service_list WHERE user_id = ? AND list_name = ? ORDER BY id ASC LIMIT 1 FOR UPDATE',
+    [userId, RECENTLY_SEEN_LIST_NAME]
+  );
+
+  if (rows.length > 0) {
+    return rows[0].id;
+  }
+
+  const [result] = await connection.query(
+    'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)',
+    [RECENTLY_SEEN_LIST_NAME, userId]
+  );
+
+  return result.insertId;
+}
+
+async function upsertRecentlySeenItem(connection, listId, serviceId) {
+  const [existingRows] = await connection.query(
+    'SELECT id FROM item_list WHERE list_id = ? AND service_id = ?',
+    [listId, serviceId]
+  );
+
+  if (existingRows.length > 0) {
+    const existingIds = existingRows.map((row) => row.id);
+    const placeholders = existingIds.map(() => '?').join(', ');
+    await connection.query(
+      `DELETE FROM item_list WHERE id IN (${placeholders})`,
+      existingIds
+    );
+  }
+
+  const [orderRows] = await connection.query(
+    'SELECT COALESCE(MAX(`order`), 0) AS maxOrder FROM item_list WHERE list_id = ?',
+    [listId]
+  );
+  const nextOrder = Number(orderRows[0]?.maxOrder || 0) + 1;
+
+  const [insertResult] = await connection.query(
+    'INSERT INTO item_list (list_id, service_id, `order`, added_datetime) VALUES (?, ?, ?, NOW())',
+    [listId, serviceId, nextOrder]
+  );
+
+  const [orderedRows] = await connection.query(
+    'SELECT id FROM item_list WHERE list_id = ? ORDER BY `order` DESC, added_datetime DESC, id DESC',
+    [listId]
+  );
+  const overflowIds = orderedRows
+    .slice(RECENTLY_SEEN_MAX_ITEMS)
+    .map((row) => row.id);
+
+  if (overflowIds.length > 0) {
+    const placeholders = overflowIds.map(() => '?').join(', ');
+    await connection.query(
+      `DELETE FROM item_list WHERE id IN (${placeholders})`,
+      overflowIds
+    );
+  }
+
+  return {
+    itemId: insertResult.insertId,
+    deduplicated: existingRows.length > 0,
+    removedOverflowCount: overflowIds.length,
+  };
+}
 
 async function reviewTableHasBookingIdColumn() {
   if (!reviewBookingColumnAvailabilityPromise) {
@@ -8730,7 +8799,13 @@ app.get('/api/user/:userId/lists', authenticateToken, (req, res) => {
           const lastItemDateResult = await query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
 
           // Obtener todos los servicios de la lista ordenados por el id de inserción
-          const services = await query('SELECT service_id FROM item_list WHERE list_id = ? ORDER BY id', [list.id]);
+          const servicesOrderClause = list.list_name === RECENTLY_SEEN_LIST_NAME
+            ? 'ORDER BY `order` DESC, id DESC'
+            : 'ORDER BY `order` ASC, id ASC';
+          const services = await query(
+            `SELECT service_id FROM item_list WHERE list_id = ? ${servicesOrderClause}`,
+            [list.id]
+          );
 
           const servicesWithImages = [];
 
@@ -8774,6 +8849,49 @@ app.get('/api/user/:userId/lists', authenticateToken, (req, res) => {
         });
     });
   });
+});
+
+app.post('/api/recently-seen/items', async (req, res) => {
+  const userId = Number(req.user?.id);
+  const serviceId = Number(req.body?.service_id);
+
+  if (!Number.isFinite(userId)) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
+
+  if (!Number.isFinite(serviceId)) {
+    return res.status(400).json({ error: 'service_id es requerido.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
+
+    const listId = await getOrCreateRecentlySeenListId(connection, userId);
+    const result = await upsertRecentlySeenItem(connection, listId, serviceId);
+
+    await connection.commit();
+    return res.status(201).json({
+      message: 'Recently seen actualizado con éxito.',
+      listId,
+      itemId: result.itemId,
+      deduplicated: result.deduplicated,
+      removedOverflowCount: result.removedOverflowCount,
+    });
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Error rolling back recently seen transaction:', rollbackError);
+      }
+    }
+    console.error('Error updating recently seen list:', error);
+    return res.status(500).json({ error: 'Error al actualizar Recently seen.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 //Ruta para actulizar el nombre de una lista
@@ -8947,6 +9065,7 @@ app.get('/api/lists/:id/items', (req, res) => {
         COALESCE(review_data.review_count, 0) AS review_count,
         COALESCE(review_data.average_rating, 0) AS average_rating
       FROM item_list
+      JOIN service_list sl ON item_list.list_id = sl.id
       JOIN service ON item_list.service_id = service.id
       JOIN price ON service.price_id = price.id
       JOIN user_account ON service.user_id = user_account.id
@@ -8959,11 +9078,14 @@ app.get('/api/lists/:id/items', (req, res) => {
         GROUP BY service_id
       ) AS review_data ON service.id = review_data.service_id
       WHERE item_list.list_id = ?
-        AND service.is_hidden = 0;
+        AND service.is_hidden = 0
+      ORDER BY
+        CASE WHEN sl.list_name = ? THEN -item_list.\`order\` ELSE item_list.\`order\` END ASC,
+        CASE WHEN sl.list_name = ? THEN -item_list.id ELSE item_list.id END ASC;
     `;
 
 
-    connection.query(query, [id], (err, itemsWithService) => {
+    connection.query(query, [id, RECENTLY_SEEN_LIST_NAME, RECENTLY_SEEN_LIST_NAME], (err, itemsWithService) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -9220,11 +9342,12 @@ app.get('/api/category/:id/services', async (req, res) => {
           JOIN service_list sl ON il.list_id = sl.id
           LEFT JOIN shared_list sh ON sh.list_id = il.list_id
           WHERE (sl.user_id = ? OR sh.user_id = ?)
+            AND sl.list_name <> ?
             AND il.service_id IN (${placeholders})
         `;
         const [likedRows] = await promisePool.query(
           likedQuery,
-          [viewerId, viewerId, ...serviceIds]
+          [viewerId, viewerId, RECENTLY_SEEN_LIST_NAME, ...serviceIds]
         );
         likedServiceIds = new Set(likedRows.map(r => Number(r.service_id)));
       }
@@ -10153,63 +10276,85 @@ app.post('/api/lists', (req, res) => {
 app.post('/api/lists/:list_id/items', (req, res) => {
   const { list_id } = req.params;
   const { service_id } = req.body;
+  const numericListId = Number(list_id);
+  const numericServiceId = Number(service_id);
 
-  if (!service_id) {
+  if (!Number.isFinite(numericServiceId)) {
     return res.status(400).json({ error: 'service_id es requerido.' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
+  if (!Number.isFinite(numericListId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
+  }
 
-    // Comprobar si ya existe un item con el mismo service_id en la lista
-    const checkIfExistsQuery = 'SELECT id FROM item_list WHERE list_id = ? AND service_id = ?';
-    connection.query(checkIfExistsQuery, [list_id, service_id], (err, results) => {
-      if (err) {
-        connection.release();
-        console.error('Error al comprobar si el item ya existe:', err);
-        return res.status(500).json({ error: 'Error al comprobar si el item ya existe.' });
+  (async () => {
+    let connection;
+    let transactionStarted = false;
+    try {
+      connection = await promisePool.getConnection();
+
+      const [listRows] = await connection.query(
+        'SELECT id, user_id, list_name FROM service_list WHERE id = ? LIMIT 1',
+        [numericListId]
+      );
+
+      if (listRows.length === 0) {
+        return res.status(404).json({ error: 'Lista no encontrada.' });
       }
 
-      // Si ya existe, no añadir el nuevo item
-      if (results.length > 0) {
-        connection.release();
+      const list = listRows[0];
+      const isOwnerRecentlySeenList =
+        list.list_name === RECENTLY_SEEN_LIST_NAME && Number(list.user_id) === Number(req.user?.id);
+
+      if (isOwnerRecentlySeenList) {
+        await connection.beginTransaction();
+        transactionStarted = true;
+        const result = await upsertRecentlySeenItem(connection, numericListId, numericServiceId);
+        await connection.commit();
+        transactionStarted = false;
+        return res.status(201).json({
+          message: 'Item añadido con éxito',
+          itemId: result.itemId,
+          deduplicated: result.deduplicated,
+          removedOverflowCount: result.removedOverflowCount,
+        });
+      }
+
+      const [existingRows] = await connection.query(
+        'SELECT id FROM item_list WHERE list_id = ? AND service_id = ?',
+        [numericListId, numericServiceId]
+      );
+
+      if (existingRows.length > 0) {
         return res.status(201).json({ message: 'El item ya existe en la lista.', alreadyExists: true });
       }
 
-      // Si no existe, proceder con la inserción
-      const getLastOrderQuery = 'SELECT MAX(`order`) AS lastOrder FROM item_list WHERE list_id = ?';
-      connection.query(getLastOrderQuery, [list_id], (err, result) => {
-        if (err) {
-          connection.release();
-          console.error('Error al obtener el último orden:', err);
-          return res.status(500).json({ error: 'Error al obtener el último orden.' });
+      const [orderRows] = await connection.query(
+        'SELECT COALESCE(MAX(`order`), 0) AS lastOrder FROM item_list WHERE list_id = ?',
+        [numericListId]
+      );
+      const newOrder = Number(orderRows[0]?.lastOrder || 0) + 1;
+
+      const [insertResult] = await connection.query(
+        'INSERT INTO item_list (list_id, service_id, `order`, added_datetime) VALUES (?, ?, ?, NOW())',
+        [numericListId, numericServiceId, newOrder]
+      );
+
+      return res.status(201).json({ message: 'Item añadido con éxito', itemId: insertResult.insertId });
+    } catch (error) {
+      if (connection && transactionStarted) {
+        try {
+          await connection.rollback();
+        } catch (rollbackError) {
+          console.error('Error rolling back list item creation:', rollbackError);
         }
-
-        const lastOrder = result[0].lastOrder || 0;
-        const newOrder = lastOrder + 1;
-
-        const insertItemQuery = `
-          INSERT INTO item_list (list_id, service_id, \`order\`, added_datetime) 
-          VALUES (?, ?, ?, NOW())
-        `;
-        const values = [list_id, service_id, newOrder];
-
-        connection.query(insertItemQuery, values, (err, result) => {
-          connection.release();
-
-          if (err) {
-            console.error('Error al añadir el item a la lista:', err);
-            return res.status(500).json({ error: 'Error al añadir el item a la lista.' });
-          }
-
-          res.status(201).json({ message: 'Item añadido con éxito', itemId: result.insertId });
-        });
-      });
-    });
-  });
+      }
+      console.error('Error al añadir el item a la lista:', error);
+      return res.status(500).json({ error: 'Error al añadir el item a la lista.' });
+    } finally {
+      connection?.release();
+    }
+  })();
 });
 
 // Ruta para eliminar un item de una lista por su ID
@@ -10404,7 +10549,8 @@ app.get('/api/service/:id', (req, res) => {
         (SELECT COUNT(DISTINCT sl.user_id)
          FROM item_list il
          JOIN service_list sl ON il.list_id = sl.id
-         WHERE il.service_id = s.id) AS likes_count,
+         WHERE il.service_id = s.id
+           AND sl.list_name <> ?) AS likes_count,
         (SELECT ROUND(COALESCE(SUM(
              CASE
                WHEN b.requested_duration_minutes IS NOT NULL THEN b.requested_duration_minutes
@@ -10423,7 +10569,7 @@ app.get('/api/service/:id', (req, res) => {
       WHERE s.id = ?;
     `;
 
-    connection.query(query, [id], async (err, serviceData) => {
+    connection.query(query, [RECENTLY_SEEN_LIST_NAME, id], async (err, serviceData) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -10490,11 +10636,12 @@ app.get('/api/service/:id', (req, res) => {
               JOIN service_list sl ON il.list_id = sl.id
               LEFT JOIN shared_list sh ON sh.list_id = il.list_id
               WHERE il.service_id = ? AND (sl.user_id = ? OR sh.user_id = ?)
+                AND sl.list_name <> ?
               LIMIT 1
             `;
             const [likedRows] = await promisePool.query(
               likedQuery,
-              [service.service_id, viewerId, viewerId]
+              [service.service_id, viewerId, viewerId, RECENTLY_SEEN_LIST_NAME]
             );
             isLiked = likedRows.length > 0;
           } catch (likedError) {
@@ -17162,6 +17309,7 @@ app.get('/api/services', async (req, res) => {
           COUNT(DISTINCT sl.user_id) AS likes_count
         FROM item_list il
         JOIN service_list sl ON il.list_id = sl.id
+        WHERE sl.list_name <> ?
         GROUP BY il.service_id
       ) AS likes_data ON likes_data.service_id = service.id
       LEFT JOIN (
@@ -17213,6 +17361,7 @@ app.get('/api/services', async (req, res) => {
     try {
       const params = [
         ...distanceSelectParams,
+        RECENTLY_SEEN_LIST_NAME,
         ...searchClause.params,
       ];
       if (Number.isFinite(categoryId)) {
@@ -17247,13 +17396,14 @@ app.get('/api/services', async (req, res) => {
             JOIN service_list sl ON il.list_id = sl.id
             LEFT JOIN shared_list sh ON sh.list_id = il.list_id
             WHERE (sl.user_id = ? OR sh.user_id = ?)
+              AND sl.list_name <> ?
               AND il.service_id IN (${placeholders})
           `;
 
           try {
             const [likedRows] = await promisePool.query(
               likedQuery,
-              [viewerId, viewerId, ...serviceIds]
+              [viewerId, viewerId, RECENTLY_SEEN_LIST_NAME, ...serviceIds]
             );
             likedServiceIds = new Set(likedRows.map((row) => Number(row.service_id)));
           } catch (likeError) {
@@ -17516,6 +17666,7 @@ app.get('/api/services', async (req, res) => {
           COUNT(DISTINCT sl.user_id) AS likes_count
         FROM item_list il
         JOIN service_list sl ON il.list_id = sl.id
+        WHERE sl.list_name <> ?
         GROUP BY il.service_id
       ) AS likes_data ON likes_data.service_id = service.id
       LEFT JOIN (
@@ -17575,6 +17726,7 @@ app.get('/api/services', async (req, res) => {
     const whereSearchParams = new Array(5).fill(searchPattern);
     const params = [
       ...distanceSelectParams,
+      RECENTLY_SEEN_LIST_NAME,
       ...whereSearchParams,
     ];
     if (Number.isFinite(categoryId)) {
@@ -17600,12 +17752,13 @@ app.get('/api/services', async (req, res) => {
             JOIN service_list sl ON il.list_id = sl.id 
             LEFT JOIN shared_list sh ON sh.list_id = il.list_id 
             WHERE (sl.user_id = ? OR sh.user_id = ?) 
+              AND sl.list_name <> ?
               AND il.service_id IN (${placeholders}) 
           `;
           try {
             const [likedRows] = await promisePool.query(
               likedQuery,
-              [viewerId, viewerId, ...serviceIds]
+              [viewerId, viewerId, RECENTLY_SEEN_LIST_NAME, ...serviceIds]
             );
             likedServiceIds = new Set(likedRows.map(r => Number(r.service_id)));
           } catch (e) {
