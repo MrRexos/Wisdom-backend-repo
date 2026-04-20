@@ -8756,6 +8756,8 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
 app.get('/api/user/:userId/lists', authenticateToken, (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res, req.params.userId);
   if (!requestedUserId) return;
+  const requestedServiceId = Number(req.query?.service_id);
+  const hasRequestedServiceId = Number.isFinite(requestedServiceId);
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -8797,6 +8799,12 @@ app.get('/api/user/:userId/lists', authenticateToken, (req, res) => {
         return (async () => {
           const itemCountResult = await query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id]);
           const lastItemDateResult = await query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
+          const selectedServiceItemResult = hasRequestedServiceId
+            ? await query(
+              'SELECT id FROM item_list WHERE list_id = ? AND service_id = ? LIMIT 1',
+              [list.id, requestedServiceId]
+            )
+            : [];
 
           // Obtener todos los servicios de la lista ordenados por el id de inserción
           const servicesOrderClause = list.list_name === RECENTLY_SEEN_LIST_NAME
@@ -8831,7 +8839,9 @@ app.get('/api/user/:userId/lists', authenticateToken, (req, res) => {
             role: list.role,  // Rol del usuario en la lista (propietario o compartido)
             item_count: itemCountResult[0].item_count,
             last_item_date: lastItemDateResult[0].last_item_date,
-            services: servicesWithImages
+            services: servicesWithImages,
+            contains_service: hasRequestedServiceId ? selectedServiceItemResult.length > 0 : false,
+            service_item_id: hasRequestedServiceId ? selectedServiceItemResult[0]?.id ?? null : null,
           };
         })();
       });
