@@ -6367,13 +6367,57 @@ pool.on('connection', (connection) => {
 
 const promisePool = pool.promise();
 const RECENTLY_SEEN_LIST_NAME = 'Recently seen';
+const FAVORITES_LIST_TITLE_KEY = 'default_favorites_list';
+const SYSTEM_LIST_TYPE_CUSTOM = 'custom';
+const SYSTEM_LIST_TYPE_RECENTLY_SEEN = 'recently_seen';
+const SYSTEM_LIST_TYPE_FAVORITES = 'favorites';
+const SYSTEM_SERVICE_LISTS = [
+  {
+    type: SYSTEM_LIST_TYPE_RECENTLY_SEEN,
+    listName: RECENTLY_SEEN_LIST_NAME,
+    titleKey: null,
+  },
+  {
+    type: SYSTEM_LIST_TYPE_FAVORITES,
+    listName: FAVORITES_LIST_TITLE_KEY,
+    titleKey: FAVORITES_LIST_TITLE_KEY,
+  },
+];
 const RECENTLY_SEEN_MAX_ITEMS = 15;
 let reviewBookingColumnAvailabilityPromise = null;
 
-async function getOrCreateRecentlySeenListId(connection, userId) {
+function getServiceListMetadata(listName) {
+  const systemList = SYSTEM_SERVICE_LISTS.find((entry) => entry.listName === listName);
+  if (!systemList) {
+    return {
+      type: SYSTEM_LIST_TYPE_CUSTOM,
+      titleKey: null,
+      canRename: true,
+      canDelete: true,
+    };
+  }
+
+  return {
+    type: systemList.type,
+    titleKey: systemList.titleKey,
+    canRename: false,
+    canDelete: false,
+  };
+}
+
+function isReservedServiceListName(listName) {
+  if (typeof listName !== 'string') {
+    return false;
+  }
+
+  const trimmedListName = listName.trim();
+  return SYSTEM_SERVICE_LISTS.some((entry) => entry.listName === trimmedListName);
+}
+
+async function getOrCreateServiceListId(connection, userId, listName) {
   const [rows] = await connection.query(
     'SELECT id FROM service_list WHERE user_id = ? AND list_name = ? ORDER BY id ASC LIMIT 1 FOR UPDATE',
-    [userId, RECENTLY_SEEN_LIST_NAME]
+    [userId, listName]
   );
 
   if (rows.length > 0) {
@@ -6382,10 +6426,20 @@ async function getOrCreateRecentlySeenListId(connection, userId) {
 
   const [result] = await connection.query(
     'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)',
-    [RECENTLY_SEEN_LIST_NAME, userId]
+    [listName, userId]
   );
 
   return result.insertId;
+}
+
+async function getOrCreateRecentlySeenListId(connection, userId) {
+  return getOrCreateServiceListId(connection, userId, RECENTLY_SEEN_LIST_NAME);
+}
+
+async function ensureDefaultServiceLists(connection, userId) {
+  for (const serviceList of SYSTEM_SERVICE_LISTS) {
+    await getOrCreateServiceListId(connection, userId, serviceList.listName);
+  }
 }
 
 async function upsertRecentlySeenItem(connection, listId, serviceId) {
@@ -6785,10 +6839,7 @@ async function createUserAccountWithDefaults(connection, {
     throw new Error('USERNAME_GENERATION_FAILED');
   }
 
-  await connection.query(
-    'INSERT INTO service_list (list_name, user_id) VALUES (?, ?)',
-    ['Recently seen', userId]
-  );
+  await ensureDefaultServiceLists(connection, userId);
 
   return { userId, username };
 }
@@ -8753,112 +8804,109 @@ app.post('/api/upload-image', multerMid.single('file'), async (req, res, next) =
 });
 
 //Ruta para obtener las listas de un usuario en favorites
-app.get('/api/user/:userId/lists', authenticateToken, (req, res) => {
+app.get('/api/user/:userId/lists', authenticateToken, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res, req.params.userId);
   if (!requestedUserId) return;
   const requestedServiceId = Number(req.query?.service_id);
   const hasRequestedServiceId = Number.isFinite(requestedServiceId);
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
+    await ensureDefaultServiceLists(connection, requestedUserId);
 
-    // Obtener las listas del usuario en service_list y las listas compartidas en shared_list
-    let query = `
-      SELECT id, list_name, 'owner' AS role FROM service_list WHERE user_id = ?
-      UNION
-      SELECT service_list.id, service_list.list_name, 'shared' AS role 
-      FROM service_list
-      JOIN shared_list ON service_list.id = shared_list.list_id
-      WHERE shared_list.user_id = ?;
-    `;
+    const [lists] = await connection.query(
+      `
+        SELECT id, list_name, 'owner' AS role FROM service_list WHERE user_id = ?
+        UNION
+        SELECT service_list.id, service_list.list_name, 'shared' AS role
+        FROM service_list
+        JOIN shared_list ON service_list.id = shared_list.list_id
+        WHERE shared_list.user_id = ?;
+      `,
+      [requestedUserId, requestedUserId]
+    );
 
-    connection.query(query, [requestedUserId, requestedUserId], (err, lists) => {
-      if (err) {
-        console.error('Error al obtener las listas:', err);
-        res.status(500).json({ error: 'Error al obtener las listas.' });
-        connection.release();  // Libera la conexión
-        return;
+    const listsWithDetails = [];
+
+    for (const list of lists) {
+      const [itemCountResult] = await connection.query(
+        'SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?',
+        [list.id]
+      );
+      const [lastItemDateResult] = await connection.query(
+        'SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?',
+        [list.id]
+      );
+      const [selectedServiceItemResult] = hasRequestedServiceId
+        ? await connection.query(
+          'SELECT id FROM item_list WHERE list_id = ? AND service_id = ? LIMIT 1',
+          [list.id, requestedServiceId]
+        )
+        : [[]];
+
+      const servicesOrderClause = list.list_name === RECENTLY_SEEN_LIST_NAME
+        ? 'ORDER BY `order` DESC, id DESC'
+        : 'ORDER BY `order` ASC, id ASC';
+      const [services] = await connection.query(
+        `SELECT service_id FROM item_list WHERE list_id = ? ${servicesOrderClause}`,
+        [list.id]
+      );
+
+      const servicesWithImages = [];
+
+      for (const service of services) {
+        if (servicesWithImages.length >= 3) {
+          break;
+        }
+
+        const [images] = await connection.query(
+          'SELECT image_url, object_name FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1',
+          [service.service_id]
+        );
+
+        if (images.length > 0 && images[0].image_url) {
+          servicesWithImages.push({
+            service_id: service.service_id,
+            image_url: images[0].image_url,
+            object_name: images[0].object_name,
+          });
+        }
       }
 
-      // Iterar sobre las listas para obtener los detalles
-      const listsWithDetailsPromises = lists.map(list => {
-        const query = (sql, params) => new Promise((resolve, reject) => {
-          connection.query(sql, params, (err, results) => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve(results);
-            }
-          });
-        });
-
-        return (async () => {
-          const itemCountResult = await query('SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?', [list.id]);
-          const lastItemDateResult = await query('SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?', [list.id]);
-          const selectedServiceItemResult = hasRequestedServiceId
-            ? await query(
-              'SELECT id FROM item_list WHERE list_id = ? AND service_id = ? LIMIT 1',
-              [list.id, requestedServiceId]
-            )
-            : [];
-
-          // Obtener todos los servicios de la lista ordenados por el id de inserción
-          const servicesOrderClause = list.list_name === RECENTLY_SEEN_LIST_NAME
-            ? 'ORDER BY `order` DESC, id DESC'
-            : 'ORDER BY `order` ASC, id ASC';
-          const services = await query(
-            `SELECT service_id FROM item_list WHERE list_id = ? ${servicesOrderClause}`,
-            [list.id]
-          );
-
-          const servicesWithImages = [];
-
-          for (const service of services) {
-            if (servicesWithImages.length >= 3) {
-              break;
-            }
-
-            const images = await query('SELECT image_url, object_name FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1', [service.service_id]);
-
-            if (images.length > 0 && images[0].image_url) {
-              servicesWithImages.push({
-                service_id: service.service_id,
-                image_url: images[0].image_url,
-                object_name: images[0].object_name
-              });
-            }
-          }
-
-          return {
-            id: list.id,
-            title: list.list_name,
-            role: list.role,  // Rol del usuario en la lista (propietario o compartido)
-            item_count: itemCountResult[0].item_count,
-            last_item_date: lastItemDateResult[0].last_item_date,
-            services: servicesWithImages,
-            contains_service: hasRequestedServiceId ? selectedServiceItemResult.length > 0 : false,
-            service_item_id: hasRequestedServiceId ? selectedServiceItemResult[0]?.id ?? null : null,
-          };
-        })();
+      const metadata = getServiceListMetadata(list.list_name);
+      listsWithDetails.push({
+        id: list.id,
+        title: list.list_name,
+        title_key: metadata.titleKey,
+        type: metadata.type,
+        can_rename: metadata.canRename,
+        can_delete: metadata.canDelete,
+        role: list.role,
+        item_count: itemCountResult[0].item_count,
+        last_item_date: lastItemDateResult[0].last_item_date,
+        services: servicesWithImages,
+        contains_service: hasRequestedServiceId ? selectedServiceItemResult.length > 0 : false,
+        service_item_id: hasRequestedServiceId ? selectedServiceItemResult[0]?.id ?? null : null,
       });
+    }
 
-      Promise.all(listsWithDetailsPromises)
-        .then(listsWithDetails => {
-          res.json(listsWithDetails);
-        })
-        .catch(error => {
-          console.error('Error al obtener los detalles de las listas:', error);
-          res.status(500).json({ error: 'Error al obtener los detalles de las listas.' });
-        })
-        .finally(() => {
-          connection.release();  // Libera la conexión
-        });
-    });
-  });
+    await connection.commit();
+    res.json(listsWithDetails);
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Error al hacer rollback al obtener las listas:', rollbackError);
+      }
+    }
+    console.error('Error al obtener las listas:', error);
+    res.status(500).json({ error: 'Error al obtener las listas.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 app.post('/api/recently-seen/items', async (req, res) => {
@@ -8905,73 +8953,74 @@ app.post('/api/recently-seen/items', async (req, res) => {
 });
 
 //Ruta para actulizar el nombre de una lista
-app.put('/api/list/:listId', (req, res) => {
+app.put('/api/list/:listId', async (req, res) => {
   const { listId } = req.params;
-  const { newName } = req.body;
+  const newName = String(req.body?.newName || '').trim();
 
   if (!newName) {
     return res.status(400).json({ error: 'El nuevo nombre de la lista es requerido.' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  if (isReservedServiceListName(newName)) {
+    return res.status(400).json({ error: 'Ese nombre está reservado para una lista del sistema.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const [existingLists] = await connection.query(
+      'SELECT id, list_name FROM service_list WHERE id = ? LIMIT 1',
+      [listId]
+    );
+
+    if (existingLists.length === 0) {
+      return res.status(404).json({ error: 'Lista no encontrada.' });
     }
 
-    // Actualizar el nombre de la lista
-    connection.query('UPDATE service_list SET list_name = ? WHERE id = ?', [newName, listId], (err, result) => {
-      if (err) {
-        console.error('Error al actualizar el nombre de la lista:', err);
-        connection.release(); // Libera la conexión
-        return res.status(500).json({ error: 'Error al actualizar el nombre de la lista.' });
-      }
+    if (!getServiceListMetadata(existingLists[0].list_name).canRename) {
+      return res.status(403).json({ error: 'No se puede renombrar una lista del sistema.' });
+    }
 
-      if (result.affectedRows === 0) {
-        connection.release(); // Libera la conexión
-        return res.status(404).json({ error: 'Lista no encontrada.' });
-      }
-
-      res.json({ message: 'Nombre de la lista actualizado con éxito.' });
-      connection.release(); // Libera la conexión
-    });
-  });
+    await connection.query('UPDATE service_list SET list_name = ? WHERE id = ?', [newName, listId]);
+    res.json({ message: 'Nombre de la lista actualizado con éxito.' });
+  } catch (err) {
+    console.error('Error al actualizar el nombre de la lista:', err);
+    return res.status(500).json({ error: 'Error al actualizar el nombre de la lista.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 // Ruta para borrar una lista desde list
-app.delete('/api/list/:listId', (req, res) => {
+app.delete('/api/list/:listId', async (req, res) => {
   const { listId } = req.params;
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const [existingLists] = await connection.query(
+      'SELECT id, list_name FROM service_list WHERE id = ? LIMIT 1',
+      [listId]
+    );
+
+    if (existingLists.length === 0) {
+      return res.status(404).json({ error: 'Lista no encontrada.' });
     }
 
-    // Eliminar la lista
-    connection.query('DELETE FROM service_list WHERE id = ?', [listId], (err, result) => {
-      if (err) {
-        console.error('Error al eliminar la lista:', err);
-        connection.release(); // Libera la conexión
-        return res.status(500).json({ error: 'Error al eliminar la lista.' });
-      }
+    if (!getServiceListMetadata(existingLists[0].list_name).canDelete) {
+      return res.status(403).json({ error: 'No se puede eliminar una lista del sistema.' });
+    }
 
-      if (result.affectedRows === 0) {
-        connection.release(); // Libera la conexión
-        return res.status(404).json({ error: 'Lista no encontrada.' });
-      }
+    await connection.query('DELETE FROM service_list WHERE id = ?', [listId]);
+    await connection.query('DELETE FROM item_list WHERE list_id = ?', [listId]);
 
-      // Opcional: eliminar los items asociados a la lista
-      connection.query('DELETE FROM item_list WHERE list_id = ?', [listId], (err) => {
-        if (err) {
-          console.error('Error al eliminar los items de la lista:', err);
-        }
-        connection.release(); // Libera la conexión
-      });
-
-      res.json({ message: 'Lista eliminada con éxito.' });
-    });
-  });
+    res.json({ message: 'Lista eliminada con éxito.' });
+  } catch (err) {
+    console.error('Error al eliminar la lista:', err);
+    return res.status(500).json({ error: 'Error al eliminar la lista.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 //Ruta para compartir una lista
@@ -9151,32 +9200,33 @@ app.put('/api/items/:id/note', (req, res) => {
 });
 
 // Ruta para borrar una lista desde favorites
-app.delete('/api/lists/:id', (req, res) => {
+app.delete('/api/lists/:id', async (req, res) => {
   const { id } = req.params;
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const [existingLists] = await connection.query(
+      'SELECT id, list_name FROM service_list WHERE id = ? LIMIT 1',
+      [id]
+    );
+
+    if (existingLists.length === 0) {
+      return res.status(404).json({ message: 'Lista no encontrada' });
     }
 
-    connection.query('DELETE FROM service_list WHERE id = ?', [id], (err, result) => {
-      connection.release(); // Libera la conexión después de usarla
+    if (!getServiceListMetadata(existingLists[0].list_name).canDelete) {
+      return res.status(403).json({ error: 'No se puede eliminar una lista del sistema.' });
+    }
 
-      if (err) {
-        console.error('Error al eliminar la lista:', err);
-        res.status(500).json({ error: 'Error al eliminar la lista.' });
-        return;
-      }
-
-      if (result.affectedRows > 0) {
-        res.status(200).json({ message: 'Lista eliminada con éxito' });
-      } else {
-        res.status(404).json({ message: 'Lista no encontrada' });
-      }
-    });
-  });
+    await connection.query('DELETE FROM service_list WHERE id = ?', [id]);
+    res.status(200).json({ message: 'Lista eliminada con éxito' });
+  } catch (err) {
+    console.error('Error al eliminar la lista:', err);
+    res.status(500).json({ error: 'Error al eliminar la lista.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 //Ruta para obtener todas las familias
@@ -10254,10 +10304,15 @@ app.put('/api/services/:id', async (req, res) => {
 
 //Ruta para crear lista
 app.post('/api/lists', (req, res) => {
-  const { user_id, list_name } = req.body;
+  const { user_id } = req.body;
+  const list_name = String(req.body?.list_name || '').trim();
 
   if (!user_id || !list_name) {
     return res.status(400).json({ error: 'user_id y list_name son requeridos.' });
+  }
+
+  if (isReservedServiceListName(list_name)) {
+    return res.status(400).json({ error: 'Ese nombre está reservado para una lista del sistema.' });
   }
 
   pool.getConnection((err, connection) => {
