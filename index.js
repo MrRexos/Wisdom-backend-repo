@@ -72,6 +72,16 @@ const APPLE_PRIVATE_KEY = typeof process.env.APPLE_PRIVATE_KEY === 'string'
 const APPLE_PRIVATE_KEY_PATH = typeof process.env.APPLE_PRIVATE_KEY_PATH === 'string'
   ? process.env.APPLE_PRIVATE_KEY_PATH.trim()
   : '';
+const APP_DEEP_LINK_SCHEME = (process.env.APP_DEEP_LINK_SCHEME || 'wisdomexpo').trim().replace(/[:/]+$/g, '');
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 async function handleStripeRollbackIfNeeded(error) {
   try {
     if (error && error.payment_intent) {
@@ -7873,6 +7883,98 @@ const guestSessionLimiter = rateLimit({
 // Ruta de prueba
 app.get('/', (req, res) => {
   res.send('El backend está funcionando.');
+});
+
+app.get(['/shared-list/:token', '/api/shared-list/:token'], (req, res) => {
+  const token = typeof req.params?.token === 'string' ? req.params.token.trim() : '';
+
+  if (!token) {
+    return res.status(400).send('Invalid shared list link.');
+  }
+
+  const appUrl = `${APP_DEEP_LINK_SCHEME}://shared-list/${encodeURIComponent(token)}`;
+  const escapedAppUrl = escapeHtml(appUrl);
+  const escapedToken = escapeHtml(token);
+
+  return res
+    .status(200)
+    .type('html')
+    .send(`<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Open Wisdom</title>
+    <meta name="robots" content="noindex,nofollow" />
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f5f5f4;
+        color: #262626;
+        padding: 24px;
+      }
+      .card {
+        width: 100%;
+        max-width: 420px;
+        background: #ffffff;
+        border-radius: 24px;
+        padding: 28px 24px;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.08);
+        text-align: center;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 24px;
+      }
+      p {
+        margin: 0 0 16px;
+        line-height: 1.5;
+        color: #525252;
+      }
+      .button {
+        display: inline-block;
+        margin-top: 8px;
+        padding: 14px 22px;
+        border-radius: 999px;
+        background: #262626;
+        color: #ffffff;
+        text-decoration: none;
+        font-weight: 600;
+      }
+      .token {
+        margin-top: 18px;
+        font-size: 12px;
+        color: #737373;
+        word-break: break-word;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Open in Wisdom</h1>
+      <p>We are opening this shared list in Wisdom.</p>
+      <p>If the app does not open automatically, use the button below.</p>
+      <a class="button" href="${escapedAppUrl}">Open Wisdom</a>
+      <div class="token">Invite token: ${escapedToken}</div>
+    </main>
+    <script>
+      const appUrl = ${JSON.stringify(appUrl)};
+      const openApp = () => {
+        window.location.replace(appUrl);
+      };
+      openApp();
+      window.setTimeout(openApp, 900);
+    </script>
+  </body>
+</html>`);
 });
 
 app.get('/api/currency-rates', async (req, res) => {
