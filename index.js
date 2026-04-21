@@ -6371,6 +6371,13 @@ const FAVORITES_LIST_TITLE_KEY = 'default_favorites_list';
 const SYSTEM_LIST_TYPE_CUSTOM = 'custom';
 const SYSTEM_LIST_TYPE_RECENTLY_SEEN = 'recently_seen';
 const SYSTEM_LIST_TYPE_FAVORITES = 'favorites';
+const SHARED_LIST_PERMISSION_READ = 'read';
+const SHARED_LIST_PERMISSION_EDIT = 'edit';
+const SHARED_LIST_PERMISSION_OWNER = 'owner';
+const SHARED_LIST_ROLE_OWNER = 'owner';
+const SHARED_LIST_ROLE_COLLABORATOR = 'collaborator';
+const SHARED_LIST_ROLE_READ_ONLY = 'read_only';
+const SHARED_LIST_INVITATION_TOKEN_BYTES = 32;
 const SYSTEM_SERVICE_LISTS = [
   {
     type: SYSTEM_LIST_TYPE_RECENTLY_SEEN,
@@ -6412,6 +6419,249 @@ function isReservedServiceListName(listName) {
 
   const trimmedListName = listName.trim();
   return SYSTEM_SERVICE_LISTS.some((entry) => entry.listName === trimmedListName);
+}
+
+function normalizeSharedListPermission(value, fallback = null) {
+  if (value === SHARED_LIST_PERMISSION_OWNER) {
+    return SHARED_LIST_PERMISSION_OWNER;
+  }
+
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === SHARED_LIST_PERMISSION_READ || normalized === SHARED_LIST_PERMISSION_EDIT) {
+    return normalized;
+  }
+
+  return fallback;
+}
+
+function getSharedListPermissionRank(permission) {
+  const normalizedPermission = normalizeSharedListPermission(permission, null);
+
+  if (normalizedPermission === SHARED_LIST_PERMISSION_OWNER) {
+    return 3;
+  }
+
+  if (normalizedPermission === SHARED_LIST_PERMISSION_EDIT) {
+    return 2;
+  }
+
+  if (normalizedPermission === SHARED_LIST_PERMISSION_READ) {
+    return 1;
+  }
+
+  return 0;
+}
+
+function getStrongerSharedListPermission(...permissions) {
+  return permissions.reduce((strongestPermission, nextPermission) => (
+    getSharedListPermissionRank(nextPermission) > getSharedListPermissionRank(strongestPermission)
+      ? normalizeSharedListPermission(nextPermission, strongestPermission)
+      : strongestPermission
+  ), null);
+}
+
+function buildServiceListAccessRecord(listRow, requesterUserId) {
+  if (!listRow) {
+    return null;
+  }
+
+  const metadata = getServiceListMetadata(listRow.list_name);
+  const numericRequesterUserId = Number(requesterUserId);
+  const ownerUserId = Number(listRow.owner_user_id ?? listRow.user_id ?? null);
+  const isOwner = Number.isFinite(ownerUserId) && Number.isFinite(numericRequesterUserId)
+    && ownerUserId === numericRequesterUserId;
+  const sharedPermission = isOwner
+    ? null
+    : normalizeSharedListPermission(
+        listRow.shared_permission ?? listRow.permissions ?? null,
+        null
+      );
+  const accessLevel = isOwner ? SHARED_LIST_PERMISSION_OWNER : sharedPermission;
+  const accessRole = isOwner
+    ? SHARED_LIST_ROLE_OWNER
+    : sharedPermission === SHARED_LIST_PERMISSION_EDIT
+      ? SHARED_LIST_ROLE_COLLABORATOR
+      : sharedPermission === SHARED_LIST_PERMISSION_READ
+        ? SHARED_LIST_ROLE_READ_ONLY
+        : null;
+  const isCustomList = metadata.type === SYSTEM_LIST_TYPE_CUSTOM;
+  const canShareReadOnly = isCustomList && (
+    isOwner || sharedPermission === SHARED_LIST_PERMISSION_EDIT
+  );
+
+  return {
+    id: Number(listRow.id),
+    list_name: listRow.list_name,
+    owner_user_id: ownerUserId,
+    title_key: metadata.titleKey,
+    type: metadata.type,
+    role: isOwner ? 'owner' : sharedPermission ? 'shared' : null,
+    access_role: accessRole,
+    access_level: accessLevel,
+    is_owner: isOwner,
+    shared_permission: sharedPermission,
+    can_view: Boolean(isOwner || sharedPermission),
+    can_rename: Boolean(isOwner && metadata.canRename),
+    can_delete: Boolean(isOwner && metadata.canDelete),
+    can_leave: Boolean(!isOwner && sharedPermission),
+    can_add_items: Boolean(isOwner || sharedPermission === SHARED_LIST_PERMISSION_EDIT),
+    can_remove_items: Boolean(isOwner || sharedPermission === SHARED_LIST_PERMISSION_EDIT),
+    can_edit_notes: Boolean(isOwner || sharedPermission === SHARED_LIST_PERMISSION_EDIT),
+    can_share_collaborators: Boolean(isOwner && isCustomList),
+    can_share_read_only: Boolean(canShareReadOnly),
+  };
+}
+
+function mergeServiceListAccessRecords(records = []) {
+  const mergedRecordsById = new Map();
+
+  for (const record of records) {
+    const numericListId = Number(record?.id);
+    if (!Number.isFinite(numericListId)) {
+      continue;
+    }
+
+    const existingRecord = mergedRecordsById.get(numericListId);
+    if (
+      !existingRecord
+      || getSharedListPermissionRank(record.access_level) > getSharedListPermissionRank(existingRecord.access_level)
+    ) {
+      mergedRecordsById.set(numericListId, record);
+    }
+  }
+
+  return Array.from(mergedRecordsById.values());
+}
+
+async function getServiceListAccess(connection, listId, requesterUserId, { lock = false } = {}) {
+  const numericListId = Number(listId);
+  const numericRequesterUserId = Number(requesterUserId);
+
+  if (!Number.isFinite(numericListId) || !Number.isFinite(numericRequesterUserId)) {
+    return null;
+  }
+
+  const lockClause = lock ? 'FOR UPDATE' : '';
+  const [rows] = await connection.query(
+    `
+      SELECT
+        sl.id,
+        sl.list_name,
+        sl.user_id AS owner_user_id,
+        sh.permissions AS shared_permission
+      FROM service_list sl
+      LEFT JOIN shared_list sh
+        ON sh.list_id = sl.id
+       AND sh.user_id = ?
+      WHERE sl.id = ?
+      ORDER BY
+        CASE sh.permissions
+          WHEN 'edit' THEN 2
+          WHEN 'read' THEN 1
+          ELSE 0
+        END DESC,
+        sh.id DESC
+      LIMIT 1
+      ${lockClause}
+    `,
+    [numericRequesterUserId, numericListId]
+  );
+
+  if (!rows.length) {
+    return null;
+  }
+
+  return buildServiceListAccessRecord(rows[0], numericRequesterUserId);
+}
+
+async function buildServiceListPayload(connection, listAccess, { requestedServiceId = null } = {}) {
+  if (!listAccess?.can_view) {
+    return null;
+  }
+
+  const numericListId = Number(listAccess.id);
+  const numericRequestedServiceId = Number(requestedServiceId);
+  const hasRequestedServiceId = Number.isFinite(numericRequestedServiceId);
+
+  const [itemCountResult] = await connection.query(
+    'SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?',
+    [numericListId]
+  );
+  const [lastItemDateResult] = await connection.query(
+    'SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?',
+    [numericListId]
+  );
+  const [selectedServiceItemResult] = hasRequestedServiceId
+    ? await connection.query(
+        'SELECT id FROM item_list WHERE list_id = ? AND service_id = ? LIMIT 1',
+        [numericListId, numericRequestedServiceId]
+      )
+    : [[]];
+
+  const servicesOrderClause = listAccess.list_name === RECENTLY_SEEN_LIST_NAME
+    ? 'ORDER BY `order` DESC, id DESC'
+    : 'ORDER BY `order` ASC, id ASC';
+  const [services] = await connection.query(
+    `SELECT service_id FROM item_list WHERE list_id = ? ${servicesOrderClause}`,
+    [numericListId]
+  );
+
+  const servicesWithImages = [];
+
+  for (const service of services) {
+    if (servicesWithImages.length >= 3) {
+      break;
+    }
+
+    const [images] = await connection.query(
+      'SELECT image_url, object_name FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1',
+      [service.service_id]
+    );
+
+    if (images.length > 0 && images[0].image_url) {
+      servicesWithImages.push({
+        service_id: service.service_id,
+        image_url: images[0].image_url,
+        object_name: images[0].object_name,
+      });
+    }
+  }
+
+  return {
+    id: numericListId,
+    title: listAccess.list_name,
+    title_key: listAccess.title_key,
+    type: listAccess.type,
+    role: listAccess.role,
+    access_role: listAccess.access_role,
+    access_level: listAccess.access_level,
+    shared_permission: listAccess.shared_permission,
+    can_rename: listAccess.can_rename,
+    can_delete: listAccess.can_delete,
+    can_leave: listAccess.can_leave,
+    can_add_items: listAccess.can_add_items,
+    can_remove_items: listAccess.can_remove_items,
+    can_edit_notes: listAccess.can_edit_notes,
+    can_share_collaborators: listAccess.can_share_collaborators,
+    can_share_read_only: listAccess.can_share_read_only,
+    item_count: itemCountResult[0].item_count,
+    last_item_date: lastItemDateResult[0].last_item_date,
+    services: servicesWithImages,
+    contains_service: hasRequestedServiceId ? selectedServiceItemResult.length > 0 : false,
+    service_item_id: hasRequestedServiceId ? selectedServiceItemResult[0]?.id ?? null : null,
+  };
+}
+
+function createSharedListInvitationToken() {
+  return crypto.randomBytes(SHARED_LIST_INVITATION_TOKEN_BYTES).toString('hex');
+}
+
+function hashSharedListInvitationToken(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
 }
 
 async function getOrCreateServiceListId(connection, userId, listName) {
@@ -8808,7 +9058,6 @@ app.get('/api/user/:userId/lists', authenticateToken, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res, req.params.userId);
   if (!requestedUserId) return;
   const requestedServiceId = Number(req.query?.service_id);
-  const hasRequestedServiceId = Number.isFinite(requestedServiceId);
 
   let connection;
   try {
@@ -8816,80 +9065,45 @@ app.get('/api/user/:userId/lists', authenticateToken, async (req, res) => {
     await connection.beginTransaction();
     await ensureDefaultServiceLists(connection, requestedUserId);
 
-    const [lists] = await connection.query(
+    const [listRows] = await connection.query(
       `
-        SELECT id, list_name, 'owner' AS role FROM service_list WHERE user_id = ?
-        UNION
-        SELECT service_list.id, service_list.list_name, 'shared' AS role
-        FROM service_list
-        JOIN shared_list ON service_list.id = shared_list.list_id
-        WHERE shared_list.user_id = ?;
+        SELECT
+          sl.id,
+          sl.list_name,
+          sl.user_id AS owner_user_id,
+          NULL AS shared_permission
+        FROM service_list sl
+        WHERE sl.user_id = ?
+        UNION ALL
+        SELECT
+          sl.id,
+          sl.list_name,
+          sl.user_id AS owner_user_id,
+          sh.permissions AS shared_permission
+        FROM service_list sl
+        JOIN shared_list sh ON sl.id = sh.list_id
+        WHERE sh.user_id = ?
+          AND sl.user_id <> ?;
       `,
-      [requestedUserId, requestedUserId]
+      [requestedUserId, requestedUserId, requestedUserId]
+    );
+
+    const listAccessRecords = mergeServiceListAccessRecords(
+      listRows
+        .map((row) => buildServiceListAccessRecord(row, requestedUserId))
+        .filter((row) => row?.can_view)
     );
 
     const listsWithDetails = [];
 
-    for (const list of lists) {
-      const [itemCountResult] = await connection.query(
-        'SELECT COUNT(*) as item_count FROM item_list WHERE list_id = ?',
-        [list.id]
-      );
-      const [lastItemDateResult] = await connection.query(
-        'SELECT MAX(added_datetime) as last_item_date FROM item_list WHERE list_id = ?',
-        [list.id]
-      );
-      const [selectedServiceItemResult] = hasRequestedServiceId
-        ? await connection.query(
-          'SELECT id FROM item_list WHERE list_id = ? AND service_id = ? LIMIT 1',
-          [list.id, requestedServiceId]
-        )
-        : [[]];
-
-      const servicesOrderClause = list.list_name === RECENTLY_SEEN_LIST_NAME
-        ? 'ORDER BY `order` DESC, id DESC'
-        : 'ORDER BY `order` ASC, id ASC';
-      const [services] = await connection.query(
-        `SELECT service_id FROM item_list WHERE list_id = ? ${servicesOrderClause}`,
-        [list.id]
-      );
-
-      const servicesWithImages = [];
-
-      for (const service of services) {
-        if (servicesWithImages.length >= 3) {
-          break;
-        }
-
-        const [images] = await connection.query(
-          'SELECT image_url, object_name FROM service_image WHERE service_id = ? ORDER BY `order` LIMIT 1',
-          [service.service_id]
-        );
-
-        if (images.length > 0 && images[0].image_url) {
-          servicesWithImages.push({
-            service_id: service.service_id,
-            image_url: images[0].image_url,
-            object_name: images[0].object_name,
-          });
-        }
-      }
-
-      const metadata = getServiceListMetadata(list.list_name);
-      listsWithDetails.push({
-        id: list.id,
-        title: list.list_name,
-        title_key: metadata.titleKey,
-        type: metadata.type,
-        can_rename: metadata.canRename,
-        can_delete: metadata.canDelete,
-        role: list.role,
-        item_count: itemCountResult[0].item_count,
-        last_item_date: lastItemDateResult[0].last_item_date,
-        services: servicesWithImages,
-        contains_service: hasRequestedServiceId ? selectedServiceItemResult.length > 0 : false,
-        service_item_id: hasRequestedServiceId ? selectedServiceItemResult[0]?.id ?? null : null,
+    for (const listAccess of listAccessRecords) {
+      const payload = await buildServiceListPayload(connection, listAccess, {
+        requestedServiceId: Number.isFinite(requestedServiceId) ? requestedServiceId : null,
       });
+
+      if (payload) {
+        listsWithDetails.push(payload);
+      }
     }
 
     await connection.commit();
@@ -8954,11 +9168,16 @@ app.post('/api/recently-seen/items', async (req, res) => {
 
 //Ruta para actulizar el nombre de una lista
 app.put('/api/list/:listId', async (req, res) => {
-  const { listId } = req.params;
+  const listId = Number(req.params.listId);
+  const requesterUserId = Number(req.user?.id);
   const newName = String(req.body?.newName || '').trim();
 
   if (!newName) {
     return res.status(400).json({ error: 'El nuevo nombre de la lista es requerido.' });
+  }
+
+  if (!Number.isFinite(listId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
   }
 
   if (isReservedServiceListName(newName)) {
@@ -8968,17 +9187,14 @@ app.put('/api/list/:listId', async (req, res) => {
   let connection;
   try {
     connection = await promisePool.getConnection();
-    const [existingLists] = await connection.query(
-      'SELECT id, list_name FROM service_list WHERE id = ? LIMIT 1',
-      [listId]
-    );
+    const listAccess = await getServiceListAccess(connection, listId, requesterUserId, { lock: true });
 
-    if (existingLists.length === 0) {
+    if (!listAccess?.can_view) {
       return res.status(404).json({ error: 'Lista no encontrada.' });
     }
 
-    if (!getServiceListMetadata(existingLists[0].list_name).canRename) {
-      return res.status(403).json({ error: 'No se puede renombrar una lista del sistema.' });
+    if (!listAccess.can_rename) {
+      return res.status(403).json({ error: 'No tienes permisos para renombrar esta lista.' });
     }
 
     await connection.query('UPDATE service_list SET list_name = ? WHERE id = ?', [newName, listId]);
@@ -8993,27 +9209,27 @@ app.put('/api/list/:listId', async (req, res) => {
 
 // Ruta para borrar una lista desde list
 app.delete('/api/list/:listId', async (req, res) => {
-  const { listId } = req.params;
+  const listId = Number(req.params.listId);
+  const requesterUserId = Number(req.user?.id);
+
+  if (!Number.isFinite(listId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
+  }
 
   let connection;
   try {
     connection = await promisePool.getConnection();
-    const [existingLists] = await connection.query(
-      'SELECT id, list_name FROM service_list WHERE id = ? LIMIT 1',
-      [listId]
-    );
+    const listAccess = await getServiceListAccess(connection, listId, requesterUserId, { lock: true });
 
-    if (existingLists.length === 0) {
+    if (!listAccess?.can_view) {
       return res.status(404).json({ error: 'Lista no encontrada.' });
     }
 
-    if (!getServiceListMetadata(existingLists[0].list_name).canDelete) {
-      return res.status(403).json({ error: 'No se puede eliminar una lista del sistema.' });
+    if (!listAccess.can_delete) {
+      return res.status(403).json({ error: 'No tienes permisos para eliminar esta lista.' });
     }
 
     await connection.query('DELETE FROM service_list WHERE id = ?', [listId]);
-    await connection.query('DELETE FROM item_list WHERE list_id = ?', [listId]);
-
     res.json({ message: 'Lista eliminada con éxito.' });
   } catch (err) {
     console.error('Error al eliminar la lista:', err);
@@ -9023,61 +9239,240 @@ app.delete('/api/list/:listId', async (req, res) => {
   }
 });
 
-//Ruta para compartir una lista
-app.post('/api/list/share', (req, res) => {
-  const { listId, user, permissions } = req.body;
+//Ruta para generar un enlace compartido de una lista
+app.post('/api/lists/:listId/share-link', async (req, res) => {
+  const listId = Number(req.params.listId);
+  const requesterUserId = Number(req.user?.id);
+  const permission = normalizeSharedListPermission(req.body?.permission, null);
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  if (!Number.isFinite(listId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
+  }
+
+  if (!permission || permission === SHARED_LIST_PERMISSION_OWNER) {
+    return res.status(400).json({ error: 'Permiso de compartición inválido.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const listAccess = await getServiceListAccess(connection, listId, requesterUserId, { lock: true });
+
+    if (!listAccess?.can_view) {
+      return res.status(404).json({ error: 'Lista no encontrada.' });
     }
 
-    // Verificar si el usuario existe y obtener su ID
-    const getUserIdQuery = 'SELECT id FROM user_account WHERE username = ? OR email = ?';
-    connection.query(getUserIdQuery, [user, user], (err, results) => {
-      if (err) {
-        console.error('Error al consultar el usuario:', err);
-        connection.release(); // Libera la conexión
-        return res.status(500).json({ error: 'Error al consultar el usuario.' });
-      }
+    if (
+      (permission === SHARED_LIST_PERMISSION_EDIT && !listAccess.can_share_collaborators)
+      || (permission === SHARED_LIST_PERMISSION_READ && !listAccess.can_share_read_only)
+    ) {
+      return res.status(403).json({ error: 'No tienes permisos para generar este enlace.' });
+    }
 
-      if (results.length === 0) {
-        connection.release(); // Libera la conexión
-        return res.status(201).json({ notFound: true });
-      }
+    const token = createSharedListInvitationToken();
+    await connection.query(
+      `
+        INSERT INTO shared_list_invitation (list_id, created_by_user_id, permission, token_hash)
+        VALUES (?, ?, ?, ?)
+      `,
+      [listId, requesterUserId, permission, hashSharedListInvitationToken(token)]
+    );
 
-      const userId = results[0].id;
-
-      // Insertar una nueva fila en shared_list
-      const insertQuery = 'INSERT INTO shared_list (list_id, user_id, permissions) VALUES (?, ?, ?)';
-      connection.query(insertQuery, [listId, userId, permissions], (err, result) => {
-        if (err) {
-          console.error('Error al añadir el usuario a la lista compartida:', err);
-          connection.release(); // Libera la conexión
-          return res.status(500).json({ error: 'Error al añadir el usuario a la lista compartida.' });
-        }
-
-        res.status(201).json({ message: 'Usuario añadido a la lista compartida con éxito.' });
-        connection.release(); // Libera la conexión
-      });
+    return res.status(201).json({
+      message: 'Enlace de compartición generado con éxito.',
+      token,
+      permission,
     });
-  });
+  } catch (error) {
+    console.error('Error al generar el enlace compartido de la lista:', error);
+    return res.status(500).json({ error: 'Error al generar el enlace compartido.' });
+  } finally {
+    connection?.release();
+  }
+});
+
+//Ruta para aceptar una invitación de lista compartida
+app.post('/api/shared-lists/accept', async (req, res) => {
+  const requesterUserId = Number(req.user?.id);
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+
+  if (!Number.isFinite(requesterUserId)) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
+
+  if (!token) {
+    return res.status(400).json({ error: 'token es requerido.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
+
+    const [invitationRows] = await connection.query(
+      `
+        SELECT
+          sli.id,
+          sli.list_id,
+          sli.created_by_user_id,
+          sli.permission,
+          sl.list_name,
+          sl.user_id AS owner_user_id
+        FROM shared_list_invitation sli
+        JOIN service_list sl ON sl.id = sli.list_id
+        WHERE sli.token_hash = ?
+          AND sli.revoked_at IS NULL
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [hashSharedListInvitationToken(token)]
+    );
+
+    if (!invitationRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'shared_list_invitation_not_found' });
+    }
+
+    const invitation = invitationRows[0];
+    const invitationPermission = normalizeSharedListPermission(invitation.permission, null);
+
+    if (!invitationPermission) {
+      await connection.rollback();
+      return res.status(410).json({ error: 'shared_list_invitation_invalid' });
+    }
+
+    const sharerAccess = await getServiceListAccess(connection, invitation.list_id, invitation.created_by_user_id, { lock: true });
+    const sharerCanStillShare = invitationPermission === SHARED_LIST_PERMISSION_EDIT
+      ? Boolean(sharerAccess?.can_share_collaborators)
+      : Boolean(sharerAccess?.can_share_read_only);
+
+    if (!sharerCanStillShare) {
+      await connection.rollback();
+      return res.status(410).json({ error: 'shared_list_invitation_inactive' });
+    }
+
+    const currentAccess = await getServiceListAccess(connection, invitation.list_id, requesterUserId, { lock: true });
+
+    if (currentAccess?.is_owner) {
+      await connection.query(
+        'UPDATE shared_list_invitation SET last_used_at = NOW() WHERE id = ?',
+        [invitation.id]
+      );
+
+      const listPayload = await buildServiceListPayload(connection, currentAccess);
+      await connection.commit();
+      return res.status(200).json({
+        message: 'La lista ya te pertenece.',
+        list: listPayload,
+      });
+    }
+
+    if (!currentAccess?.can_view) {
+      await connection.query(
+        'INSERT INTO shared_list (list_id, user_id, permissions) VALUES (?, ?, ?)',
+        [invitation.list_id, requesterUserId, invitationPermission]
+      );
+    } else {
+      const nextPermission = getStrongerSharedListPermission(
+        currentAccess.shared_permission,
+        invitationPermission
+      );
+
+      if (nextPermission !== currentAccess.shared_permission) {
+        await connection.query(
+          'UPDATE shared_list SET permissions = ? WHERE list_id = ? AND user_id = ?',
+          [nextPermission, invitation.list_id, requesterUserId]
+        );
+      }
+    }
+
+    await connection.query(
+      'UPDATE shared_list_invitation SET last_used_at = NOW() WHERE id = ?',
+      [invitation.id]
+    );
+
+    const finalAccess = await getServiceListAccess(connection, invitation.list_id, requesterUserId, { lock: true });
+    const listPayload = await buildServiceListPayload(connection, finalAccess);
+
+    await connection.commit();
+    return res.status(200).json({
+      message: 'Lista compartida añadida con éxito.',
+      list: listPayload,
+    });
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error('Error al revertir la aceptación de la invitación compartida:', rollbackError);
+      }
+    }
+    console.error('Error al aceptar la invitación de la lista compartida:', error);
+    return res.status(500).json({ error: 'Error al aceptar la invitación de la lista.' });
+  } finally {
+    connection?.release();
+  }
+});
+
+//Ruta para salir de una lista compartida
+app.delete('/api/lists/:listId/membership', async (req, res) => {
+  const listId = Number(req.params.listId);
+  const requesterUserId = Number(req.user?.id);
+
+  if (!Number.isFinite(listId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const listAccess = await getServiceListAccess(connection, listId, requesterUserId, { lock: true });
+
+    if (!listAccess?.can_view) {
+      return res.status(404).json({ error: 'Lista no encontrada.' });
+    }
+
+    if (!listAccess.can_leave) {
+      return res.status(403).json({ error: 'No puedes salir de esta lista.' });
+    }
+
+    const [deleteResult] = await connection.query(
+      'DELETE FROM shared_list WHERE list_id = ? AND user_id = ?',
+      [listId, requesterUserId]
+    );
+
+    if (!deleteResult.affectedRows) {
+      return res.status(404).json({ error: 'No se encontró la relación compartida.' });
+    }
+
+    return res.status(200).json({ message: 'Has salido de la lista compartida con éxito.' });
+  } catch (error) {
+    console.error('Error al salir de la lista compartida:', error);
+    return res.status(500).json({ error: 'Error al salir de la lista compartida.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 // Ruta para obtener todos los items de una lista por su ID
-app.get('/api/lists/:id/items', (req, res) => {
-  const { id } = req.params;
+app.get('/api/lists/:id/items', async (req, res) => {
+  const listId = Number(req.params.id);
+  const requesterUserId = Number(req.user?.id);
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
+  if (!Number.isFinite(listId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const listAccess = await getServiceListAccess(connection, listId, requesterUserId);
+
+    if (!listAccess?.can_view) {
+      return res.status(404).json({ error: 'Lista no encontrada.' });
     }
 
-    // Usar una sola consulta con JOIN para obtener los ítems y datos adicionales de la tabla service, price, user_account y review
-    let query = `
+    const query = `
       SELECT
         item_list.id AS item_id, 
         item_list.list_id, 
@@ -9143,83 +9538,94 @@ app.get('/api/lists/:id/items', (req, res) => {
         CASE WHEN sl.list_name = ? THEN -item_list.id ELSE item_list.id END ASC;
     `;
 
+    const [itemsWithService] = await connection.query(query, [
+      listId,
+      RECENTLY_SEEN_LIST_NAME,
+      RECENTLY_SEEN_LIST_NAME,
+    ]);
 
-    connection.query(query, [id, RECENTLY_SEEN_LIST_NAME, RECENTLY_SEEN_LIST_NAME], (err, itemsWithService) => {
-      connection.release(); // Liberar la conexión después de usarla
+    if (itemsWithService.length > 0) {
+      return res.status(200).json(itemsWithService);
+    }
 
-      if (err) {
-        console.error('Error al obtener los ítems de la lista:', err);
-        res.status(500).json({ error: 'Error al obtener los ítems de la lista.' });
-        return;
-      }
-
-      if (itemsWithService.length > 0) {
-        res.status(200).json(itemsWithService);
-      } else {
-        res.status(200).json({ empty: true, message: 'No se encontraron ítems para esta lista.' });
-      }
-    });
-  });
+    return res.status(200).json({ empty: true, message: 'No se encontraron ítems para esta lista.' });
+  } catch (error) {
+    console.error('Error al obtener los ítems de la lista:', error);
+    return res.status(500).json({ error: 'Error al obtener los ítems de la lista.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 //Ruta para añadir una nota
-app.put('/api/items/:id/note', (req, res) => {
-  const { id } = req.params;
-  const { note } = req.body;
+app.put('/api/items/:id/note', async (req, res) => {
+  const itemId = Number(req.params.id);
+  const normalizedNote = req.body?.note == null ? null : String(req.body.note);
+  const requesterUserId = Number(req.user?.id);
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      res.status(500).json({ error: 'Error al obtener la conexión.' });
-      return;
-    }
-
-    // Consulta para actualizar la columna 'note' en la tabla 'item_list'
-    const query = `
-      UPDATE item_list
-      SET note = ?
-      WHERE id = ?
-    `;
-
-    connection.query(query, [note, id], (err, result) => {
-      connection.release(); // Liberar la conexión después de usarla
-
-      if (err) {
-        console.error('Error al actualizar la nota del ítem:', err);
-        res.status(500).json({ error: 'Error al actualizar la nota del ítem.' });
-        return;
-      }
-
-      if (result.affectedRows > 0) {
-        res.status(200).json({ message: 'Nota actualizada con éxito.' });
-      } else {
-        res.status(404).json({ message: 'Ítem no encontrado.' });
-      }
-    });
-  });
-});
-
-// Ruta para borrar una lista desde favorites
-app.delete('/api/lists/:id', async (req, res) => {
-  const { id } = req.params;
+  if (!Number.isFinite(itemId)) {
+    return res.status(400).json({ error: 'item_id inválido.' });
+  }
 
   let connection;
   try {
     connection = await promisePool.getConnection();
-    const [existingLists] = await connection.query(
-      'SELECT id, list_name FROM service_list WHERE id = ? LIMIT 1',
-      [id]
+    const [itemRows] = await connection.query(
+      'SELECT id, list_id FROM item_list WHERE id = ? LIMIT 1',
+      [itemId]
     );
 
-    if (existingLists.length === 0) {
+    if (!itemRows.length) {
+      return res.status(404).json({ message: 'Ítem no encontrado.' });
+    }
+
+    const listAccess = await getServiceListAccess(connection, itemRows[0].list_id, requesterUserId, { lock: true });
+
+    if (!listAccess?.can_view) {
+      return res.status(404).json({ error: 'Lista no encontrada.' });
+    }
+
+    if (!listAccess.can_edit_notes) {
+      return res.status(403).json({ error: 'No tienes permisos para editar notas en esta lista.' });
+    }
+
+    await connection.query(
+      'UPDATE item_list SET note = ? WHERE id = ?',
+      [normalizedNote, itemId]
+    );
+
+    return res.status(200).json({ message: 'Nota actualizada con éxito.' });
+  } catch (error) {
+    console.error('Error al actualizar la nota del ítem:', error);
+    return res.status(500).json({ error: 'Error al actualizar la nota del ítem.' });
+  } finally {
+    connection?.release();
+  }
+});
+
+// Ruta para borrar una lista desde favorites
+app.delete('/api/lists/:id', async (req, res) => {
+  const listId = Number(req.params.id);
+  const requesterUserId = Number(req.user?.id);
+
+  if (!Number.isFinite(listId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const listAccess = await getServiceListAccess(connection, listId, requesterUserId, { lock: true });
+
+    if (!listAccess?.can_view) {
       return res.status(404).json({ message: 'Lista no encontrada' });
     }
 
-    if (!getServiceListMetadata(existingLists[0].list_name).canDelete) {
-      return res.status(403).json({ error: 'No se puede eliminar una lista del sistema.' });
+    if (!listAccess.can_delete) {
+      return res.status(403).json({ error: 'No tienes permisos para eliminar esta lista.' });
     }
 
-    await connection.query('DELETE FROM service_list WHERE id = ?', [id]);
+    await connection.query('DELETE FROM service_list WHERE id = ?', [listId]);
     res.status(200).json({ message: 'Lista eliminada con éxito' });
   } catch (err) {
     console.error('Error al eliminar la lista:', err);
@@ -10303,38 +10709,42 @@ app.put('/api/services/:id', async (req, res) => {
 });
 
 //Ruta para crear lista
-app.post('/api/lists', (req, res) => {
-  const { user_id } = req.body;
+app.post('/api/lists', async (req, res) => {
+  const authenticatedUserId = Number(req.user?.id);
+  const requestedUserId = req.body?.user_id == null ? authenticatedUserId : Number(req.body.user_id);
   const list_name = String(req.body?.list_name || '').trim();
 
-  if (!user_id || !list_name) {
+  if (!Number.isFinite(authenticatedUserId)) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
+
+  if (!Number.isFinite(requestedUserId) || !list_name) {
     return res.status(400).json({ error: 'user_id y list_name son requeridos.' });
+  }
+
+  if (requestedUserId !== authenticatedUserId) {
+    return res.status(403).json({ error: 'Acceso denegado' });
   }
 
   if (isReservedServiceListName(list_name)) {
     return res.status(400).json({ error: 'Ese nombre está reservado para una lista del sistema.' });
   }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
-    }
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const [result] = await connection.query(
+      'INSERT INTO service_list (user_id, list_name) VALUES (?, ?)',
+      [requestedUserId, list_name]
+    );
 
-    const query = 'INSERT INTO service_list (user_id, list_name) VALUES (?, ?)';
-    const values = [user_id, list_name];
-
-    connection.query(query, values, (err, result) => {
-      connection.release(); // Libera la conexión después de usarla
-
-      if (err) {
-        console.error('Error al crear la lista:', err);
-        return res.status(500).json({ error: 'Error al crear la lista.' });
-      }
-
-      res.status(201).json({ message: 'Lista creada con éxito', listId: result.insertId });
-    });
-  });
+    return res.status(201).json({ message: 'Lista creada con éxito', listId: result.insertId });
+  } catch (error) {
+    console.error('Error al crear la lista:', error);
+    return res.status(500).json({ error: 'Error al crear la lista.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 //Ruta para añadir un item a una lista
@@ -10357,19 +10767,14 @@ app.post('/api/lists/:list_id/items', (req, res) => {
     let transactionStarted = false;
     try {
       connection = await promisePool.getConnection();
+      const listAccess = await getServiceListAccess(connection, numericListId, req.user?.id, { lock: true });
 
-      const [listRows] = await connection.query(
-        'SELECT id, user_id, list_name FROM service_list WHERE id = ? LIMIT 1',
-        [numericListId]
-      );
-
-      if (listRows.length === 0) {
+      if (!listAccess?.can_view) {
         return res.status(404).json({ error: 'Lista no encontrada.' });
       }
 
-      const list = listRows[0];
       const isOwnerRecentlySeenList =
-        list.list_name === RECENTLY_SEEN_LIST_NAME && Number(list.user_id) === Number(req.user?.id);
+        listAccess.is_owner && listAccess.list_name === RECENTLY_SEEN_LIST_NAME;
 
       if (isOwnerRecentlySeenList) {
         await connection.beginTransaction();
@@ -10383,6 +10788,10 @@ app.post('/api/lists/:list_id/items', (req, res) => {
           deduplicated: result.deduplicated,
           removedOverflowCount: result.removedOverflowCount,
         });
+      }
+
+      if (!listAccess.can_add_items) {
+        return res.status(403).json({ error: 'No tienes permisos para añadir servicios a esta lista.' });
       }
 
       const [existingRows] = await connection.query(
@@ -10423,32 +10832,48 @@ app.post('/api/lists/:list_id/items', (req, res) => {
 });
 
 // Ruta para eliminar un item de una lista por su ID
-app.delete('/api/lists/:list_id/items/:item_id', (req, res) => {
-  const { list_id, item_id } = req.params;
+app.delete('/api/lists/:list_id/items/:item_id', async (req, res) => {
+  const listId = Number(req.params.list_id);
+  const itemId = Number(req.params.item_id);
+  const requesterUserId = Number(req.user?.id);
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  if (!Number.isFinite(listId)) {
+    return res.status(400).json({ error: 'list_id inválido.' });
+  }
+
+  if (!Number.isFinite(itemId)) {
+    return res.status(400).json({ error: 'item_id inválido.' });
+  }
+
+  let connection;
+  try {
+    connection = await promisePool.getConnection();
+    const listAccess = await getServiceListAccess(connection, listId, requesterUserId, { lock: true });
+
+    if (!listAccess?.can_view) {
+      return res.status(404).json({ error: 'Lista no encontrada.' });
     }
 
-    const deleteQuery = 'DELETE FROM item_list WHERE id = ? AND list_id = ?';
+    if (!listAccess.can_remove_items) {
+      return res.status(403).json({ error: 'No tienes permisos para eliminar servicios de esta lista.' });
+    }
 
-    connection.query(deleteQuery, [item_id, list_id], (err, result) => {
-      connection.release();
+    const [result] = await connection.query(
+      'DELETE FROM item_list WHERE id = ? AND list_id = ?',
+      [itemId, listId]
+    );
 
-      if (err) {
-        console.error('Error al eliminar el item de la lista:', err);
-        return res.status(500).json({ error: 'Error al eliminar el item de la lista.' });
-      }
+    if (!result.affectedRows) {
+      return res.status(404).json({ error: 'Item no encontrado en la lista.' });
+    }
 
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Item no encontrado en la lista.' });
-      }
-
-      return res.status(200).json({ message: 'Item eliminado con éxito.' });
-    });
-  });
+    return res.status(200).json({ message: 'Item eliminado con éxito.' });
+  } catch (error) {
+    console.error('Error al eliminar el item de la lista:', error);
+    return res.status(500).json({ error: 'Error al eliminar el item de la lista.' });
+  } finally {
+    connection?.release();
+  }
 });
 
 //Ruta para obtener toda la info de un servicio y mostrar su profile

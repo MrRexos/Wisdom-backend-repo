@@ -348,7 +348,18 @@
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
 - `list_id` (INT, FK -> service_list.id, NOT NULL)
 - `user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
-- `permissions` (VARCHAR(45), NOT NULL)
+- `permissions` (ENUM('read','edit'), NOT NULL)
+- `UNIQUE(list_id, user_id)`
+
+## Tabla: `shared_list_invitation`
+- `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
+- `list_id` (INT, FK -> service_list.id, NOT NULL)
+- `created_by_user_id` (INT UNSIGNED, FK -> user_account.id, NOT NULL)
+- `permission` (ENUM('read','edit'), NOT NULL)
+- `token_hash` (CHAR(64), UNIQUE, NOT NULL)
+- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `last_used_at` (DATETIME, NULL)
+- `revoked_at` (DATETIME, NULL)
 
 ## Tabla: `user_account`
 - `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
@@ -557,6 +568,11 @@
 - `id`: **PK** (Key Name: `PRIMARY`)
 - `list_id`: **FK** -> `service_list`.`id` (Key Name: `fk_shared_list_list_id_service_list_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
 - `user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_shared_list_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+
+### Tabla: `shared_list_invitation`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `list_id`: **FK** -> `service_list`.`id` (Key Name: `fk_shared_list_invitation_list_id_service_list_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `created_by_user_id`: **FK** -> `user_account`.`id` (Key Name: `fk_shared_list_invitation_created_by_user_id_user_account_id`, ON DELETE CASCADE, ON UPDATE NO ACTION)
 
 ### Tabla: `user_account`
 - `id`: **PK** (Key Name: `PRIMARY`)
