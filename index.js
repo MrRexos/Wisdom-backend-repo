@@ -13442,41 +13442,6 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
   const connection = await promisePool.getConnection();
   let shouldNotifyRequester = false;
   try {
-    const [routeBookingChangeRequests] = await connection.query(
-      `
-      SELECT
-        id,
-        booking_id,
-        requested_by_user_id,
-        target_user_id,
-        status,
-        created_at,
-        resolved_at
-      FROM booking_change_request
-      WHERE booking_id = ?
-      ORDER BY created_at DESC, id DESC
-      LIMIT 10
-      `,
-      [routeBookingId]
-    );
-
-    console.log('[booking-change-request][patch] incoming request', {
-      routeBookingId,
-      changeRequestId,
-      action,
-      requesterUserId: normalizeNullableInteger(req.user?.id),
-      requesterRole: req.user?.role ?? null,
-      routeBookingChangeRequests: (routeBookingChangeRequests || []).map((row) => ({
-        id: normalizeNullableInteger(row.id),
-        booking_id: normalizeNullableInteger(row.booking_id),
-        requested_by_user_id: normalizeNullableInteger(row.requested_by_user_id),
-        target_user_id: normalizeNullableInteger(row.target_user_id),
-        status: normalizeBookingChangeRequestStatus(row.status, null),
-        created_at: row.created_at ?? null,
-        resolved_at: row.resolved_at ?? null,
-      })),
-    });
-
     const [[changeRequestReference]] = await connection.query(
       `
       SELECT
@@ -13490,13 +13455,6 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
     );
 
     if (!changeRequestReference) {
-      console.warn('[booking-change-request][patch] change request reference not found', {
-        routeBookingId,
-        changeRequestId,
-        action,
-        requesterUserId: normalizeNullableInteger(req.user?.id),
-        requesterRole: req.user?.role ?? null,
-      });
       return res.status(404).json({ error: 'Solicitud de modificación no encontrada.' });
     }
 
@@ -13537,12 +13495,6 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
 
     if (!currentBooking) {
       await connection.rollback();
-      console.warn('[booking-change-request][patch] booking not found after resolving change request', {
-        routeBookingId,
-        effectiveBookingId,
-        changeRequestId,
-        action,
-      });
       return res.status(404).json({ error: 'Reserva no encontrada.' });
     }
 
@@ -13555,61 +13507,8 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
       return res.status(403).json({ error: 'No autorizado.' });
     }
 
-    console.log('[booking-change-request][patch] booking loaded for action', {
-      bookingId: normalizeNullableInteger(currentBooking.id),
-      routeBookingId,
-      effectiveBookingId,
-      changeRequestId,
-      action,
-      requesterUserId,
-      requesterRole: req.user?.role ?? null,
-      service_status: currentBooking.service_status ?? null,
-      settlement_status: currentBooking.settlement_status ?? null,
-      client_user_id: normalizeNullableInteger(currentBooking.client_user_id),
-      provider_user_id_snapshot: normalizeNullableInteger(currentBooking.provider_user_id_snapshot),
-      isClientOwner,
-      isProviderOwner,
-      isStaff,
-    });
-
-    const expiredPendingChangeRequestIds = await expirePendingBookingChangeRequestsForBooking(connection, currentBooking, {
+    await expirePendingBookingChangeRequestsForBooking(connection, currentBooking, {
       now: new Date(),
-    });
-
-    const [effectiveBookingChangeRequestsAfterExpire] = await connection.query(
-      `
-      SELECT
-        id,
-        booking_id,
-        requested_by_user_id,
-        target_user_id,
-        status,
-        created_at,
-        resolved_at
-      FROM booking_change_request
-      WHERE booking_id = ?
-      ORDER BY created_at DESC, id DESC
-      LIMIT 10
-      FOR UPDATE
-      `,
-      [effectiveBookingId]
-    );
-
-    console.log('[booking-change-request][patch] state after expiring pending requests', {
-      routeBookingId,
-      effectiveBookingId,
-      changeRequestId,
-      action,
-      expiredPendingChangeRequestIds,
-      effectiveBookingChangeRequestsAfterExpire: (effectiveBookingChangeRequestsAfterExpire || []).map((row) => ({
-        id: normalizeNullableInteger(row.id),
-        booking_id: normalizeNullableInteger(row.booking_id),
-        requested_by_user_id: normalizeNullableInteger(row.requested_by_user_id),
-        target_user_id: normalizeNullableInteger(row.target_user_id),
-        status: normalizeBookingChangeRequestStatus(row.status, null),
-        created_at: row.created_at ?? null,
-        resolved_at: row.resolved_at ?? null,
-      })),
     });
 
     const [[changeRequest]] = await connection.query(
@@ -13634,61 +13533,9 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
     );
 
     if (!changeRequest) {
-      const [[changeRequestByIdOnly]] = await connection.query(
-        `
-        SELECT
-          id,
-          booking_id,
-          requested_by_user_id,
-          target_user_id,
-          status,
-          created_at,
-          resolved_at
-        FROM booking_change_request
-        WHERE id = ?
-        LIMIT 1
-        FOR UPDATE
-        `,
-        [changeRequestId]
-      );
       await connection.rollback();
-      console.warn('[booking-change-request][patch] change request missing in locked lookup', {
-        routeBookingId,
-        effectiveBookingId,
-        changeRequestId,
-        action,
-        requesterUserId,
-        changeRequestByIdOnly: changeRequestByIdOnly
-          ? {
-            id: normalizeNullableInteger(changeRequestByIdOnly.id),
-            booking_id: normalizeNullableInteger(changeRequestByIdOnly.booking_id),
-            requested_by_user_id: normalizeNullableInteger(changeRequestByIdOnly.requested_by_user_id),
-            target_user_id: normalizeNullableInteger(changeRequestByIdOnly.target_user_id),
-            status: normalizeBookingChangeRequestStatus(changeRequestByIdOnly.status, null),
-            created_at: changeRequestByIdOnly.created_at ?? null,
-            resolved_at: changeRequestByIdOnly.resolved_at ?? null,
-          }
-          : null,
-      });
       return res.status(404).json({ error: 'Solicitud de modificación no encontrada.' });
     }
-
-    console.log('[booking-change-request][patch] change request row locked for action', {
-      routeBookingId,
-      effectiveBookingId,
-      changeRequestId,
-      action,
-      requesterUserId,
-      changeRequest: {
-        id: normalizeNullableInteger(changeRequest.id),
-        booking_id: normalizeNullableInteger(changeRequest.booking_id),
-        requested_by_user_id: normalizeNullableInteger(changeRequest.requested_by_user_id),
-        target_user_id: normalizeNullableInteger(changeRequest.target_user_id),
-        status: normalizeBookingChangeRequestStatus(changeRequest.status, null),
-        created_at: changeRequest.created_at ?? null,
-        resolved_at: changeRequest.resolved_at ?? null,
-      },
-    });
 
     if (normalizeBookingChangeRequestStatus(changeRequest.status, 'pending') !== 'pending') {
       await connection.rollback();
@@ -13742,15 +13589,6 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
     await connection.commit();
     shouldNotifyRequester = action !== 'canceled' || isStaff;
 
-    console.log('[booking-change-request][patch] action completed', {
-      routeBookingId,
-      effectiveBookingId,
-      changeRequestId,
-      action,
-      requesterUserId,
-      shouldNotifyRequester,
-    });
-
     if (shouldNotifyRequester) {
       try {
         await sendBookingChangeRequestNotificationEmail({
@@ -13775,14 +13613,6 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
     });
   } catch (error) {
     try { await connection.rollback(); } catch {}
-    console.error('[booking-change-request][patch] unexpected error', {
-      routeBookingId,
-      changeRequestId,
-      action,
-      requesterUserId: normalizeNullableInteger(req.user?.id),
-      requesterRole: req.user?.role ?? null,
-      error: error?.message || error,
-    });
     if (error?.statusCode) {
       return res.status(error.statusCode).json({ error: error.message });
     }
