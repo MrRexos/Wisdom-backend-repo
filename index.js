@@ -1448,10 +1448,16 @@ function assertBookingAddressRulesForService({
   }
 
   if (!hasAddress) {
+    if (rule.mode === 'fixed') {
+      return {
+        rule,
+        addressLocation: null,
+        distanceKm: null,
+      };
+    }
+
     const error = new Error(
-      rule.mode === 'fixed'
-        ? 'Este servicio tiene una ubicación fija y la reserva debe conservar esa dirección.'
-        : 'Este servicio requiere una dirección dentro del radio de acción del profesional.'
+      'Este servicio requiere una dirección dentro del radio de acción del profesional.'
     );
     error.statusCode = 400;
     throw error;
