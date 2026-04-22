@@ -46,6 +46,7 @@ const {
   meetsMinimumNotice,
   canReportBookingIssue,
   canEditBooking,
+  shouldResetBookingToAcceptedAfterFutureReschedule,
   hasBookingChangeRequestExpired,
   buildTransitionPatch,
   computeSettlementAmounts,
@@ -2988,6 +2989,30 @@ async function applyPreparedBookingEditableUpdate(connection, bookingId, prepare
       bookingId,
     ]
   );
+}
+
+async function applyPreparedBookingEditableUpdateWithLifecycle(connection, currentBooking, bookingId, preparedUpdate, {
+  changedByUserId = null,
+  reasonCode = null,
+} = {}) {
+  await applyPreparedBookingEditableUpdate(connection, bookingId, preparedUpdate);
+
+  if (!shouldResetBookingToAcceptedAfterFutureReschedule(currentBooking, {
+    nextRequestedStartDateTime: preparedUpdate?.comparableFields?.requested_start_datetime,
+  })) {
+    return;
+  }
+
+  await transitionBookingStateRecord(connection, currentBooking, {
+    nextServiceStatus: 'accepted',
+    nextSettlementStatus: 'none',
+    changedByUserId,
+    reasonCode,
+    extraPatch: {
+      started_at: null,
+      finished_at: null,
+    },
+  });
 }
 
 async function getLatestBookingChangeRequest(connection, bookingId, {
@@ -13322,7 +13347,10 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
     }
 
     if (isStaff) {
-      await applyPreparedBookingEditableUpdate(connection, bookingId, preparedUpdate);
+      await applyPreparedBookingEditableUpdateWithLifecycle(connection, currentBooking, bookingId, preparedUpdate, {
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'booking_schedule_updated',
+      });
       await expirePendingBookingChangeRequestsForBooking(connection, currentBooking, {
         force: true,
         now: new Date(),
@@ -13565,7 +13593,10 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
       const preparedUpdate = await prepareBookingEditableUpdate(connection, currentBooking, requestedChanges);
       const currentComparableFields = buildBookingEditableComparableFields(currentBooking);
       if (!bookingEditableFieldsAreEqual(currentComparableFields, preparedUpdate.comparableFields)) {
-        await applyPreparedBookingEditableUpdate(connection, effectiveBookingId, preparedUpdate);
+        await applyPreparedBookingEditableUpdateWithLifecycle(connection, currentBooking, effectiveBookingId, preparedUpdate, {
+          changedByUserId: req.user?.id || null,
+          reasonCode: 'booking_change_request_accepted',
+        });
       }
     }
 

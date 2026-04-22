@@ -25,6 +25,7 @@ const {
   isWithinLastMinuteWindow,
   normalizeMinimumNoticeMinutes,
   normalizeLegacyStatusUpdate,
+  shouldResetBookingToAcceptedAfterFutureReschedule,
 } = require("./bookingDomain");
 
 test("deriveRequestedEndDateTime returns null when start or duration is missing", () => {
@@ -409,6 +410,64 @@ test("canEditBooking only allows accepted and in_progress bookings outside block
   assert.equal(canEditBooking({ service_status: "accepted", settlement_status: "none" }), true);
   assert.equal(canEditBooking({ service_status: "in_progress", settlement_status: "awaiting_payment" }), true);
   assert.equal(canEditBooking({ service_status: "accepted", settlement_status: "in_dispute" }), false);
+});
+
+test("shouldResetBookingToAcceptedAfterFutureReschedule only resets in-progress bookings when the schedule changes to a future start", () => {
+  assert.equal(
+    shouldResetBookingToAcceptedAfterFutureReschedule(
+      {
+        service_status: "accepted",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+      },
+      {
+        nextRequestedStartDateTime: "2026-03-29T12:00:00.000Z",
+        now: "2026-03-29T09:00:00.000Z",
+      }
+    ),
+    false
+  );
+
+  assert.equal(
+    shouldResetBookingToAcceptedAfterFutureReschedule(
+      {
+        service_status: "in_progress",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+      },
+      {
+        nextRequestedStartDateTime: "2026-03-29T10:00:00.000Z",
+        now: "2026-03-29T09:00:00.000Z",
+      }
+    ),
+    false
+  );
+
+  assert.equal(
+    shouldResetBookingToAcceptedAfterFutureReschedule(
+      {
+        service_status: "in_progress",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+      },
+      {
+        nextRequestedStartDateTime: "2026-03-29T09:30:00.000Z",
+        now: "2026-03-29T09:45:00.000Z",
+      }
+    ),
+    false
+  );
+
+  assert.equal(
+    shouldResetBookingToAcceptedAfterFutureReschedule(
+      {
+        service_status: "in_progress",
+        requested_start_datetime: "2026-03-29T10:00:00.000Z",
+      },
+      {
+        nextRequestedStartDateTime: "2026-03-29T12:00:00.000Z",
+        now: "2026-03-29T10:30:00.000Z",
+      }
+    ),
+    true
+  );
 });
 
 test("hasBookingChangeRequestExpired only expires pending requests once the ttl is reached", () => {

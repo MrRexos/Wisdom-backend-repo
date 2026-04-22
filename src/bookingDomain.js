@@ -578,6 +578,39 @@ function canEditBooking(booking) {
   ].includes(normalizedSettlementStatus);
 }
 
+function shouldResetBookingToAcceptedAfterFutureReschedule(currentBooking, {
+  nextRequestedStartDateTime,
+  now = new Date(),
+} = {}) {
+  const normalizedServiceStatus = normalizeServiceStatus(
+    currentBooking?.service_status,
+    "pending_deposit"
+  );
+  if (normalizedServiceStatus !== "in_progress") {
+    return false;
+  }
+
+  const parsedNextRequestedStartDateTime = parseDateInput(nextRequestedStartDateTime);
+  if (!parsedNextRequestedStartDateTime) {
+    return false;
+  }
+
+  const parsedCurrentRequestedStartDateTime = parseDateInput(
+    currentBooking?.requested_start_datetime
+    ?? currentBooking?.booking_start_datetime
+    ?? null
+  );
+  if (
+    parsedCurrentRequestedStartDateTime
+    && parsedCurrentRequestedStartDateTime.getTime() === parsedNextRequestedStartDateTime.getTime()
+  ) {
+    return false;
+  }
+
+  const normalizedNow = parseDateInput(now) || new Date();
+  return parsedNextRequestedStartDateTime.getTime() > normalizedNow.getTime();
+}
+
 function hasBookingChangeRequestExpired(changeRequest, {
   now = new Date(),
   ttlMs = ONE_DAY_MS,
@@ -754,6 +787,7 @@ module.exports = {
   deriveLegacyBookingStatus,
   deriveLegacyIsPaid,
   canEditBooking,
+  shouldResetBookingToAcceptedAfterFutureReschedule,
   hasBookingChangeRequestExpired,
   buildTransitionPatch,
   normalizeLegacyStatusUpdate,
