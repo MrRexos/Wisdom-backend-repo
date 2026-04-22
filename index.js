@@ -13508,6 +13508,7 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
       `
       SELECT
         b.id,
+        b.service_id,
         b.client_user_id,
         b.provider_user_id_snapshot,
         b.service_status,
