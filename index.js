@@ -2878,6 +2878,9 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
     ? (requestBody.requested_start_datetime ?? requestBody.booking_start_datetime ?? null)
     : currentBooking.requested_start_datetime;
   const requestedStartDateTime = parseDateTimeInput(requestedStartInput);
+  const currentRequestedStartDateTime = parseDateTimeInput(currentBooking.requested_start_datetime);
+  const currentRequestedStartDateTimeValue = toDbDateTime(currentRequestedStartDateTime);
+  const nextRequestedStartDateTimeValue = toDbDateTime(requestedStartDateTime);
   const requestedDurationMinutes = hasDurationField
     ? normalizeDurationMinutes(requestBody.requested_duration_minutes ?? requestBody.service_duration ?? null)
     : normalizeDurationMinutes(currentBooking.requested_duration_minutes);
@@ -2888,7 +2891,11 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
     throw error;
   }
 
-  if (requestedStartDateTime && requestedStartDateTime.getTime() < Date.now()) {
+  if (
+    requestedStartDateTime
+    && requestedStartDateTime.getTime() < Date.now()
+    && nextRequestedStartDateTimeValue !== currentRequestedStartDateTimeValue
+  ) {
     const error = new Error('No se puede reprogramar la reserva en el pasado.');
     error.statusCode = 400;
     throw error;
@@ -2926,6 +2933,9 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
     address_id: nextAddressId,
     description: nextDescription,
   };
+  const shouldResetToAccepted = shouldResetBookingToAcceptedAfterFutureReschedule(currentBooking, {
+    nextRequestedStartDateTime: schedule.requestedStartDateTime,
+  });
 
   return {
     comparableFields,
@@ -2947,6 +2957,7 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
       ...comparableFields,
       address_snapshot: nextAddressSnapshot,
     },
+    shouldResetToAccepted,
   };
 }
 
@@ -2995,11 +3006,10 @@ async function applyPreparedBookingEditableUpdateWithLifecycle(connection, curre
   changedByUserId = null,
   reasonCode = null,
 } = {}) {
+  const shouldResetToAccepted = preparedUpdate?.shouldResetToAccepted === true;
   await applyPreparedBookingEditableUpdate(connection, bookingId, preparedUpdate);
 
-  if (!shouldResetBookingToAcceptedAfterFutureReschedule(currentBooking, {
-    nextRequestedStartDateTime: preparedUpdate?.comparableFields?.requested_start_datetime,
-  })) {
+  if (!shouldResetToAccepted) {
     return;
   }
 
@@ -13259,6 +13269,12 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
         b.requested_start_datetime,
         b.requested_duration_minutes,
         b.requested_end_datetime,
+        b.accepted_at,
+        b.started_at,
+        b.finished_at,
+        b.accept_deadline_at,
+        b.expires_at,
+        b.last_minute_window_starts_at,
         b.description,
         b.address_id,
         b.price_type_snapshot,
@@ -13504,6 +13520,12 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
         b.requested_start_datetime,
         b.requested_duration_minutes,
         b.requested_end_datetime,
+        b.accepted_at,
+        b.started_at,
+        b.finished_at,
+        b.accept_deadline_at,
+        b.expires_at,
+        b.last_minute_window_starts_at,
         b.description,
         b.address_id,
         b.price_type_snapshot,
