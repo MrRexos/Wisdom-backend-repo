@@ -536,6 +536,22 @@ function parseDateTimeInput(value) {
   return Number.isNaN(fallback.getTime()) ? null : fallback;
 }
 
+function deriveActualDurationMinutes(startedAt, finishedAt) {
+  const startedDate = parseDateTimeInput(startedAt);
+  const finishedDate = parseDateTimeInput(finishedAt);
+
+  if (!startedDate || !finishedDate) {
+    return null;
+  }
+
+  const diffMs = finishedDate.getTime() - startedDate.getTime();
+  if (!Number.isFinite(diffMs) || diffMs <= 0) {
+    return null;
+  }
+
+  return Math.max(1, Math.round(diffMs / 60000));
+}
+
 function toUtcSqlDateTime(value) {
   const parsed = parseDateTimeInput(value);
   return parsed ? formatUtcSqlDateTime(parsed) : null;
@@ -4163,6 +4179,8 @@ async function getBookingSettlementContext(connection, bookingId, { forUpdate = 
       b.requested_start_datetime,
       b.requested_end_datetime,
       b.requested_duration_minutes,
+      b.started_at,
+      b.finished_at,
       b.price_type_snapshot,
       b.service_currency_snapshot,
       b.estimated_base_amount_cents,
@@ -4359,6 +4377,7 @@ async function markBookingSettlementForReview(bookingId, {
 async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
   changedByUserId = null,
   reasonCode = 'final_payment_settled',
+  finishedAt = null,
 } = {}) {
   const normalizedBookingId = normalizeNullableInteger(bookingId);
   if (!normalizedBookingId) {
@@ -4495,6 +4514,7 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
       reasonCode,
       extraPatch: {
         client_approval_deadline_at: null,
+        ...(finishedAt ? { finished_at: finishedAt } : {}),
       },
     });
 
@@ -14089,6 +14109,8 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
         requested_start_datetime,
         requested_end_datetime,
         requested_duration_minutes,
+        started_at,
+        finished_at,
         price_type_snapshot,
         service_currency_snapshot,
         unit_price_amount_cents_snapshot,
@@ -14139,9 +14161,11 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
       ? 0
       : fromMinorUnits(booking.unit_price_amount_cents_snapshot, bookingCurrency);
     const zeroChargeMode = req.body?.zero_charge_mode === true || req.body?.zero_charge_mode === 1;
+    const closureFinishedAt = new Date();
+    const actualFinalDurationMinutes = deriveActualDurationMinutes(booking.started_at, closureFinishedAt);
 
     let proposedBaseAmountCents = 0;
-    let proposedFinalDurationMinutes = null;
+    let proposedFinalDurationMinutes = priceTypeSnapshot === 'hour' ? null : actualFinalDurationMinutes;
 
     if (!zeroChargeMode) {
       if (priceTypeSnapshot === 'hour') {
@@ -14201,12 +14225,13 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
 
     const shouldCompleteImmediately = zeroChargeMode || proposedBaseAmountCents <= 0;
     if (shouldCompleteImmediately) {
-      await updateClosureProposalStatus(connection, proposalId, 'accepted', new Date());
+      await updateClosureProposalStatus(connection, proposalId, 'accepted', closureFinishedAt);
       await connection.commit();
 
       const settlementResult = await finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
         changedByUserId: req.user?.id || null,
         reasonCode: zeroChargeMode ? 'closure_zero_charge_completed' : 'closure_zero_amount_completed',
+        finishedAt: closureFinishedAt,
       });
       if (!settlementResult.settled) {
         return res.status(500).json({ error: 'No se pudo completar automáticamente el cierre.' });
@@ -14225,6 +14250,7 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
       reasonCode: 'closure_proposal_sent',
       extraPatch: {
         client_approval_deadline_at: buildClientApprovalDeadline(),
+        finished_at: closureFinishedAt,
       },
     });
 
@@ -14259,7 +14285,9 @@ app.post('/api/bookings/:id/closure-proposal/revoke', authenticateToken, async (
         client_user_id,
         provider_user_id_snapshot,
         service_status,
-        settlement_status
+        settlement_status,
+        started_at,
+        finished_at
       FROM booking
       WHERE id = ?
       LIMIT 1
@@ -14299,6 +14327,7 @@ app.post('/api/bookings/:id/closure-proposal/revoke', authenticateToken, async (
       reasonCode: 'closure_proposal_revoked',
       extraPatch: {
         client_approval_deadline_at: null,
+        finished_at: null,
       },
     });
 
@@ -14330,7 +14359,9 @@ app.post('/api/bookings/:id/dispute', authenticateToken, async (req, res) => {
         client_user_id,
         provider_user_id_snapshot,
         service_status,
-        settlement_status
+        settlement_status,
+        started_at,
+        finished_at
       FROM booking
       WHERE id = ?
       LIMIT 1
@@ -16291,6 +16322,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
              b.requested_duration_minutes AS service_duration,
              b.requested_start_datetime AS booking_start_datetime,
              b.requested_end_datetime AS booking_end_datetime,
+             b.started_at,
+             b.finished_at,
              b.price_type_snapshot,
              b.service_currency_snapshot,
              b.unit_price_amount_cents_snapshot,
