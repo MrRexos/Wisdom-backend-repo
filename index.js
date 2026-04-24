@@ -5688,13 +5688,13 @@ function getAcceptedBookingInactivityCopy(kind, recipientRole = 'client') {
   if (normalizedKind === ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE) {
     return normalizedRecipientRole === 'professional'
       ? {
-        subjectPrefix: 'Reserva cancelada automáticamente por inactividad',
-        intro: 'Hemos cancelado automáticamente esta reserva porque han pasado 7 días desde la hora de inicio prevista sin ninguna acción registrada.',
+        subjectPrefix: 'Reserva caducada automáticamente por inactividad',
+        intro: 'Esta reserva ha caducado automáticamente porque han pasado 7 días desde la hora de inicio prevista sin ninguna acción registrada.',
         action: 'Además, se ha aplicado un strike automático a tu cuenta por abandono de la reserva.',
       }
       : {
-        subjectPrefix: 'Tu reserva se ha cancelado automáticamente',
-        intro: 'Hemos cancelado automáticamente esta reserva porque han pasado 7 días desde la hora de inicio prevista sin ninguna acción registrada.',
+        subjectPrefix: 'Tu reserva ha caducado por inactividad',
+        intro: 'Esta reserva ha caducado automáticamente porque han pasado 7 días desde la hora de inicio prevista sin ninguna acción registrada.',
         action: 'Hemos solicitado el reembolso íntegro del depósito al método de pago original.',
       };
   }
