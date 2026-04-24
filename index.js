@@ -1527,6 +1527,7 @@ function assertBookingAddressRulesForService({
   if (rule.mode === 'required' && Number.isFinite(rule.actionRate) && distanceKm >= rule.actionRate * 2) {
     const error = new Error('Demasiado lejos. Este profesional no presta servicios a esta distancia. Por favor, introduce una dirección más cercana o busca a otro profesional en tu zona.');
     error.statusCode = 400;
+    error.errorCode = 'booking_direction_too_far';
     throw error;
   }
 
@@ -12907,7 +12908,10 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
         });
       } catch (addressError) {
         await connection.rollback();
-        return res.status(addressError.statusCode || 400).json({ error: addressError.message });
+        return res.status(addressError.statusCode || 400).json({
+          error: addressError.message,
+          error_code: addressError.errorCode || undefined,
+        });
       }
     }
 
@@ -13025,7 +13029,10 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
   } catch (error) {
     try { await connection.rollback(); } catch {}
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ error: error.message });
+      return res.status(error.statusCode).json({
+        error: error.message,
+        error_code: error.errorCode || undefined,
+      });
     }
     console.error('Error al insertar la reserva:', error);
     return res.status(500).json({ error: 'Error al insertar la reserva.' });
@@ -13508,7 +13515,10 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
   } catch (error) {
     try { await connection.rollback(); } catch {}
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ error: error.message });
+      return res.status(error.statusCode).json({
+        error: error.message,
+        error_code: error.errorCode || undefined,
+      });
     }
     console.error('Error al actualizar la reserva:', error);
     return res.status(500).json({ error: 'Error al actualizar la reserva.' });
@@ -13713,7 +13723,10 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
   } catch (error) {
     try { await connection.rollback(); } catch {}
     if (error?.statusCode) {
-      return res.status(error.statusCode).json({ error: error.message });
+      return res.status(error.statusCode).json({
+        error: error.message,
+        error_code: error.errorCode || undefined,
+      });
     }
     console.error('Error al responder la solicitud de modificación:', error);
     return res.status(500).json({ error: 'Error al responder la solicitud de modificación.' });
