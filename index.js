@@ -13091,12 +13091,18 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         a.state,
         a.country,
         a.latitude AS address_latitude,
-        a.longitude AS address_longitude
+        a.longitude AS address_longitude,
+        bu.id AS booking_user_id,
+        bu.username AS booking_user_username,
+        bu.first_name AS booking_user_first_name,
+        bu.surname AS booking_user_surname,
+        bu.profile_picture AS booking_user_profile_picture
       FROM booking b
       LEFT JOIN service s ON b.service_id = s.id
       LEFT JOIN price p ON s.price_id = p.id
       LEFT JOIN payment_method pm ON b.selected_customer_payment_method_id = pm.id
       LEFT JOIN address a ON b.address_id = a.id
+      LEFT JOIN user_account bu ON b.client_user_id = bu.id
       LEFT JOIN booking_closure_proposal cp ON cp.id = (
         SELECT cp2.id
         FROM booking_closure_proposal cp2
