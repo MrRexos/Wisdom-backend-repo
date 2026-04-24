@@ -552,6 +552,22 @@ function deriveActualDurationMinutes(startedAt, finishedAt) {
   return Math.max(1, Math.round(diffMs / 60000));
 }
 
+function deriveActualWholeHoursDurationMinutes(startedAt, finishedAt) {
+  const startedDate = parseDateTimeInput(startedAt);
+  const finishedDate = parseDateTimeInput(finishedAt);
+
+  if (!startedDate || !finishedDate) {
+    return null;
+  }
+
+  const diffMs = finishedDate.getTime() - startedDate.getTime();
+  if (!Number.isFinite(diffMs) || diffMs <= 0) {
+    return null;
+  }
+
+  return Math.max(1, Math.ceil(diffMs / (60 * 60 * 1000))) * 60;
+}
+
 function toUtcSqlDateTime(value) {
   const parsed = parseDateTimeInput(value);
   return parsed ? formatUtcSqlDateTime(parsed) : null;
@@ -1129,11 +1145,15 @@ function buildComparablePriceExpression({
       ELSE NULL
     END
   `.trim();
+  const convertedBaseExpression = `((${sourceAmountExpression}) / NULLIF(${sourceRateExpression}, 0)) * ${targetRate}`;
+  const roundedBaseExpression = `ROUND(${convertedBaseExpression}, 2)`;
+  const minimumCommissionAmount = getMinimumCommissionAmount(targetCurrency);
+  const commissionExpression = `GREATEST(${minimumCommissionAmount}, ROUND(${roundedBaseExpression} * 0.1, 1))`;
 
   return `
     CASE
       WHEN ${priceAlias}.price_type IN ('fix', 'hour')
-        THEN ((${sourceAmountExpression}) / NULLIF(${sourceRateExpression}, 0)) * ${targetRate}
+        THEN ROUND(${roundedBaseExpression} + ${commissionExpression}, 2)
       ELSE NULL
     END
   `.trim();
@@ -1504,8 +1524,8 @@ function assertBookingAddressRulesForService({
     };
   }
 
-  if (rule.mode === 'required' && Number.isFinite(rule.actionRate) && distanceKm > rule.actionRate) {
-    const error = new Error('La dirección indicada está fuera del radio de acción del profesional para este servicio.');
+  if (rule.mode === 'required' && Number.isFinite(rule.actionRate) && distanceKm >= rule.actionRate * 2) {
+    const error = new Error('Demasiado lejos. Este profesional no presta servicios a esta distancia. Por favor, introduce una dirección más cercana o busca a otro profesional en tu zona.');
     error.statusCode = 400;
     throw error;
   }
@@ -14163,6 +14183,7 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
     const zeroChargeMode = req.body?.zero_charge_mode === true || req.body?.zero_charge_mode === 1;
     const closureFinishedAt = new Date();
     const actualFinalDurationMinutes = deriveActualDurationMinutes(booking.started_at, closureFinishedAt);
+    const actualFinalWholeHoursDurationMinutes = deriveActualWholeHoursDurationMinutes(booking.started_at, closureFinishedAt);
 
     let proposedBaseAmountCents = 0;
     let proposedFinalDurationMinutes = priceTypeSnapshot === 'hour' ? null : actualFinalDurationMinutes;
@@ -14174,9 +14195,10 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
           ?? req.body?.service_duration
           ?? req.body?.requested_duration_minutes
           ?? booking.requested_duration_minutes
+          ?? actualFinalWholeHoursDurationMinutes
         );
 
-        if (!isDurationMinutesInRange(proposedFinalDurationMinutes)) {
+        if (proposedFinalDurationMinutes === null || !isDurationMinutesInRange(proposedFinalDurationMinutes)) {
           await connection.rollback();
           return res.status(400).json({
             error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,

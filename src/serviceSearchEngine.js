@@ -965,24 +965,38 @@ function annotateServiceSearchCandidate(searchPlan, row) {
   };
 }
 
+function roundSearchPrice(value, digits) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue)) return 0;
+  const factor = 10 ** digits;
+  return Math.round(numericValue * factor) / factor;
+}
+
 function getComparablePrice(service, durationMinutes) {
+  if (service?.price === null || service?.price === undefined || service?.price === '') {
+    return null;
+  }
+
   const numericPrice = Number(service?.price);
   if (!Number.isFinite(numericPrice)) {
     return null;
   }
 
+  let basePrice = null;
   if (service?.price_type === 'fix') {
-    return numericPrice;
-  }
-
-  if (service?.price_type === 'hour') {
+    basePrice = numericPrice;
+  } else if (service?.price_type === 'hour') {
     const safeDurationMinutes = Number.isFinite(Number(durationMinutes)) && Number(durationMinutes) > 0
       ? Number(durationMinutes)
       : 60;
-    return numericPrice * (safeDurationMinutes / 60);
+    basePrice = numericPrice * (safeDurationMinutes / 60);
+  } else {
+    return null;
   }
 
-  return null;
+  const roundedBasePrice = roundSearchPrice(basePrice, 2);
+  const commission = Math.max(1, roundSearchPrice(roundedBasePrice * 0.1, 1));
+  return roundSearchPrice(roundedBasePrice + commission, 2);
 }
 
 function getBayesianRating(service) {
