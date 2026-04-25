@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 
 const {
   AUTO_CHARGE_TOLERANCE_FACTOR,
+  MIN_BOOKING_DURATION_MINUTES,
+  MAX_BOOKING_DURATION_MINUTES,
   buildBookingSchedule,
   buildTransitionPatch,
   canReportBookingIssue,
@@ -22,6 +24,7 @@ const {
   deriveRequestedEndDateTime,
   deriveExpiresAt,
   hasRequestedStartDateTimePassed,
+  isDurationMinutesInRange,
   isWithinLastMinuteWindow,
   normalizeMinimumNoticeMinutes,
   normalizeLegacyStatusUpdate,
@@ -37,6 +40,15 @@ test("deriveRequestedEndDateTime adds duration minutes to the requested start", 
   const result = deriveRequestedEndDateTime("2026-03-29T10:00:00.000Z", 95);
   assert.ok(result instanceof Date);
   assert.equal(result.toISOString(), "2026-03-29T11:35:00.000Z");
+});
+
+test("isDurationMinutesInRange allows up to one year", () => {
+  const oneYearMinutes = 365 * 24 * 60;
+
+  assert.equal(MAX_BOOKING_DURATION_MINUTES, oneYearMinutes);
+  assert.equal(isDurationMinutesInRange(MIN_BOOKING_DURATION_MINUTES), true);
+  assert.equal(isDurationMinutesInRange(oneYearMinutes), true);
+  assert.equal(isDurationMinutesInRange(oneYearMinutes + 1), false);
 });
 
 test("normalizeMinimumNoticeMinutes accepts nullable and non negative values", () => {
