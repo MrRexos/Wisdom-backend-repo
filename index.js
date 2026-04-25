@@ -1533,6 +1533,30 @@ function assertBookingAddressRulesForService({
   };
 }
 
+function getServiceBookingAvailabilityError(serviceRow = {}) {
+  if (Number(serviceRow.provider_is_verified ?? serviceRow.is_verified ?? 0) !== 1) {
+    return {
+      status: 409,
+      body: {
+        error: 'El profesional debe verificar su correo electrónico antes de recibir reservas.',
+        error_code: 'provider_email_not_verified',
+      },
+    };
+  }
+
+  if (Number(serviceRow.is_hidden ?? 0) === 1) {
+    return {
+      status: 409,
+      body: {
+        error: 'Este servicio no está visible y no se puede reservar.',
+        error_code: 'service_not_visible',
+      },
+    };
+  }
+
+  return null;
+}
+
 function generateObjectName(originalName = '') {
   const extension = path.extname(originalName || '') || '';
   const uniqueId = typeof crypto.randomUUID === 'function'
@@ -2208,6 +2232,54 @@ function canAutoExpireRequestedBooking(booking, now = new Date()) {
   }
 
   return expiresAt.getTime() <= normalizedNow.getTime();
+}
+
+function hasConfiguredProviderPayoutMethod(providerRow = {}) {
+  const stripeAccountId = typeof providerRow?.stripe_account_id === 'string'
+    ? providerRow.stripe_account_id.trim()
+    : '';
+  const hasCollectionMethod = Number(providerRow?.has_collection_method ?? 0) > 0;
+  return stripeAccountId.startsWith('acct_') && hasCollectionMethod;
+}
+
+async function fetchProviderBookingAcceptanceReadiness(connection, providerUserId, { forUpdate = false } = {}) {
+  const normalizedProviderUserId = normalizeNullableInteger(providerUserId);
+  if (!normalizedProviderUserId) {
+    return null;
+  }
+
+  const [[providerRow]] = await connection.query(
+    `
+    SELECT
+      ua.id,
+      ua.stripe_account_id,
+      EXISTS (
+        SELECT 1
+        FROM collection_method cm
+        WHERE cm.user_id = ua.id
+        LIMIT 1
+      ) AS has_collection_method
+    FROM user_account ua
+    WHERE ua.id = ?
+    LIMIT 1
+    ${forUpdate ? 'FOR UPDATE' : ''}
+    `,
+    [normalizedProviderUserId]
+  );
+
+  return providerRow || null;
+}
+
+async function touchBookingUserInteraction(connection, bookingId) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return;
+  }
+
+  await connection.query(
+    'UPDATE booking SET updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+    [normalizedBookingId]
+  );
 }
 
 function assertBookingStatusUpdateAllowed({
@@ -12867,14 +12939,17 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
         s.id,
         s.user_id AS provider_user_id_snapshot,
         s.service_title,
+        s.is_hidden,
         s.minimum_notice_policy,
         s.latitude,
         s.longitude,
         s.action_rate,
+        ua.is_verified AS provider_is_verified,
         p.price,
         p.currency AS currency,
         p.price_type
       FROM service s
+      JOIN user_account ua ON ua.id = s.user_id
       LEFT JOIN price p ON s.price_id = p.id
       WHERE s.id = ?
       LIMIT 1
@@ -12886,6 +12961,12 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
     if (!serviceSnapshot) {
       await connection.rollback();
       return res.status(404).json({ error: 'Servicio no encontrado.' });
+    }
+
+    const availabilityError = getServiceBookingAvailabilityError(serviceSnapshot);
+    if (availabilityError) {
+      await connection.rollback();
+      return res.status(availabilityError.status).json(availabilityError.body);
     }
 
     const now = new Date();
@@ -13536,6 +13617,7 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
         ]
       );
       createdChangeRequestId = existingPendingChangeRequest.id;
+      await touchBookingUserInteraction(connection, bookingId);
     } else {
       const [insertResult] = await connection.query(
         `
@@ -13552,6 +13634,7 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
         ]
       );
       createdChangeRequestId = insertResult.insertId;
+      await touchBookingUserInteraction(connection, bookingId);
     }
 
     await connection.commit();
@@ -13894,6 +13977,8 @@ app.patch('/api/bookings/:id/change-requests/:changeRequestId', authenticateToke
       });
     }
 
+    await touchBookingUserInteraction(connection, effectiveBookingId);
+
     await connection.commit();
     shouldNotifyRequester = action !== 'canceled' || isStaff;
 
@@ -14085,6 +14170,25 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
       isStaff,
       cancellationReasonCode: extraPatch.cancellation_reason_code || mappedCancellationReason,
     });
+
+    if (
+      normalizedCurrentServiceStatus === 'requested'
+      && normalizedNextServiceStatus === 'accepted'
+    ) {
+      const providerReadiness = await fetchProviderBookingAcceptanceReadiness(
+        connection,
+        booking.provider_user_id_snapshot,
+        { forUpdate: true }
+      );
+
+      if (!hasConfiguredProviderPayoutMethod(providerReadiness)) {
+        await connection.rollback();
+        return res.status(409).json({
+          error: 'Para aceptar reservas debes configurar un método de cobro.',
+          error_code: 'provider_payout_method_required',
+        });
+      }
+    }
 
     if (
       normalizedNextServiceStatus === 'canceled'
@@ -18971,14 +19075,18 @@ app.get('/api/services/:id', (req, res) => {
   });
 });
 
-app.post('/api/services/:id/reviews', async (req, res) => {
+app.post('/api/services/:id/reviews', authenticateToken, async (req, res) => {
   const serviceId = normalizeNullableInteger(req.params.id);
   const normalizedBookingId = normalizeNullableInteger(req.body?.booking_id);
   const numericRating = Number(req.body?.rating);
   const comment = typeof req.body?.comment === 'string' && req.body.comment.trim().length > 0
     ? req.body.comment.trim()
     : null;
-  const userId = req.user.id;
+  const userId = normalizeNullableInteger(req.user?.id);
+
+  if (!userId) {
+    return res.status(401).json({ error: 'missing_user_id' });
+  }
 
   if (!serviceId) {
     return res.status(400).json({ error: 'service_id inválido.' });
