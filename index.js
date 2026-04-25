@@ -2646,6 +2646,49 @@ async function transitionBookingWithOptionalDepositRefund(connection, currentBoo
   };
 }
 
+async function requestDepositRefundForCurrentBooking(connection, currentBooking, {
+  changedByUserId = null,
+  reasonCode = null,
+  note = null,
+} = {}) {
+  const normalizedSettlementStatus = normalizeSettlementStatus(currentBooking?.settlement_status, 'none');
+  if (['refunded', 'partially_refunded'].includes(normalizedSettlementStatus)) {
+    return { refundRequest: null };
+  }
+
+  const depositPayment = await getPaymentRow(connection, currentBooking.id, 'deposit');
+  const normalizedPaymentStatus = String(depositPayment?.status || '').trim().toLowerCase();
+  if (
+    !depositPayment?.payment_intent_id
+    || !['succeeded', 'refund_pending'].includes(normalizedPaymentStatus)
+  ) {
+    return { refundRequest: null };
+  }
+
+  if (normalizedSettlementStatus !== 'refund_pending') {
+    await transitionBookingStateRecord(connection, currentBooking, {
+      nextServiceStatus: currentBooking.service_status,
+      nextSettlementStatus: 'refund_pending',
+      changedByUserId,
+      reasonCode: reasonCode || 'deposit_refund_requested',
+      note,
+    });
+  }
+
+  await connection.query(
+    'UPDATE payments SET status = ? WHERE id = ?',
+    ['refund_pending', depositPayment.id]
+  );
+
+  return {
+    refundRequest: {
+      bookingId: currentBooking.id,
+      paymentIntentId: depositPayment.payment_intent_id,
+      reasonCode: reasonCode || 'deposit_refund_requested',
+    },
+  };
+}
+
 async function expireRequestedBookingByIdIfNeeded(bookingId) {
   const normalizedBookingId = normalizeNullableInteger(bookingId);
   if (!normalizedBookingId) {
@@ -13522,6 +13565,135 @@ app.put('/api/bookings/:id', authenticateToken, async (req, res) => {
     }
     console.error('Error al actualizar la reserva:', error);
     return res.status(500).json({ error: 'Error al actualizar la reserva.' });
+  } finally {
+    connection.release();
+  }
+});
+
+app.post('/api/bookings/:id/prepare-rebooking', authenticateToken, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+
+  const connection = await promisePool.getConnection();
+  let refundRequest = null;
+  let finalServiceStatus = null;
+  let shouldReleaseEphemeralPaymentMethods = false;
+
+  try {
+    await connection.beginTransaction();
+
+    const [[booking]] = await connection.query(
+      `
+      SELECT
+        b.id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
+        b.service_status,
+        b.settlement_status,
+        b.order_datetime AS created_at,
+        b.order_datetime,
+        b.requested_start_datetime,
+        b.requested_duration_minutes,
+        b.expires_at
+      FROM booking b
+      WHERE b.id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [bookingId]
+    );
+
+    if (!booking) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const isClientOwner = req.user && Number(req.user.id) === Number(booking.client_user_id);
+    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    if (!isClientOwner && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
+
+    const normalizedServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
+    if (canAutoExpireRequestedBooking(booking)) {
+      const transitionResult = await transitionBookingWithOptionalDepositRefund(connection, booking, {
+        nextServiceStatus: 'expired',
+        nextSettlementStatus: booking.settlement_status,
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'request_expired',
+        requestDepositRefund: true,
+      });
+      refundRequest = transitionResult.refundRequest;
+      finalServiceStatus = 'expired';
+    } else if (normalizedServiceStatus === 'requested') {
+      const transitionResult = await transitionBookingWithOptionalDepositRefund(connection, booking, {
+        nextServiceStatus: 'canceled',
+        nextSettlementStatus: booking.settlement_status,
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'client_rebooking_requested',
+        extraPatch: {
+          canceled_by_user_id: req.user?.id || null,
+          cancellation_reason_code: 'client_rebooking_requested',
+        },
+        requestDepositRefund: true,
+      });
+      refundRequest = transitionResult.refundRequest;
+      finalServiceStatus = 'canceled';
+      shouldReleaseEphemeralPaymentMethods = !refundRequest?.paymentIntentId;
+    } else if (normalizedServiceStatus === 'expired') {
+      const refundResult = await requestDepositRefundForCurrentBooking(connection, booking, {
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'expired_booking_rebooking_requested',
+      });
+      refundRequest = refundResult.refundRequest;
+      finalServiceStatus = 'expired';
+    } else {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'Solo puedes crear una nueva reserva desde una solicitud pendiente o expirada.',
+      });
+    }
+
+    await connection.commit();
+
+    if (refundRequest?.paymentIntentId) {
+      try {
+        await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
+          booking_id: String(refundRequest.bookingId),
+          source: finalServiceStatus === 'expired' ? 'booking_expired_rebooking' : 'booking_replaced',
+        });
+      } catch (refundError) {
+        console.error('Error refunding booking deposit before rebooking:', {
+          bookingId: refundRequest.bookingId,
+          paymentIntentId: refundRequest.paymentIntentId,
+          error: refundError.message,
+        });
+      }
+    }
+
+    if (shouldReleaseEphemeralPaymentMethods) {
+      try {
+        await releaseEphemeralBookingPaymentMethodsIfClosed(bookingId);
+      } catch (cleanupError) {
+        console.error('Error releasing ephemeral payment methods before rebooking:', {
+          bookingId,
+          error: cleanupError.message,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      service_status: finalServiceStatus,
+      refund_requested: Boolean(refundRequest?.paymentIntentId),
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error preparing booking replacement:', error);
+    return res.status(500).json({ error: 'Error al preparar la nueva reserva.' });
   } finally {
     connection.release();
   }
