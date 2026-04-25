@@ -220,6 +220,39 @@ test("canReportBookingIssue enables accepted bookings without start, accepted bo
   );
 });
 
+test("canReportBookingIssue lets the client report a general issue during final payment approval", () => {
+  const pendingClientApprovalBooking = {
+    service_status: "finished",
+    settlement_status: "pending_client_approval",
+    requested_start_datetime: "2026-03-29T10:00:00.000Z",
+  };
+
+  assert.equal(
+    canReportBookingIssue(
+      pendingClientApprovalBooking,
+      "2026-03-29T12:00:00.000Z",
+      { reporterRole: "client", issueType: "general_problem" }
+    ),
+    true
+  );
+  assert.equal(
+    canReportBookingIssue(
+      pendingClientApprovalBooking,
+      "2026-03-29T12:00:00.000Z",
+      { reporterRole: "pro", issueType: "general_problem" }
+    ),
+    false
+  );
+  assert.equal(
+    canReportBookingIssue(
+      pendingClientApprovalBooking,
+      "2026-03-29T12:00:00.000Z",
+      { reporterRole: "client", issueType: "no_show_provider" }
+    ),
+    false
+  );
+});
+
 test("getAcceptedBookingInactivityStage returns the next unsent reminder for inactive accepted bookings", () => {
   assert.deepEqual(
     getAcceptedBookingInactivityStage(

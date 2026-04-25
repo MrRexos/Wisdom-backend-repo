@@ -349,8 +349,24 @@ function getAcceptedBookingInactivityStage(booking, {
   return null;
 }
 
-function canReportBookingIssue(booking, now = new Date()) {
+function canReportBookingIssue(booking, now = new Date(), options = {}) {
   const normalizedServiceStatus = normalizeServiceStatus(booking?.service_status, "pending_deposit");
+  const normalizedSettlementStatus = normalizeSettlementStatus(booking?.settlement_status, "none");
+  const reporterRole = typeof options?.reporterRole === "string"
+    ? options.reporterRole.trim().toLowerCase()
+    : null;
+  const issueType = typeof options?.issueType === "string"
+    ? options.issueType.trim().toLowerCase()
+    : "general_problem";
+
+  if (
+    reporterRole === "client"
+    && issueType === "general_problem"
+    && normalizedServiceStatus === "finished"
+    && normalizedSettlementStatus === "pending_client_approval"
+  ) {
+    return true;
+  }
 
   if (normalizedServiceStatus === "in_progress") {
     return true;

@@ -14854,10 +14854,19 @@ app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'No autorizado.' });
     }
 
-    if (!canReportBookingIssue(booking)) {
+    const requestedIssueType = String(req.body?.issue_type || '').trim().toLowerCase();
+    let issueType = requestedIssueType || 'general_problem';
+    if (issueType === 'no_show') {
+      issueType = isProviderOwner ? 'no_show_client' : 'no_show_provider';
+    }
+
+    if (!canReportBookingIssue(booking, new Date(), {
+      reporterRole: isClientOwner ? 'client' : 'pro',
+      issueType,
+    })) {
       await connection.rollback();
       return res.status(400).json({
-        error: 'La incidencia solo se puede reportar cuando la reserva está en progreso, no tiene fecha de inicio o ya ha pasado la hora de inicio.',
+        error: 'La incidencia solo se puede reportar cuando la reserva está en progreso, no tiene fecha de inicio, ya ha pasado la hora de inicio o el cliente debe revisar el pago final.',
       });
     }
 
@@ -14876,12 +14885,6 @@ app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
     if (existingOpenIssue) {
       await connection.rollback();
       return res.status(409).json({ error: 'Ya existe una incidencia abierta para esta reserva.' });
-    }
-
-    const requestedIssueType = String(req.body?.issue_type || '').trim().toLowerCase();
-    let issueType = requestedIssueType || 'general_problem';
-    if (issueType === 'no_show') {
-      issueType = isProviderOwner ? 'no_show_client' : 'no_show_provider';
     }
 
     const allowedIssueTypes = new Set(['general_problem']);
