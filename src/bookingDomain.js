@@ -375,10 +375,14 @@ function canReportBookingIssue(booking, now = new Date(), options = {}) {
     return false;
   }
 
-   const requestedStartDateTime = booking?.requested_start_datetime ?? booking?.booking_start_datetime;
-   if (!parseDateInput(requestedStartDateTime)) {
-     return true;
-   }
+  if (issueType === "general_problem") {
+    return true;
+  }
+
+  const requestedStartDateTime = booking?.requested_start_datetime ?? booking?.booking_start_datetime;
+  if (!parseDateInput(requestedStartDateTime)) {
+    return true;
+  }
 
   return hasRequestedStartDateTimePassed(
     requestedStartDateTime,

@@ -4763,7 +4763,7 @@ async function processCanceledBookingIssueOutcome(bookingId, {
       details: details || (
         providerFailure
           ? 'Se ha cancelado la reserva y se devolverá el depósito al cliente.'
-          : 'Se ha cancelado la reserva y el depósito pasa al profesional como compensación.'
+          : 'Se ha cancelado la reserva y Wisdom conserva el depósito.'
       ),
       resolvedAt: new Date(),
     });
@@ -4795,11 +4795,8 @@ async function processCanceledBookingIssueOutcome(bookingId, {
       );
     } else if (clientFailure && depositPayment?.id && Number(depositPayment.amount_cents || 0) > 0) {
       await setPaymentProviderPayoutState(initialConnection, depositPayment.id, {
-        amountCents: Number(depositPayment.amount_cents || 0),
-        status: 'pending_release',
-        eligibleAt: deriveProviderPayoutEligibleAt(
-          getPaymentReferenceDateTime(depositPayment)
-        ),
+        amountCents: 0,
+        status: 'none',
       });
     }
 

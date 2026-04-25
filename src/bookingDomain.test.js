@@ -188,11 +188,19 @@ test("hasRequestedStartDateTimePassed only returns true once the requested start
   );
 });
 
-test("canReportBookingIssue enables accepted bookings without start, accepted bookings after the start, and in progress bookings", () => {
+test("canReportBookingIssue enables general problems for all accepted bookings and keeps no-show time gated", () => {
   assert.equal(
     canReportBookingIssue(
       { service_status: "accepted", requested_start_datetime: "2026-03-29T10:00:00.000Z" },
       "2026-03-29T09:59:00.000Z"
+    ),
+    true
+  );
+  assert.equal(
+    canReportBookingIssue(
+      { service_status: "accepted", requested_start_datetime: "2026-03-29T10:00:00.000Z" },
+      "2026-03-29T09:59:00.000Z",
+      { issueType: "no_show_client" }
     ),
     false
   );
