@@ -32,7 +32,6 @@ const BOOKING_CHANGE_REQUEST_STATUSES = Object.freeze([
 ]);
 
 const MIN_BOOKING_DURATION_MINUTES = 5;
-const MAX_BOOKING_DURATION_MINUTES = 365 * 24 * 60;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const ONE_DAY_MS = 24 * ONE_HOUR_MS;
 const THREE_DAYS_MS = 3 * ONE_DAY_MS;
@@ -153,7 +152,7 @@ function isDurationMinutesInRange(value) {
     return true;
   }
 
-  return value >= MIN_BOOKING_DURATION_MINUTES && value <= MAX_BOOKING_DURATION_MINUTES;
+  return value >= MIN_BOOKING_DURATION_MINUTES;
 }
 
 function deriveRequestedEndDateTime(requestedStartDateTime, requestedDurationMinutes) {
@@ -858,7 +857,6 @@ module.exports = {
   ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
   ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
   MIN_BOOKING_DURATION_MINUTES,
-  MAX_BOOKING_DURATION_MINUTES,
   parseDateInput,
   normalizeServiceStatus,
   normalizeSettlementStatus,

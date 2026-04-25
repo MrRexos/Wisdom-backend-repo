@@ -32,7 +32,6 @@ const {
 const {
   AUTO_CHARGE_TOLERANCE_FACTOR,
   MIN_BOOKING_DURATION_MINUTES,
-  MAX_BOOKING_DURATION_MINUTES,
   normalizeServiceStatus,
   normalizeSettlementStatus,
   normalizeBookingChangeRequestStatus,
@@ -57,6 +56,7 @@ const {
   ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
   ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
 } = require('./src/bookingDomain');
+const MIN_BOOKING_DURATION_ERROR = `La duración debe ser de al menos ${MIN_BOOKING_DURATION_MINUTES} minutos.`;
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
 const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo.png';
 const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
@@ -2984,7 +2984,7 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
     : normalizeDurationMinutes(currentBooking.requested_duration_minutes);
 
   if (!isDurationMinutesInRange(requestedDurationMinutes)) {
-    const error = new Error(`La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`);
+    const error = new Error(MIN_BOOKING_DURATION_ERROR);
     error.statusCode = 400;
     throw error;
   }
@@ -12843,7 +12843,7 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
 
   if (!isDurationMinutesInRange(requestedDurationMinutes)) {
     return res.status(400).json({
-      error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
+      error: MIN_BOOKING_DURATION_ERROR,
     });
   }
 
@@ -14176,7 +14176,7 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
         if (priceTypeSnapshot === 'hour' && !isDurationMinutesInRange(proposedDurationMinutes)) {
           await connection.rollback();
           return res.status(400).json({
-            error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
+            error: MIN_BOOKING_DURATION_ERROR,
           });
         }
 
@@ -14416,7 +14416,7 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
         if (proposedFinalDurationMinutes === null || !isDurationMinutesInRange(proposedFinalDurationMinutes)) {
           await connection.rollback();
           return res.status(400).json({
-            error: `La duración debe estar entre ${MIN_BOOKING_DURATION_MINUTES} y ${MAX_BOOKING_DURATION_MINUTES} minutos.`,
+            error: MIN_BOOKING_DURATION_ERROR,
           });
         }
 
