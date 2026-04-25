@@ -611,10 +611,74 @@ function shouldResetBookingToAcceptedAfterFutureReschedule(currentBooking, {
   return parsedNextRequestedStartDateTime.getTime() > normalizedNow.getTime();
 }
 
+function parseChangeRequestChanges(changeRequest) {
+  const rawChanges = changeRequest?.changes
+    ?? changeRequest?.changes_json
+    ?? changeRequest?.changesJson
+    ?? null;
+
+  if (!rawChanges) {
+    return null;
+  }
+
+  if (typeof rawChanges === "object" && !Array.isArray(rawChanges)) {
+    return rawChanges;
+  }
+
+  if (typeof rawChanges !== "string") {
+    return null;
+  }
+
+  try {
+    const parsedChanges = JSON.parse(rawChanges);
+    return parsedChanges && typeof parsedChanges === "object" && !Array.isArray(parsedChanges)
+      ? parsedChanges
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function getChangeRequestProposedStartDateTime(changeRequest) {
+  const changes = parseChangeRequestChanges(changeRequest);
+  return parseDateInput(
+    changes?.requested_start_datetime
+    ?? changes?.booking_start_datetime
+    ?? changeRequest?.requested_start_datetime
+    ?? changeRequest?.booking_start_datetime
+    ?? null
+  );
+}
+
+function hasBookingAdvancedAfterChangeRequest(changeRequest, booking) {
+  const createdAt = parseDateInput(changeRequest?.created_at ?? changeRequest?.createdAt);
+  if (!createdAt || !booking || typeof booking !== "object") {
+    return false;
+  }
+
+  const lifecycleAdvancedDates = [
+    booking.accepted_at,
+    booking.started_at,
+    booking.finished_at,
+    booking.canceled_at,
+    booking.expired_at,
+  ]
+    .map((value) => parseDateInput(value))
+    .filter(Boolean);
+
+  return lifecycleAdvancedDates.some(
+    (advancedAt) => advancedAt.getTime() >= createdAt.getTime()
+  );
+}
+
 function hasBookingChangeRequestExpired(changeRequest, {
   now = new Date(),
-  ttlMs = ONE_DAY_MS,
+  booking = null,
 } = {}) {
+  if (!changeRequest || typeof changeRequest !== "object") {
+    return false;
+  }
+
   const normalizedStatus = normalizeBookingChangeRequestStatus(
     changeRequest?.status,
     "pending"
@@ -624,17 +688,32 @@ function hasBookingChangeRequestExpired(changeRequest, {
     return false;
   }
 
-  const createdAt = parseDateInput(changeRequest?.created_at ?? changeRequest?.createdAt);
   const normalizedNow = parseDateInput(now) || new Date();
-  const normalizedTtlMs = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0
-    ? Number(ttlMs)
-    : ONE_DAY_MS;
-
-  if (!createdAt) {
-    return false;
+  const originalStartDateTime = parseDateInput(
+    booking?.requested_start_datetime
+    ?? booking?.booking_start_datetime
+    ?? null
+  );
+  if (
+    originalStartDateTime
+    && originalStartDateTime.getTime() <= normalizedNow.getTime()
+  ) {
+    return true;
   }
 
-  return normalizedNow.getTime() >= createdAt.getTime() + normalizedTtlMs;
+  const proposedStartDateTime = getChangeRequestProposedStartDateTime(changeRequest);
+  if (
+    proposedStartDateTime
+    && proposedStartDateTime.getTime() <= normalizedNow.getTime()
+  ) {
+    return true;
+  }
+
+  if (booking && typeof booking === "object" && !canEditBooking(booking)) {
+    return true;
+  }
+
+  return hasBookingAdvancedAfterChangeRequest(changeRequest, booking);
 }
 
 function buildTransitionPatch(

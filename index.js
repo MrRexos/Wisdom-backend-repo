@@ -615,12 +615,6 @@ const mapStatus = (piStatus) => {
 
 // Helpers adicionales para pagos
 const stableKey = (parts) => parts.join(':');
-const BOOKING_CHANGE_REQUEST_TTL_MS = (
-  Number.isFinite(Number(process.env.BOOKING_CHANGE_REQUEST_TTL_MS))
-  && Number(process.env.BOOKING_CHANGE_REQUEST_TTL_MS) > 0
-)
-  ? Number(process.env.BOOKING_CHANGE_REQUEST_TTL_MS)
-  : 24 * 60 * 60 * 1000;
 
 // Redondeos consistentes con frontend (BookingScreen)
 const round1 = (n) => {
@@ -1955,7 +1949,16 @@ function mapBookingRecordForApi(row = {}) {
     : closureProposalId !== null && closureProposalId !== undefined;
   const hasOpenIssueReport = row.open_issue_report_id !== null
     && row.open_issue_report_id !== undefined;
-  const latestChangeRequest = mapEmbeddedBookingChangeRequestForApi(row);
+  const rawLatestChangeRequest = mapEmbeddedBookingChangeRequestForApi(row);
+  const latestChangeRequest = (
+    rawLatestChangeRequest?.status === 'pending'
+    && hasBookingChangeRequestExpired(rawLatestChangeRequest, {
+      booking: row,
+      now: new Date(),
+    })
+  )
+    ? { ...rawLatestChangeRequest, status: 'expired' }
+    : rawLatestChangeRequest;
   const hasPendingChangeRequest = latestChangeRequest?.status === 'pending';
   const baseCanEditBooking = canEditBooking({
     service_status: normalizedServiceStatus,
@@ -2131,9 +2134,11 @@ async function transitionBookingStateRecord(connection, currentBooking, {
   note = null,
   extraPatch = {},
 }) {
+  const transitionNow = new Date();
   const transition = buildTransitionPatch(currentBooking, {
     nextServiceStatus,
     nextSettlementStatus,
+    now: transitionNow,
   });
   const patch = { ...transition.patch, ...extraPatch };
   const patchEntries = Object.entries(patch).filter(([, value]) => typeof value !== 'undefined');
@@ -2165,6 +2170,13 @@ async function transitionBookingStateRecord(connection, currentBooking, {
       note,
     });
   }
+
+  await expirePendingBookingChangeRequestsForBooking(connection, {
+    ...currentBooking,
+    ...patch,
+  }, {
+    now: transitionNow,
+  });
 
   return {
     ...transition,
@@ -3157,7 +3169,7 @@ async function expirePendingBookingChangeRequestsForBooking(connection, booking,
 
   const [rows] = await connection.query(
     `
-    SELECT id, booking_id, status, created_at
+    SELECT id, booking_id, status, changes_json, created_at
     FROM booking_change_request
     WHERE booking_id = ?
       AND status = 'pending'
@@ -3170,10 +3182,9 @@ async function expirePendingBookingChangeRequestsForBooking(connection, booking,
   const expiredIds = [];
   for (const row of rows || []) {
     const shouldExpire = force
-      || !canEditBooking(booking)
       || hasBookingChangeRequestExpired(row, {
         now,
-        ttlMs: BOOKING_CHANGE_REQUEST_TTL_MS,
+        booking,
       });
 
     if (!shouldExpire) {
@@ -7718,7 +7729,13 @@ cron.schedule('*/10 * * * *', async () => {
           SELECT
             id,
             service_status,
-            settlement_status
+            settlement_status,
+            requested_start_datetime,
+            accepted_at,
+            started_at,
+            finished_at,
+            canceled_at,
+            expired_at
           FROM booking
           WHERE id = ?
           LIMIT 1

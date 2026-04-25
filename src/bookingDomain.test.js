@@ -482,25 +482,109 @@ test("shouldResetBookingToAcceptedAfterFutureReschedule only resets in-progress 
   );
 });
 
-test("hasBookingChangeRequestExpired only expires pending requests once the ttl is reached", () => {
+test("hasBookingChangeRequestExpired does not apply a fixed ttl", () => {
+  assert.equal(
+    hasBookingChangeRequestExpired(null, {
+      booking: {
+        service_status: "accepted",
+        settlement_status: "none",
+        requested_start_datetime: "2026-03-29T11:00:00.000Z",
+      },
+      now: "2026-03-29T12:00:00.000Z",
+    }),
+    false
+  );
+
   assert.equal(
     hasBookingChangeRequestExpired(
       { status: "pending", created_at: "2026-03-29T10:00:00.000Z" },
-      { now: "2026-03-30T09:59:59.000Z" }
+      {
+        booking: { service_status: "accepted", settlement_status: "none" },
+        now: "2026-04-02T10:00:00.000Z",
+      }
     ),
     false
   );
+});
+
+test("hasBookingChangeRequestExpired expires at the original or proposed start", () => {
   assert.equal(
     hasBookingChangeRequestExpired(
       { status: "pending", created_at: "2026-03-29T10:00:00.000Z" },
-      { now: "2026-03-30T10:00:00.000Z" }
+      {
+        booking: {
+          service_status: "accepted",
+          settlement_status: "none",
+          requested_start_datetime: "2026-03-30T10:00:00.000Z",
+        },
+        now: "2026-03-30T10:00:00.000Z",
+      }
     ),
     true
   );
+
+  assert.equal(
+    hasBookingChangeRequestExpired(
+      {
+        status: "pending",
+        created_at: "2026-03-29T10:00:00.000Z",
+        changes_json: JSON.stringify({
+          requested_start_datetime: "2026-03-30T09:00:00.000Z",
+        }),
+      },
+      {
+        booking: { service_status: "accepted", settlement_status: "none" },
+        now: "2026-03-30T09:00:00.000Z",
+      }
+    ),
+    true
+  );
+});
+
+test("hasBookingChangeRequestExpired expires when the booking advances after the request", () => {
+  assert.equal(
+    hasBookingChangeRequestExpired(
+      { status: "pending", created_at: "2026-03-29T10:00:00.000Z" },
+      {
+        booking: {
+          service_status: "in_progress",
+          settlement_status: "none",
+          started_at: "2026-03-29T10:15:00.000Z",
+        },
+        now: "2026-03-29T10:20:00.000Z",
+      }
+    ),
+    true
+  );
+
+  assert.equal(
+    hasBookingChangeRequestExpired(
+      { status: "pending", created_at: "2026-03-29T10:30:00.000Z" },
+      {
+        booking: {
+          service_status: "in_progress",
+          settlement_status: "none",
+          started_at: "2026-03-29T10:15:00.000Z",
+        },
+        now: "2026-03-29T10:40:00.000Z",
+      }
+    ),
+    false
+  );
+});
+
+test("hasBookingChangeRequestExpired ignores resolved requests", () => {
   assert.equal(
     hasBookingChangeRequestExpired(
       { status: "accepted", created_at: "2026-03-29T10:00:00.000Z" },
-      { now: "2026-03-30T12:00:00.000Z" }
+      {
+        booking: {
+          service_status: "accepted",
+          settlement_status: "none",
+          requested_start_datetime: "2026-03-29T11:00:00.000Z",
+        },
+        now: "2026-03-29T12:00:00.000Z",
+      }
     ),
     false
   );
