@@ -615,6 +615,7 @@ const mapStatus = (piStatus) => {
 
 // Helpers adicionales para pagos
 const stableKey = (parts) => parts.join(':');
+const MAX_OPEN_GENERAL_PROBLEM_ISSUES_PER_BOOKING = 5;
 
 // Redondeos consistentes con frontend (BookingScreen)
 const round1 = (n) => {
@@ -1949,6 +1950,10 @@ function mapBookingRecordForApi(row = {}) {
     : closureProposalId !== null && closureProposalId !== undefined;
   const hasOpenIssueReport = row.open_issue_report_id !== null
     && row.open_issue_report_id !== undefined;
+  const openGeneralProblemIssueCount = Math.max(
+    0,
+    Number(row.open_general_problem_issue_count ?? 0) || 0
+  );
   const rawLatestChangeRequest = mapEmbeddedBookingChangeRequestForApi(row);
   const latestChangeRequest = (
     rawLatestChangeRequest?.status === 'pending'
@@ -2047,6 +2052,7 @@ function mapBookingRecordForApi(row = {}) {
     closure_auto_charge_scheduled_at: row.auto_charge_scheduled_at ?? null,
     has_active_closure_proposal: hasActiveClosureProposal,
     has_open_issue_report: hasOpenIssueReport,
+    open_general_problem_issue_count: openGeneralProblemIssueCount,
     has_pending_change_request: hasPendingChangeRequest,
     has_actionable_change_request: isActionableChangeRequest,
     latest_change_request: latestChangeRequest,
@@ -13171,6 +13177,13 @@ app.get('/api/bookings/:id', authenticateToken, async (req, res) => {
         bir.status AS open_issue_status,
         bir.reported_by_user_id AS open_issue_reported_by_user_id,
         bir.created_at AS open_issue_created_at,
+        (
+          SELECT COUNT(*)
+          FROM booking_issue_report bir_general
+          WHERE bir_general.booking_id = b.id
+            AND bir_general.issue_type = 'general_problem'
+            AND bir_general.status = 'open'
+        ) AS open_general_problem_issue_count,
         bcr.id AS change_request_id,
         bcr.requested_by_user_id AS change_request_requested_by_user_id,
         bcr.target_user_id AS change_request_target_user_id,
@@ -14870,23 +14883,6 @@ app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
       });
     }
 
-    const [[existingOpenIssue]] = await connection.query(
-      `
-      SELECT id
-      FROM booking_issue_report
-      WHERE booking_id = ? AND status = 'open'
-      ORDER BY created_at DESC, id DESC
-      LIMIT 1
-      FOR UPDATE
-      `,
-      [bookingId]
-    );
-
-    if (existingOpenIssue) {
-      await connection.rollback();
-      return res.status(409).json({ error: 'Ya existe una incidencia abierta para esta reserva.' });
-    }
-
     const allowedIssueTypes = new Set(['general_problem']);
     if (isProviderOwner) {
       allowedIssueTypes.add('no_show_client');
@@ -14900,14 +14896,54 @@ app.post('/api/bookings/:id/issues', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'issue_type inválido para este usuario.' });
     }
 
+    const rawDetails = typeof req.body?.details === 'string' ? req.body.details.trim() : '';
+    if (issueType === 'general_problem' && !rawDetails) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'El comentario es obligatorio para reportar un problema.' });
+    }
+
+    if (issueType === 'general_problem') {
+      const [openGeneralProblemIssues] = await connection.query(
+        `
+        SELECT id
+        FROM booking_issue_report
+        WHERE booking_id = ?
+          AND issue_type = 'general_problem'
+          AND status = 'open'
+        ORDER BY created_at DESC, id DESC
+        FOR UPDATE
+        `,
+        [bookingId]
+      );
+
+      if ((openGeneralProblemIssues || []).length >= MAX_OPEN_GENERAL_PROBLEM_ISSUES_PER_BOOKING) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'Ya hay 5 incidencias generales abiertas para esta reserva.' });
+      }
+    } else {
+      const [[existingOpenIssue]] = await connection.query(
+        `
+        SELECT id
+        FROM booking_issue_report
+        WHERE booking_id = ? AND status = 'open'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [bookingId]
+      );
+
+      if (existingOpenIssue) {
+        await connection.rollback();
+        return res.status(409).json({ error: 'Ya existe una incidencia abierta para esta reserva.' });
+      }
+    }
+
     const defaultDetailsByType = {
-      general_problem: 'Incidencia reportada desde la app.',
       no_show_client: 'El cliente no se ha presentado.',
       no_show_provider: 'El profesional no se ha presentado.',
     };
-    const details = typeof req.body?.details === 'string' && req.body.details.trim()
-      ? req.body.details.trim()
-      : defaultDetailsByType[issueType];
+    const details = rawDetails || defaultDetailsByType[issueType];
     const reportedAgainstUserId = isClientOwner
       ? booking.provider_user_id_snapshot
       : booking.client_user_id;
