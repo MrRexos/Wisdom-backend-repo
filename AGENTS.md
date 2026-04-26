@@ -32,6 +32,17 @@
 - `expires_at` (DATETIME, NOT NULL)
 - `revoked_at` (DATETIME, NULL)
 
+## Tabla: `auth_session_refresh_token`
+- `id` (BIGINT UNSIGNED, PK, auto_increment, NOT NULL)
+- `session_id` (BIGINT UNSIGNED, FK -> auth_session.id, NOT NULL)
+- `refresh_token_hash` (CHAR(64), UNIQUE, NOT NULL)
+- `status` (ENUM('active','rotated','reused','revoked'), NOT NULL, DEFAULT active)
+- `created_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `rotated_at` (DATETIME, NULL)
+- `reused_at` (DATETIME, NULL)
+- `revoked_at` (DATETIME, NULL)
+- `expires_at` (DATETIME, NOT NULL)
+
 ## Tabla: `booking`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
 - `client_user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
@@ -431,6 +442,11 @@
 
 ### Tabla: `auth_session`
 - `id`: **PK** (Key Name: `PRIMARY`)
+
+### Tabla: `auth_session_refresh_token`
+- `id`: **PK** (Key Name: `PRIMARY`)
+- `session_id`: **FK** -> `auth_session`.`id` (Key Name: `fk_asrt_session`, ON DELETE CASCADE, ON UPDATE NO ACTION)
+- `refresh_token_hash`: **UNIQUE** (Key Name: `ux_asrt_hash`)
 
 ### Tabla: `booking`
 - `id`: **PK** (Key Name: `PRIMARY`)

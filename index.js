@@ -418,38 +418,71 @@ function authenticateToken(req, res, next) {
       .json({ error: 'missing_token' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
-    if (err) {
-      if (err.name === 'TokenExpiredError') {
-        return res.status(401)
-          .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="token expired"')
-          .json({ error: 'token_expired' });
-      }
+  let payload;
+  try {
+    payload = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
       return res.status(401)
-        .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="invalid token"')
-        .json({ error: 'invalid_token' });
+        .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="token expired"')
+        .json({ error: 'token_expired' });
+    }
+    return res.status(401)
+      .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="invalid token"')
+      .json({ error: 'invalid_token' });
+  }
+
+  if (isGuestTokenPayload(payload)) {
+    if (!isGuestAllowedRequest(req)) {
+      return res.status(403).json({ error: 'guest_not_allowed' });
     }
 
-    if (isGuestTokenPayload(payload)) {
-      if (!isGuestAllowedRequest(req)) {
-        return res.status(403).json({ error: 'guest_not_allowed' });
+    req.user = {
+      id: null,
+      guest: true,
+      token_type: 'guest',
+      scope: payload.scope || 'browse:read',
+      guest_session_id: payload.guest_session_id || null,
+      exp: payload.exp,
+      iat: payload.iat,
+    };
+    return next();
+  }
+
+  const userId = payload.id || payload.sub;
+  const sessionId = normalizeNullableInteger(payload.sid);
+  if (!sessionId || !userId) {
+    req.user = { id: userId, ...payload };
+    return next();
+  }
+
+  promisePool.query(
+    `SELECT revoked_at, expires_at
+     FROM auth_session
+     WHERE id = ? AND user_id = ?
+     LIMIT 1`,
+    [sessionId, userId]
+  )
+    .then(([rows]) => {
+      const session = rows[0] || null;
+      const expiresAt = parseDateTimeInput(session?.expires_at);
+      if (
+        !session
+        || session.revoked_at
+        || (expiresAt && expiresAt.getTime() <= Date.now())
+      ) {
+        return res.status(401)
+          .set('WWW-Authenticate', 'Bearer error="invalid_token", error_description="session revoked"')
+          .json({ error: 'invalid_token' });
       }
 
-      req.user = {
-        id: null,
-        guest: true,
-        token_type: 'guest',
-        scope: payload.scope || 'browse:read',
-        guest_session_id: payload.guest_session_id || null,
-        exp: payload.exp,
-        iat: payload.iat,
-      };
+      req.user = { id: userId, ...payload };
       return next();
-    }
-
-    req.user = { id: payload.id || payload.sub, ...payload };
-    next();
-  });
+    })
+    .catch((error) => {
+      console.error('Error validating auth session:', error);
+      return res.status(500).json({ error: 'auth_session_validation_failed' });
+    });
 }
 
 //Formats dates and times in English (GB)
@@ -5942,6 +5975,352 @@ async function openBookingIssueDispute(bookingId, {
   }
 }
 
+async function resolvePaymentIntentIdFromStripeDispute(dispute) {
+  const directPaymentIntentId = getStripeObjectId(dispute?.payment_intent);
+  if (directPaymentIntentId) {
+    return directPaymentIntentId;
+  }
+
+  const chargePaymentIntentId = getStripeObjectId(dispute?.charge?.payment_intent);
+  if (chargePaymentIntentId) {
+    return chargePaymentIntentId;
+  }
+
+  const chargeId = getStripeObjectId(dispute?.charge);
+  if (!chargeId) {
+    return null;
+  }
+
+  const charge = await stripe.charges.retrieve(chargeId);
+  return getStripeObjectId(charge?.payment_intent);
+}
+
+function buildStripeDisputeIssueDetails({ dispute, eventType, paymentIntentId }) {
+  const disputeId = getStripeObjectId(dispute) || 'desconocida';
+  const status = normalizeNullableText(dispute?.status) || 'desconocido';
+  const reason = normalizeNullableText(dispute?.reason) || 'desconocido';
+  const currency = normalizeCurrencyCode(dispute?.currency, null);
+  const amountCents = normalizeStripeAmountCents(dispute?.amount);
+  const amountText = amountCents > 0
+    ? `${fromMinorUnits(amountCents, currency || 'EUR')} ${currency || ''}`.trim()
+    : 'importe desconocido';
+
+  return `Stripe notificó una disputa (${eventType}) para el PaymentIntent ${paymentIntentId || 'desconocido'}. Disputa: ${disputeId}. Estado: ${status}. Motivo: ${reason}. Importe: ${amountText}. El payout del profesional queda bloqueado o en reverso hasta revisión manual.`;
+}
+
+async function updateProviderPayoutStatusAfterStripeDispute(paymentId, status) {
+  const normalizedPaymentId = normalizeNullableInteger(paymentId);
+  const normalizedStatus = String(status || '').trim().toLowerCase();
+  if (!normalizedPaymentId || !['partially_reversed', 'reversed'].includes(normalizedStatus)) {
+    return;
+  }
+
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.query(
+      `UPDATE payments
+          SET provider_payout_status = ?,
+              provider_payout_eligible_at = NULL
+        WHERE id = ?`,
+      [normalizedStatus, normalizedPaymentId]
+    );
+    await connection.commit();
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function markStripeDisputePayoutReversalForManualReview({
+  bookingId,
+  paymentIntentId,
+  disputeId,
+  error,
+}) {
+  const errorMessage = String(error?.message || error || 'Error desconocido');
+  await markBookingSettlementForReview(bookingId, {
+    nextSettlementStatus: 'in_dispute',
+    reasonCode: 'stripe_dispute_provider_payout_reversal_failed',
+    details: `No se pudo revertir automáticamente el payout del profesional tras la disputa de Stripe ${disputeId || 'desconocida'} para el PaymentIntent ${paymentIntentId || 'desconocido'}. Error: ${errorMessage}`,
+    issueType: 'payment_dispute',
+  });
+}
+
+async function protectBookingForStripeDispute(paymentIntentId, {
+  dispute = null,
+  eventType = 'charge.dispute.created',
+} = {}) {
+  const normalizedPaymentIntentId = typeof paymentIntentId === 'string' ? paymentIntentId.trim() : '';
+  if (!normalizedPaymentIntentId) {
+    return { protected: false, reason: 'missing_payment_intent' };
+  }
+
+  const disputeId = getStripeObjectId(dispute);
+  const details = buildStripeDisputeIssueDetails({
+    dispute,
+    eventType,
+    paymentIntentId: normalizedPaymentIntentId,
+  });
+  const connection = await pool.promise().getConnection();
+  let bookingId = null;
+  let releasedPayoutRows = [];
+  let missingTransferRows = [];
+  let blockedPendingPayoutCount = 0;
+
+  try {
+    await connection.beginTransaction();
+
+    const [[payment]] = await connection.query(
+      `SELECT id, booking_id, type, payment_intent_id, amount_cents, currency
+       FROM payments
+       WHERE payment_intent_id = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedPaymentIntentId]
+    );
+
+    if (!payment?.booking_id) {
+      await connection.rollback();
+      return { protected: false, reason: 'payment_not_found' };
+    }
+
+    bookingId = payment.booking_id;
+    const booking = await getBookingSettlementContext(connection, bookingId, { forUpdate: true });
+
+    await connection.query(
+      `UPDATE payments
+          SET status = 'dispute_open',
+              last_error_code = ?,
+              last_error_message = ?
+        WHERE payment_intent_id = ?`,
+      [
+        String(eventType || 'stripe_dispute_open').slice(0, 64),
+        `Stripe dispute ${disputeId || 'unknown'} opened`.slice(0, 255),
+        normalizedPaymentIntentId,
+      ]
+    );
+
+    if (booking) {
+      await upsertBookingIssueReport(connection, {
+        bookingId,
+        reportedAgainstUserId: booking.provider_user_id_snapshot || booking.effective_provider_user_id || null,
+        issueType: 'payment_dispute',
+        status: 'open',
+        details,
+      });
+
+      await transitionBookingStateRecord(connection, booking, {
+        nextServiceStatus: booking.service_status,
+        nextSettlementStatus: 'in_dispute',
+        reasonCode: 'stripe_dispute_opened',
+        extraPatch: {
+          client_approval_deadline_at: null,
+        },
+      });
+    }
+
+    const [payoutRows] = await connection.query(
+      `SELECT id,
+              booking_id,
+              type,
+              payment_intent_id,
+              provider_payout_amount_cents,
+              provider_payout_status,
+              provider_payout_transfer_id
+       FROM payments
+       WHERE booking_id = ?
+         AND provider_payout_amount_cents IS NOT NULL
+         AND provider_payout_amount_cents > 0
+         AND provider_payout_status IN ('pending_release','released','partially_reversed')
+       FOR UPDATE`,
+      [bookingId]
+    );
+
+    const pendingPayoutIds = payoutRows
+      .filter((row) => String(row.provider_payout_status || '').trim().toLowerCase() === 'pending_release')
+      .map((row) => row.id);
+
+    if (pendingPayoutIds.length > 0) {
+      const placeholders = pendingPayoutIds.map(() => '?').join(', ');
+      await connection.query(
+        `UPDATE payments
+            SET provider_payout_status = 'reversed',
+                provider_payout_eligible_at = NULL
+          WHERE id IN (${placeholders})`,
+        pendingPayoutIds
+      );
+      blockedPendingPayoutCount = pendingPayoutIds.length;
+    }
+
+    releasedPayoutRows = payoutRows.filter((row) => {
+      const payoutStatus = String(row.provider_payout_status || '').trim().toLowerCase();
+      return ['released', 'partially_reversed'].includes(payoutStatus)
+        && row.provider_payout_transfer_id;
+    });
+
+    missingTransferRows = payoutRows.filter((row) => {
+      const payoutStatus = String(row.provider_payout_status || '').trim().toLowerCase();
+      return ['released', 'partially_reversed'].includes(payoutStatus)
+        && !row.provider_payout_transfer_id;
+    });
+
+    await connection.commit();
+    return sessionResult.insertId;
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  for (const row of missingTransferRows) {
+    await markStripeDisputePayoutReversalForManualReview({
+      bookingId,
+      paymentIntentId: row.payment_intent_id || normalizedPaymentIntentId,
+      disputeId,
+      error: new Error('El payout figura como liberado pero no tiene transfer asociado.'),
+    });
+  }
+
+  let reversedReleasedPayoutCount = 0;
+  let failedReleasedPayoutReversalCount = 0;
+  for (const row of releasedPayoutRows) {
+    const targetAmountCents = normalizeStripeAmountCents(row.provider_payout_amount_cents);
+    if (targetAmountCents <= 0) {
+      continue;
+    }
+
+    try {
+      const reversalResult = await reverseProviderPayoutTransferForPayment(row, {
+        targetReversalAmountCents: targetAmountCents,
+        metadata: {
+          booking_id: String(bookingId),
+          payment_intent_id: row.payment_intent_id || normalizedPaymentIntentId,
+          stripe_dispute_id: disputeId || '',
+          source: 'stripe_dispute_provider_payout_reversal',
+        },
+      });
+      const nextPayoutStatus = reversalResult.reversedAmountCents >= targetAmountCents
+        ? 'reversed'
+        : 'partially_reversed';
+      await updateProviderPayoutStatusAfterStripeDispute(row.id, nextPayoutStatus);
+      reversedReleasedPayoutCount += 1;
+
+      if (nextPayoutStatus !== 'reversed') {
+        await markStripeDisputePayoutReversalForManualReview({
+          bookingId,
+          paymentIntentId: row.payment_intent_id || normalizedPaymentIntentId,
+          disputeId,
+          error: new Error('El payout liberado solo se pudo revertir parcialmente.'),
+        });
+      }
+    } catch (error) {
+      failedReleasedPayoutReversalCount += 1;
+      console.error('Error reversing provider payout after Stripe dispute:', {
+        bookingId,
+        paymentIntentId: row.payment_intent_id || normalizedPaymentIntentId,
+        disputeId,
+        error: error.message,
+      });
+      await markStripeDisputePayoutReversalForManualReview({
+        bookingId,
+        paymentIntentId: row.payment_intent_id || normalizedPaymentIntentId,
+        disputeId,
+        error,
+      });
+    }
+  }
+
+  return {
+    protected: true,
+    bookingId,
+    blockedPendingPayoutCount,
+    reversedReleasedPayoutCount,
+    failedReleasedPayoutReversalCount,
+  };
+}
+
+async function syncBookingForStripeDisputeOutcome(paymentIntentId, {
+  dispute = null,
+  eventType = 'charge.dispute.closed',
+  won = false,
+} = {}) {
+  const normalizedPaymentIntentId = typeof paymentIntentId === 'string' ? paymentIntentId.trim() : '';
+  if (!normalizedPaymentIntentId) {
+    return { synced: false, reason: 'missing_payment_intent' };
+  }
+
+  const details = buildStripeDisputeIssueDetails({
+    dispute,
+    eventType,
+    paymentIntentId: normalizedPaymentIntentId,
+  });
+  const nextPaymentStatus = won ? 'dispute_won' : 'dispute_lost';
+  const connection = await pool.promise().getConnection();
+
+  try {
+    await connection.beginTransaction();
+    const [[payment]] = await connection.query(
+      `SELECT id, booking_id
+       FROM payments
+       WHERE payment_intent_id = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedPaymentIntentId]
+    );
+
+    if (!payment?.booking_id) {
+      await connection.rollback();
+      return { synced: false, reason: 'payment_not_found' };
+    }
+
+    await connection.query(
+      `UPDATE payments
+          SET status = ?,
+              last_error_code = ?,
+              last_error_message = ?
+        WHERE id = ?`,
+      [
+        nextPaymentStatus,
+        String(eventType || nextPaymentStatus).slice(0, 64),
+        `Stripe dispute ${getStripeObjectId(dispute) || 'unknown'} ${won ? 'won' : 'lost'}`.slice(0, 255),
+        payment.id,
+      ]
+    );
+
+    const booking = await getBookingSettlementContext(connection, payment.booking_id, { forUpdate: true });
+    if (booking) {
+      await upsertBookingIssueReport(connection, {
+        bookingId: payment.booking_id,
+        reportedAgainstUserId: booking.provider_user_id_snapshot || booking.effective_provider_user_id || null,
+        issueType: 'payment_dispute',
+        status: 'open',
+        details,
+      });
+
+      await transitionBookingStateRecord(connection, booking, {
+        nextServiceStatus: booking.service_status,
+        nextSettlementStatus: 'in_dispute',
+        reasonCode: won ? 'stripe_dispute_won' : 'stripe_dispute_lost',
+        extraPatch: {
+          client_approval_deadline_at: null,
+        },
+      });
+    }
+
+    await connection.commit();
+    return { synced: true, bookingId: payment.booking_id, paymentStatus: nextPaymentStatus };
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 async function processCanceledBookingIssueOutcome(bookingId, {
   issueType,
   changedByUserId = null,
@@ -8674,9 +9053,9 @@ async function fetchSanitizedUserById(userId) {
 }
 
 async function issueAuthTokens(userId, req) {
-  const access_token = signAccessToken({ id: userId });
   const refresh_token = generateRefreshToken();
-  await persistRefreshToken(userId, refresh_token, req);
+  const sessionId = await persistRefreshToken(userId, refresh_token, req);
+  const access_token = signAccessToken({ id: userId, sid: sessionId });
 
   return {
     token: access_token,
@@ -9013,74 +9392,317 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+function buildRefreshTokenExpiresAt() {
+  const ttlDays = Number.isFinite(REFRESH_TOKEN_TTL_DAYS) && REFRESH_TOKEN_TTL_DAYS > 0
+    ? REFRESH_TOKEN_TTL_DAYS
+    : 30;
+  return new Date(Date.now() + ttlDays * 24 * 60 * 60 * 1000);
+}
+
+let authSessionRefreshTokenSchemaPromise = null;
+
+async function ensureAuthSessionRefreshTokenSchema() {
+  if (!authSessionRefreshTokenSchemaPromise) {
+    authSessionRefreshTokenSchemaPromise = promisePool.query(`
+      CREATE TABLE IF NOT EXISTS auth_session_refresh_token (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        session_id BIGINT UNSIGNED NOT NULL,
+        refresh_token_hash CHAR(64) NOT NULL,
+        status ENUM('active','rotated','reused','revoked') NOT NULL DEFAULT 'active',
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        rotated_at DATETIME NULL,
+        reused_at DATETIME NULL,
+        revoked_at DATETIME NULL,
+        expires_at DATETIME NOT NULL,
+        PRIMARY KEY (id),
+        UNIQUE KEY ux_asrt_hash (refresh_token_hash),
+        KEY idx_asrt_session_status (session_id, status),
+        CONSTRAINT fk_asrt_session
+          FOREIGN KEY (session_id) REFERENCES auth_session(id)
+          ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `)
+      .catch((error) => {
+        authSessionRefreshTokenSchemaPromise = null;
+        throw error;
+      });
+  }
+
+  return authSessionRefreshTokenSchemaPromise;
+}
+
+async function markRefreshTokenReuseAndRevokeSession(connection, sessionId, reusedHash) {
+  await connection.query(
+    `UPDATE auth_session
+        SET revoked_at = COALESCE(revoked_at, NOW())
+      WHERE id = ?`,
+    [sessionId]
+  );
+
+  await connection.query(
+    `UPDATE auth_session_refresh_token
+        SET status = CASE
+              WHEN refresh_token_hash = ? THEN 'reused'
+              WHEN status = 'active' THEN 'revoked'
+              ELSE status
+            END,
+            reused_at = CASE
+              WHEN refresh_token_hash = ? THEN COALESCE(reused_at, NOW())
+              ELSE reused_at
+            END,
+            revoked_at = COALESCE(revoked_at, NOW())
+      WHERE session_id = ?`,
+    [reusedHash, reusedHash, sessionId]
+  );
+}
+
 async function persistRefreshToken(userId, refreshToken, req) {
+  await ensureAuthSessionRefreshTokenSchema();
+
   const refreshHash = hashToken(refreshToken);
-  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+  const expiresAt = buildRefreshTokenExpiresAt();
   const ua = req.headers['user-agent'] || null;
   // req.ip funciona; si estás detrás de proxy, considera app.set('trust proxy', 1)
   const ip = (req.headers['x-forwarded-for'] || req.ip || '').toString().substring(0, 45) || null;
 
-  await pool.promise().query(
-    `INSERT INTO auth_session (user_id, refresh_token_hash, user_agent, ip, expires_at)
-     VALUES (?, ?, ?, ?, ?)`,
-    [userId, refreshHash, ua, ip, expiresAt]
-  );
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [sessionResult] = await connection.query(
+      `INSERT INTO auth_session (user_id, refresh_token_hash, user_agent, ip, expires_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [userId, refreshHash, ua, ip, expiresAt]
+    );
+
+    await connection.query(
+      `INSERT INTO auth_session_refresh_token
+        (session_id, refresh_token_hash, status, expires_at)
+       VALUES (?, ?, 'active', ?)`,
+      [sessionResult.insertId, refreshHash, expiresAt]
+    );
+
+    await connection.commit();
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function rotateRefreshToken(oldToken) {
+  await ensureAuthSessionRefreshTokenSchema();
+
   const oldHash = hashToken(oldToken);
+  const connection = await pool.promise().getConnection();
 
-  // Busca la sesión vigente por hash
-  const [rows] = await pool.promise().query(
-    `SELECT id, user_id
-       FROM auth_session
-      WHERE refresh_token_hash = ?
-        AND revoked_at IS NULL
-        AND expires_at > NOW()
-      LIMIT 1`,
-    [oldHash]
-  );
-  if (!rows.length) return null; // token inválido/revocado/expirado
+  try {
+    await connection.beginTransaction();
 
-  const session = rows[0];
-  const newRefresh = generateRefreshToken();
-  const newHash = hashToken(newRefresh);
+    const [tokenRows] = await connection.query(
+      `SELECT
+          rt.id AS token_id,
+          rt.session_id,
+          rt.status AS token_status,
+          rt.revoked_at AS token_revoked_at,
+          rt.expires_at AS token_expires_at,
+          s.user_id,
+          s.revoked_at AS session_revoked_at,
+          s.expires_at AS session_expires_at
+        FROM auth_session_refresh_token rt
+        INNER JOIN auth_session s ON s.id = rt.session_id
+        WHERE rt.refresh_token_hash = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [oldHash]
+    );
 
-  // Ventana deslizante: empuja SIEMPRE 30 días desde ahora
-  const days = Number(process.env.REFRESH_TOKEN_TTL_DAYS || 30);
+    let session = null;
+    let tokenId = null;
+    let legacySession = false;
 
-  const [result] = await pool.promise().query(
-    `UPDATE auth_session
-        SET refresh_token_hash = ?,
-            last_used_at = NOW(),
-            expires_at = NOW() + INTERVAL ${days} DAY
-      WHERE id = ?`,
-    [newHash, session.id]
-  );
+    if (tokenRows.length) {
+      const tokenRecord = tokenRows[0];
+      const tokenStatus = String(tokenRecord.token_status || '').trim().toLowerCase();
+      const sessionExpiredAt = parseDateTimeInput(tokenRecord.session_expires_at);
+      const tokenExpiredAt = parseDateTimeInput(tokenRecord.token_expires_at);
+      const isExpired =
+        (sessionExpiredAt && sessionExpiredAt.getTime() <= Date.now())
+        || (tokenExpiredAt && tokenExpiredAt.getTime() <= Date.now());
 
-  if (result.affectedRows !== 1) {
-    // Log defensivo para detectar carreras u otros problemas
-    console.error('rotateRefreshToken: no row updated', { sessionId: session.id });
-    return null;
+      if (tokenStatus !== 'active') {
+        await markRefreshTokenReuseAndRevokeSession(connection, tokenRecord.session_id, oldHash);
+        await connection.commit();
+        console.warn('Refresh token reuse detected; session revoked', {
+          sessionId: tokenRecord.session_id,
+          userId: tokenRecord.user_id,
+        });
+        return null;
+      }
+
+      if (tokenRecord.session_revoked_at || tokenRecord.token_revoked_at || isExpired) {
+        await connection.rollback();
+        return null;
+      }
+
+      session = {
+        id: tokenRecord.session_id,
+        user_id: tokenRecord.user_id,
+      };
+      tokenId = tokenRecord.token_id;
+    } else {
+      const [legacyRows] = await connection.query(
+        `SELECT id, user_id
+           FROM auth_session
+          WHERE refresh_token_hash = ?
+            AND revoked_at IS NULL
+            AND expires_at > NOW()
+          LIMIT 1
+          FOR UPDATE`,
+        [oldHash]
+      );
+
+      if (!legacyRows.length) {
+        await connection.rollback();
+        return null;
+      }
+
+      session = legacyRows[0];
+      legacySession = true;
+    }
+
+    const newRefresh = generateRefreshToken();
+    const newHash = hashToken(newRefresh);
+    const expiresAt = buildRefreshTokenExpiresAt();
+
+    const [result] = await connection.query(
+      `UPDATE auth_session
+          SET refresh_token_hash = ?,
+              last_used_at = NOW(),
+              expires_at = ?
+        WHERE id = ?
+          AND revoked_at IS NULL`,
+      [newHash, expiresAt, session.id]
+    );
+
+    if (result.affectedRows !== 1) {
+      console.error('rotateRefreshToken: no row updated', { sessionId: session.id });
+      await connection.rollback();
+      return null;
+    }
+
+    if (legacySession) {
+      await connection.query(
+        `INSERT IGNORE INTO auth_session_refresh_token
+          (session_id, refresh_token_hash, status, expires_at)
+         VALUES (?, ?, 'rotated', ?)`,
+        [session.id, oldHash, expiresAt]
+      );
+    } else {
+      await connection.query(
+        `UPDATE auth_session_refresh_token
+            SET status = 'rotated',
+                rotated_at = NOW()
+          WHERE id = ?`,
+        [tokenId]
+      );
+    }
+
+    await connection.query(
+      `INSERT INTO auth_session_refresh_token
+        (session_id, refresh_token_hash, status, expires_at)
+       VALUES (?, ?, 'active', ?)`,
+      [session.id, newHash, expiresAt]
+    );
+
+    await connection.commit();
+    return { userId: session.user_id, sessionId: session.id, refreshToken: newRefresh };
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
   }
-
-  return { userId: session.user_id, refreshToken: newRefresh };
 }
 
 async function revokeRefreshToken(token) {
+  await ensureAuthSessionRefreshTokenSchema();
+
   const hash = hashToken(token);
-  await pool.promise().query(
-    `UPDATE auth_session SET revoked_at = NOW() WHERE refresh_token_hash = ?`,
-    [hash]
-  );
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [tokenRows] = await connection.query(
+      `SELECT session_id
+       FROM auth_session_refresh_token
+       WHERE refresh_token_hash = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [hash]
+    );
+    const sessionId = tokenRows[0]?.session_id || null;
+
+    if (sessionId) {
+      await connection.query(
+        `UPDATE auth_session
+            SET revoked_at = COALESCE(revoked_at, NOW())
+          WHERE id = ?`,
+        [sessionId]
+      );
+      await connection.query(
+        `UPDATE auth_session_refresh_token
+            SET status = CASE WHEN status = 'reused' THEN status ELSE 'revoked' END,
+                revoked_at = COALESCE(revoked_at, NOW())
+          WHERE session_id = ?`,
+        [sessionId]
+      );
+    } else {
+      await connection.query(
+        `UPDATE auth_session SET revoked_at = COALESCE(revoked_at, NOW()) WHERE refresh_token_hash = ?`,
+        [hash]
+      );
+    }
+
+    await connection.commit();
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function revokeAllUserSessions(userId) {
-  await pool.promise().query(
-    `UPDATE auth_session SET revoked_at = NOW()
-     WHERE user_id = ? AND revoked_at IS NULL`,
-    [userId]
-  );
+  await ensureAuthSessionRefreshTokenSchema();
+
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
+
+    await connection.query(
+      `UPDATE auth_session SET revoked_at = COALESCE(revoked_at, NOW())
+       WHERE user_id = ? AND revoked_at IS NULL`,
+      [userId]
+    );
+
+    await connection.query(
+      `UPDATE auth_session_refresh_token rt
+       INNER JOIN auth_session s ON s.id = rt.session_id
+          SET rt.status = CASE WHEN rt.status = 'reused' THEN rt.status ELSE 'revoked' END,
+              rt.revoked_at = COALESCE(rt.revoked_at, NOW())
+        WHERE s.user_id = ?`,
+      [userId]
+    );
+
+    await connection.commit();
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 
@@ -10537,7 +11159,7 @@ app.post('/api/token/refresh', async (req, res) => {
       return res.status(401).json({ error: 'refresh_token inválido o caducado' });
     }
 
-    const access_token = signAccessToken({ id: rotated.userId });
+    const access_token = signAccessToken({ id: rotated.userId, sid: rotated.sessionId });
     return res.json({
       access_token,
       refresh_token: rotated.refreshToken,
@@ -21110,28 +21732,31 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
       case 'charge.dispute.created':
       case 'charge.dispute.funds_withdrawn': {
         const dispute = event.data.object;
-        const piId = dispute.charge?.payment_intent || dispute.payment_intent;
+        const piId = await resolvePaymentIntentIdFromStripeDispute(dispute);
         if (!piId) break;
-        await connection.beginTransaction();
-        await connection.query(
-          "UPDATE payments SET status = 'dispute_open' WHERE payment_intent_id = ?",
-          [piId]
-        );
-        await connection.commit();
+        await protectBookingForStripeDispute(piId, {
+          dispute,
+          eventType: event.type,
+        });
         break;
       }
       case 'charge.dispute.closed':
       case 'charge.dispute.funds_reinstated': {
         const dispute = event.data.object;
-        const piId = dispute.charge?.payment_intent || dispute.payment_intent;
+        const piId = await resolvePaymentIntentIdFromStripeDispute(dispute);
         if (!piId) break;
-        const won = dispute.status === 'won';
-        await connection.beginTransaction();
-        await connection.query(
-          "UPDATE payments SET status = ? WHERE payment_intent_id = ?",
-          [won ? 'dispute_won' : 'dispute_lost', piId]
-        );
-        await connection.commit();
+        const won = dispute.status === 'won' || event.type === 'charge.dispute.funds_reinstated';
+        if (!won) {
+          await protectBookingForStripeDispute(piId, {
+            dispute,
+            eventType: event.type,
+          });
+        }
+        await syncBookingForStripeDisputeOutcome(piId, {
+          dispute,
+          eventType: event.type,
+          won,
+        });
         break;
       }
 
