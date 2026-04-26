@@ -4970,7 +4970,7 @@ async function processPendingClosureAutoCharge(bookingId) {
   let autoChargeDecision = null;
   let transferGroup = `booking-${normalizedBookingId}`;
   let isSecondaryReminderWindow = false;
-  let shouldSendToleranceEmail = false;
+  let autoChargeNotificationMode = null;
 
   async function scheduleClosureFollowUpWindow({
     details,
@@ -5214,19 +5214,24 @@ async function processPendingClosureAutoCharge(bookingId) {
       depositPayment,
     });
     transferGroup = depositPayment.transfer_group || transferGroup;
-    shouldSendToleranceEmail = autoChargeDecision.needsAdjustmentNotice === true;
+    if (autoChargeDecision.needsAdjustmentNotice === true) {
+      autoChargeNotificationMode = 'within_tolerance';
+    } else if (autoChargeDecision.reason === 'within_estimate') {
+      autoChargeNotificationMode = 'within_estimate';
+    }
 
     if (settlementSnapshot.amountDueFromClientCents <= 0) {
       await connection.commit();
-      if (shouldSendToleranceEmail) {
+      if (autoChargeNotificationMode) {
         try {
           await sendClosureAutoChargeNotificationEmail({
             bookingId: normalizedBookingId,
-            mode: 'within_tolerance',
+            mode: autoChargeNotificationMode,
           });
         } catch (emailError) {
-          console.error('Error sending auto-charge tolerance email:', {
+          console.error('Error sending auto-charge notification email:', {
             bookingId: normalizedBookingId,
+            mode: autoChargeNotificationMode,
             error: emailError.message,
           });
         }
@@ -5310,15 +5315,16 @@ async function processPendingClosureAutoCharge(bookingId) {
     connection.release();
   }
 
-  if (shouldSendToleranceEmail) {
+  if (autoChargeNotificationMode) {
     try {
       await sendClosureAutoChargeNotificationEmail({
         bookingId: normalizedBookingId,
-        mode: 'within_tolerance',
+        mode: autoChargeNotificationMode,
       });
     } catch (emailError) {
-      console.error('Error sending auto-charge tolerance email:', {
+      console.error('Error sending auto-charge notification email:', {
         bookingId: normalizedBookingId,
+        mode: autoChargeNotificationMode,
         error: emailError.message,
       });
     }
@@ -6385,6 +6391,36 @@ function renderClosureAutoChargeEmail({ mode, booking }) {
   const estimatedText = booking?.estimatedTotal || 'No disponible';
   const amountDueText = booking?.amountDue || '0,00 €';
   const refundText = booking?.amountToRefund || '0,00 €';
+
+  if (normalizedMode === 'within_estimate') {
+    const subject = `Cierre automático de tu reserva ${bookingIdText}`;
+    const text = [
+      `Hola ${clientName},`,
+      '',
+      `Han pasado 48 horas desde que el profesional cerró la reserva ${bookingIdText} y no hemos recibido respuesta.`,
+      'Como el importe final no supera la estimación inicial, Wisdom cerrará la reserva automáticamente según las condiciones de la reserva.',
+      `Servicio: ${booking?.serviceTitle || 'Servicio sin título'}`,
+      `Importe estimado: ${estimatedText}`,
+      `Importe final: ${totalText}`,
+      `Pendiente por cobrar automáticamente: ${amountDueText}`,
+      `Reembolso previsto: ${refundText}`,
+      '',
+      'Si crees que hay un problema, puedes revisar la reserva desde la app.',
+      '',
+      '— Equipo Wisdom',
+    ].join('\n');
+    const html = `<p>Hola ${escapeHtml(clientName)},</p>
+      <p>Han pasado <strong>48 horas</strong> desde que el profesional cerró la reserva <strong>${escapeHtml(bookingIdText)}</strong> y no hemos recibido respuesta.</p>
+      <p>Como el importe final no supera la estimación inicial, Wisdom cerrará la reserva automáticamente según las condiciones de la reserva.</p>
+      <p><strong>Servicio:</strong> ${escapeHtml(booking?.serviceTitle || 'Servicio sin título')}<br/>
+      <strong>Importe estimado:</strong> ${escapeHtml(estimatedText)}<br/>
+      <strong>Importe final:</strong> ${escapeHtml(totalText)}<br/>
+      <strong>Pendiente por cobrar automáticamente:</strong> ${escapeHtml(amountDueText)}<br/>
+      <strong>Reembolso previsto:</strong> ${escapeHtml(refundText)}</p>
+      <p>Si crees que hay un problema, puedes revisar la reserva desde la app.</p>
+      <p>— Equipo Wisdom</p>`;
+    return { subject, text, html };
+  }
 
   if (normalizedMode === 'within_tolerance') {
     const subject = `Actualización automática del importe final de tu reserva ${bookingIdText}`;
