@@ -641,7 +641,7 @@ const mapStatus = (piStatus) => {
   switch (piStatus) {
     case 'succeeded': return 'succeeded';
     case 'processing': return 'processing';
-    case 'requires_payment_method':
+    case 'requires_payment_method': return 'requires_payment_method';
     case 'requires_action': return 'requires_action';
     default: return String(piStatus || 'unknown');
   }
@@ -2606,17 +2606,28 @@ async function reverseProviderPayoutTransferForPayment(paymentRow, {
   targetReversalAmountCents,
   metadata = {},
 } = {}) {
-  const transferId = typeof paymentRow?.provider_payout_transfer_id === 'string'
-    ? paymentRow.provider_payout_transfer_id.trim()
-    : '';
   const normalizedTargetReversalAmountCents = normalizeStripeAmountCents(targetReversalAmountCents);
-  if (!transferId || normalizedTargetReversalAmountCents <= 0) {
+  if (normalizedTargetReversalAmountCents <= 0) {
     return { reversedAmountCents: 0, targetReversalAmountCents: normalizedTargetReversalAmountCents };
   }
 
-  const transfer = await stripe.transfers.retrieve(transferId);
-  const reversals = await listStripeTransferReversals(transferId);
-  const alreadyReversedForPaymentCents = getProviderPayoutReversedAmountForPayment(reversals, paymentRow);
+  const transfers = await listProviderPayoutTransfersForPayment(paymentRow);
+  if (transfers.length === 0) {
+    return { reversedAmountCents: 0, targetReversalAmountCents: normalizedTargetReversalAmountCents };
+  }
+
+  const transferContexts = [];
+  let alreadyReversedForPaymentCents = 0;
+  for (const transfer of transfers) {
+    const reversals = await listStripeTransferReversals(transfer.id);
+    const reversedForTransferCents = getProviderPayoutReversedAmountForPayment(reversals, paymentRow);
+    alreadyReversedForPaymentCents += reversedForTransferCents;
+    transferContexts.push({
+      transfer,
+      reversedForTransferCents,
+    });
+  }
+
   const remainingTargetCents = Math.max(0, normalizedTargetReversalAmountCents - alreadyReversedForPaymentCents);
   if (remainingTargetCents <= 0) {
     return {
@@ -2625,39 +2636,54 @@ async function reverseProviderPayoutTransferForPayment(paymentRow, {
     };
   }
 
-  const transferNetAmountCents = getTransferNetAmountCents(transfer);
-  const amountToReverseCents = Math.min(transferNetAmountCents, remainingTargetCents);
-  if (amountToReverseCents <= 0) {
+  let reversedNowCents = 0;
+  let remainingToReverseCents = remainingTargetCents;
+  for (const { transfer } of transferContexts) {
+    if (remainingToReverseCents <= 0) {
+      break;
+    }
+
+    const transferNetAmountCents = getTransferNetAmountCents(transfer);
+    const amountToReverseCents = Math.min(transferNetAmountCents, remainingToReverseCents);
+    if (amountToReverseCents <= 0) {
+      continue;
+    }
+
+    await stripe.transfers.createReversal(
+      transfer.id,
+      {
+        amount: amountToReverseCents,
+        metadata: {
+          booking_id: String(paymentRow.booking_id || ''),
+          provider_payout_payment_id: String(paymentRow.id || paymentRow.payment_id || ''),
+          payment_intent_id: String(paymentRow.payment_intent_id || ''),
+          provider_payout_transfer_id: transfer.id,
+          source: 'provider_payout_refund_reversal',
+          ...metadata,
+        },
+      },
+      {
+        idempotencyKey: stableKey([
+          'provider_payout_reversal',
+          paymentRow.id || paymentRow.payment_id,
+          transfer.id,
+          normalizedTargetReversalAmountCents,
+        ]),
+      }
+    );
+
+    reversedNowCents += amountToReverseCents;
+    remainingToReverseCents -= amountToReverseCents;
+  }
+
+  if (reversedNowCents <= 0) {
     const error = new Error('No queda saldo reversible en el transfer del payout del profesional.');
     error.code = 'provider_payout_transfer_not_reversible';
     throw error;
   }
 
-  await stripe.transfers.createReversal(
-    transferId,
-    {
-      amount: amountToReverseCents,
-      metadata: {
-        booking_id: String(paymentRow.booking_id || ''),
-        provider_payout_payment_id: String(paymentRow.id || ''),
-        payment_intent_id: String(paymentRow.payment_intent_id || ''),
-        provider_payout_transfer_id: transferId,
-        source: 'provider_payout_refund_reversal',
-        ...metadata,
-      },
-    },
-    {
-      idempotencyKey: stableKey([
-        'provider_payout_reversal',
-        paymentRow.id,
-        transferId,
-        normalizedTargetReversalAmountCents,
-      ]),
-    }
-  );
-
   return {
-    reversedAmountCents: alreadyReversedForPaymentCents + amountToReverseCents,
+    reversedAmountCents: alreadyReversedForPaymentCents + reversedNowCents,
     targetReversalAmountCents: normalizedTargetReversalAmountCents,
   };
 }
@@ -2687,7 +2713,8 @@ async function syncProviderPayoutForPaymentRefund(paymentIntentId, {
               provider_payout_status,
               provider_payout_eligible_at,
               provider_payout_released_at,
-              provider_payout_transfer_id
+              provider_payout_transfer_id,
+              transfer_group
          FROM payments
         WHERE payment_intent_id = ?
         LIMIT 1
@@ -2741,7 +2768,7 @@ async function syncProviderPayoutForPaymentRefund(paymentIntentId, {
       return { synced: false, reason: 'provider_payout_not_released', payoutStatus };
     }
 
-    if (!payment.provider_payout_transfer_id) {
+    if (!payment.provider_payout_transfer_id && !payment.transfer_group) {
       const error = new Error('El payout del profesional está marcado como liberado pero no tiene transfer asociado.');
       error.code = 'provider_payout_transfer_missing';
       throw error;
@@ -2867,6 +2894,164 @@ async function retrievePaymentIntentWithCharge(paymentIntentId) {
   return stripe.paymentIntents.retrieve(paymentIntentId, {
     expand: ['latest_charge'],
   });
+}
+
+function isProviderPayoutTransferForPayment(transfer, paymentRow) {
+  const metadata = transfer?.metadata || {};
+  const paymentId = String(paymentRow?.id || paymentRow?.payment_id || '').trim();
+  const bookingId = String(paymentRow?.booking_id || '').trim();
+  const purpose = String(metadata.booking_purpose || '').trim().toLowerCase();
+  const source = String(metadata.source || '').trim().toLowerCase();
+  const samePayment = paymentId
+    && String(metadata.provider_payout_payment_id || metadata.payment_id || '').trim() === paymentId;
+  const sameBooking = bookingId
+    && String(metadata.booking_id || '').trim() === bookingId;
+
+  return samePayment && sameBooking && (purpose === 'provider_payout' || source.includes('provider_payout'));
+}
+
+function getTransferSourceTransactionId(transfer) {
+  return getStripeObjectId(transfer?.source_transaction);
+}
+
+async function listProviderPayoutTransfersForPayment(paymentRow) {
+  const transfersById = new Map();
+  const storedTransferId = typeof paymentRow?.provider_payout_transfer_id === 'string'
+    ? paymentRow.provider_payout_transfer_id.trim()
+    : '';
+
+  if (storedTransferId) {
+    try {
+      const transfer = await stripe.transfers.retrieve(storedTransferId);
+      if (transfer?.id) {
+        transfersById.set(transfer.id, transfer);
+      }
+    } catch (error) {
+      console.error('No se pudo recuperar el transfer guardado del payout:', {
+        paymentId: paymentRow?.id || paymentRow?.payment_id || null,
+        transferId: storedTransferId,
+        error: error.message,
+      });
+    }
+  }
+
+  const transferGroup = typeof paymentRow?.transfer_group === 'string'
+    ? paymentRow.transfer_group.trim()
+    : '';
+  if (transferGroup) {
+    const groupedTransfers = await listStripeTransfersByGroup(transferGroup);
+    for (const transfer of groupedTransfers) {
+      if (transfer?.id && isProviderPayoutTransferForPayment(transfer, paymentRow)) {
+        transfersById.set(transfer.id, transfer);
+      }
+    }
+  }
+
+  return Array.from(transfersById.values());
+}
+
+async function resolveProviderPayoutSourceAllocations(paymentRow, {
+  targetAmountCents,
+  currency,
+  existingTransfers = [],
+} = {}) {
+  let remainingAmountCents = normalizeStripeAmountCents(targetAmountCents);
+  if (remainingAmountCents <= 0) {
+    return [];
+  }
+
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const usedBySourceTransaction = new Map();
+  for (const transfer of existingTransfers || []) {
+    const sourceTransactionId = getTransferSourceTransactionId(transfer);
+    if (!sourceTransactionId) {
+      continue;
+    }
+    usedBySourceTransaction.set(
+      sourceTransactionId,
+      (usedBySourceTransaction.get(sourceTransactionId) || 0) + getTransferNetAmountCents(transfer)
+    );
+  }
+
+  const candidates = [];
+  const seenPaymentIntentIds = new Set();
+  const pushCandidate = ({ paymentId, paymentIntentId, paymentType }) => {
+    const normalizedPaymentIntentId = typeof paymentIntentId === 'string' ? paymentIntentId.trim() : '';
+    if (!normalizedPaymentIntentId || seenPaymentIntentIds.has(normalizedPaymentIntentId)) {
+      return;
+    }
+    seenPaymentIntentIds.add(normalizedPaymentIntentId);
+    candidates.push({
+      paymentId: paymentId || null,
+      paymentIntentId: normalizedPaymentIntentId,
+      paymentType,
+    });
+  };
+
+  pushCandidate({
+    paymentId: paymentRow?.payment_id || paymentRow?.id || null,
+    paymentIntentId: paymentRow?.payment_intent_id,
+    paymentType: paymentRow?.type || 'final',
+  });
+  pushCandidate({
+    paymentId: paymentRow?.deposit_payment_id || null,
+    paymentIntentId: paymentRow?.deposit_payment_intent_id,
+    paymentType: 'deposit',
+  });
+
+  const allocations = [];
+  for (const candidate of candidates) {
+    if (remainingAmountCents <= 0) {
+      break;
+    }
+
+    const intent = await retrievePaymentIntentWithCharge(candidate.paymentIntentId);
+    const latestCharge = intent?.latest_charge;
+    const sourceTransactionId = getStripeObjectId(latestCharge);
+    if (!intent || !latestCharge || !sourceTransactionId || intent.status !== 'succeeded') {
+      continue;
+    }
+
+    const chargeCurrency = normalizeCurrencyCode(latestCharge.currency || intent.currency, null);
+    if (chargeCurrency && chargeCurrency !== normalizedCurrency) {
+      const error = new Error('La divisa del cargo no coincide con la divisa del payout del profesional.');
+      error.code = 'provider_payout_source_currency_mismatch';
+      throw error;
+    }
+
+    const { refundedAmountCents, capturedAmountCents } = getStripeChargeRefundStatus(latestCharge);
+    const netChargeAmountCents = Math.max(0, capturedAmountCents - refundedAmountCents);
+    const alreadyTransferredFromSourceCents = normalizeStripeAmountCents(
+      usedBySourceTransaction.get(sourceTransactionId) || 0
+    );
+    const availableFromSourceCents = Math.max(0, netChargeAmountCents - alreadyTransferredFromSourceCents);
+    const allocationAmountCents = Math.min(availableFromSourceCents, remainingAmountCents);
+    if (allocationAmountCents <= 0) {
+      continue;
+    }
+
+    allocations.push({
+      amountCents: allocationAmountCents,
+      sourceTransactionId,
+      paymentIntentId: candidate.paymentIntentId,
+      sourcePaymentId: candidate.paymentId,
+      sourcePaymentType: candidate.paymentType,
+    });
+    usedBySourceTransaction.set(
+      sourceTransactionId,
+      alreadyTransferredFromSourceCents + allocationAmountCents
+    );
+    remainingAmountCents -= allocationAmountCents;
+  }
+
+  if (remainingAmountCents > 0) {
+    const error = new Error('No hay cargos de Stripe suficientes para vincular la liquidación del profesional.');
+    error.code = 'provider_payout_source_transaction_insufficient';
+    error.remainingAmountCents = remainingAmountCents;
+    throw error;
+  }
+
+  return allocations;
 }
 
 async function ensureRefundForPaymentIntent({
@@ -5376,17 +5561,59 @@ async function assertProviderTransferReady(accountId) {
   if (!accountId || !String(accountId).startsWith('acct_')) {
     const error = new Error('La cuenta conectada no está lista para transferencias.');
     error.code = 'provider_transfer_account_invalid';
+    error.statusCode = 409;
     throw error;
   }
 
-  const account = await stripe.accounts.retrieve(accountId);
+  let account;
+  try {
+    account = await stripe.accounts.retrieve(accountId);
+  } catch (stripeError) {
+    const error = new Error('No se pudo verificar la cuenta conectada del profesional.');
+    error.code = 'provider_transfer_account_verification_failed';
+    error.statusCode = 409;
+    error.cause = stripeError;
+    throw error;
+  }
+
   const canTransfers = account?.capabilities?.transfers === 'active';
   const canPayouts = !!account?.payouts_enabled;
   if (!canTransfers || !canPayouts) {
     const error = new Error('La cuenta conectada no está lista para transferencias.');
     error.code = 'provider_transfer_account_not_ready';
+    error.statusCode = 409;
+    error.stripeRequirements = {
+      disabled_reason: account?.requirements?.disabled_reason || null,
+      currently_due: account?.requirements?.currently_due || [],
+      past_due: account?.requirements?.past_due || [],
+      pending_verification: account?.requirements?.pending_verification || [],
+      capabilities: account?.capabilities || {},
+      payouts_enabled: !!account?.payouts_enabled,
+    };
     throw error;
   }
+
+  return account;
+}
+
+function buildProviderPayoutReadinessResponse(error) {
+  const requirements = error?.stripeRequirements || null;
+  return {
+    error: error?.message || 'La cuenta conectada no está lista para transferencias.',
+    error_code: error?.code || 'provider_transfer_account_not_ready',
+    ...(requirements ? { stripe_requirements: requirements } : {}),
+  };
+}
+
+async function assertProviderBookingPayoutReady(providerRow = {}) {
+  if (!hasConfiguredProviderPayoutMethod(providerRow)) {
+    const error = new Error('Para aceptar reservas debes configurar un método de cobro.');
+    error.code = 'provider_payout_method_required';
+    error.statusCode = 409;
+    throw error;
+  }
+
+  return assertProviderTransferReady(providerRow.stripe_account_id);
 }
 
 async function markBookingSettlementForReview(bookingId, {
@@ -5756,6 +5983,20 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
       depositPayment,
     });
     transferGroup = finalPayment?.transfer_group || depositPayment?.transfer_group || `booking-${normalizedBookingId}`;
+    if (settlementSnapshot.providerPayoutAmountCents > 0) {
+      try {
+        await assertProviderTransferReady(booking.stripe_account_id);
+      } catch (providerReadinessError) {
+        await initialConnection.rollback();
+        await markBookingSettlementForReview(normalizedBookingId, {
+          changedByUserId,
+          nextSettlementStatus: 'manual_review_required',
+          reasonCode: providerReadinessError.code || 'provider_transfer_account_not_ready',
+          details: providerReadinessError.message || 'La cuenta conectada no está lista para recibir la liquidación.',
+        });
+        return { settled: false, reason: providerReadinessError.code || 'provider_transfer_account_not_ready' };
+      }
+    }
     const finalPaymentStatus = String(finalPayment?.status || '').trim().toLowerCase();
     if (
       settlementSnapshot.amountDueFromClientCents > 0
@@ -6166,6 +6407,7 @@ async function protectBookingForStripeDispute(paymentIntentId, {
               booking_id,
               type,
               payment_intent_id,
+              transfer_group,
               provider_payout_amount_cents,
               provider_payout_status,
               provider_payout_transfer_id
@@ -6197,13 +6439,14 @@ async function protectBookingForStripeDispute(paymentIntentId, {
     releasedPayoutRows = payoutRows.filter((row) => {
       const payoutStatus = String(row.provider_payout_status || '').trim().toLowerCase();
       return ['released', 'partially_reversed'].includes(payoutStatus)
-        && row.provider_payout_transfer_id;
+        && (row.provider_payout_transfer_id || row.transfer_group);
     });
 
     missingTransferRows = payoutRows.filter((row) => {
       const payoutStatus = String(row.provider_payout_status || '').trim().toLowerCase();
       return ['released', 'partially_reversed'].includes(payoutStatus)
-        && !row.provider_payout_transfer_id;
+        && !row.provider_payout_transfer_id
+        && !row.transfer_group;
     });
 
     await connection.commit();
@@ -6787,6 +7030,19 @@ async function processPendingClosureAutoCharge(bookingId) {
       depositPayment,
     });
     transferGroup = depositPayment.transfer_group || transferGroup;
+    if (settlementSnapshot.providerPayoutAmountCents > 0) {
+      try {
+        await assertProviderTransferReady(booking.stripe_account_id);
+      } catch (providerReadinessError) {
+        await connection.rollback();
+        await markBookingSettlementForReview(normalizedBookingId, {
+          nextSettlementStatus: 'manual_review_required',
+          reasonCode: providerReadinessError.code || 'provider_transfer_account_not_ready',
+          details: providerReadinessError.message || 'La cuenta conectada no está lista para recibir la liquidación.',
+        });
+        return { handled: false, reason: providerReadinessError.code || 'provider_transfer_account_not_ready' };
+      }
+    }
     if (autoChargeDecision.needsAdjustmentNotice === true) {
       autoChargeNotificationMode = 'within_tolerance';
     } else if (autoChargeDecision.reason === 'within_estimate') {
@@ -9230,17 +9486,26 @@ async function releasePendingProviderPayouts({
       `
       SELECT
         p.id AS payment_id,
+        p.id,
         p.booking_id,
+        p.type,
+        p.payment_intent_id,
+        p.transfer_group,
         p.currency,
         p.provider_payout_amount_cents,
         p.provider_payout_status,
         p.provider_payout_eligible_at,
+        deposit.id AS deposit_payment_id,
+        deposit.payment_intent_id AS deposit_payment_intent_id,
         COALESCE(b.provider_user_id_snapshot, s.user_id) AS provider_user_id,
         provider.stripe_account_id
       FROM payments p
       INNER JOIN booking b ON b.id = p.booking_id
       LEFT JOIN service s ON s.id = b.service_id
       LEFT JOIN user_account provider ON provider.id = COALESCE(b.provider_user_id_snapshot, s.user_id)
+      LEFT JOIN payments deposit ON deposit.booking_id = p.booking_id
+        AND deposit.type = 'deposit'
+        AND deposit.status = 'succeeded'
       WHERE p.provider_payout_status = 'pending_release'
         AND p.provider_payout_amount_cents IS NOT NULL
         AND p.provider_payout_amount_cents > 0
@@ -9291,67 +9556,120 @@ async function releasePendingProviderPayouts({
         continue;
       }
 
-      const paymentIds = group.payments.map((payment) => payment.payment_id);
-      const totalAmountCents = group.payments.reduce(
-        (sum, payment) => sum + Math.max(0, Math.round(Number(payment.provider_payout_amount_cents || 0))),
-        0
-      );
-
-      if (totalAmountCents <= 0) {
-        skippedPayments += group.payments.length;
-        continue;
-      }
-
       try {
         await assertProviderTransferReady(group.destinationAccountId);
-        const transfer = await stripe.transfers.create(
-          {
-            amount: totalAmountCents,
-            currency: toStripeCurrencyCode(group.currency),
-            destination: group.destinationAccountId,
-            transfer_group: `provider-payout-${group.providerUserId}-${normalizedNow.getTime()}`,
-            metadata: {
-              source: 'provider_payout_release',
-              provider_user_id: String(group.providerUserId || ''),
-              payment_count: String(group.payments.length),
-            },
-          },
-          {
-            idempotencyKey: stableKey([
-              'provider_payout_release',
-              group.providerUserId,
-              group.currency,
-              ...paymentIds,
-            ]),
-          }
-        );
-
-        const placeholders = paymentIds.map(() => '?').join(', ');
-        await connection.query(
-          `
-          UPDATE payments
-          SET provider_payout_status = 'released',
-              provider_payout_released_at = ?,
-              provider_payout_transfer_id = ?
-          WHERE id IN (${placeholders})
-          `,
-          [
-            toDbDateTime(normalizedNow),
-            transfer.id,
-            ...paymentIds,
-          ]
-        );
-
-        releasedPayments += group.payments.length;
-        releasedAmountCents += totalAmountCents;
       } catch (error) {
         skippedPayments += group.payments.length;
         console.error('Error releasing provider payout batch:', {
           providerUserId: group.providerUserId,
           destinationAccountId: group.destinationAccountId,
-          paymentIds,
+          paymentIds: group.payments.map((payment) => payment.payment_id),
           error: error.message,
         });
+        continue;
+      }
+
+      const batchId = `provider-payout-${group.providerUserId}-${normalizedNow.getTime()}`;
+      for (const payment of group.payments) {
+        const paymentId = payment.payment_id;
+        const targetAmountCents = normalizeStripeAmountCents(payment.provider_payout_amount_cents);
+        if (targetAmountCents <= 0) {
+          skippedPayments += 1;
+          continue;
+        }
+
+        try {
+          const existingTransfers = await listProviderPayoutTransfersForPayment(payment);
+          const existingTransferredAmountCents = existingTransfers.reduce(
+            (sum, transfer) => sum + getTransferNetAmountCents(transfer),
+            0
+          );
+          const missingAmountCents = Math.max(0, targetAmountCents - existingTransferredAmountCents);
+          const createdTransfers = [];
+
+          if (missingAmountCents > 0) {
+            const allocations = await resolveProviderPayoutSourceAllocations(payment, {
+              targetAmountCents: missingAmountCents,
+              currency: group.currency,
+              existingTransfers,
+            });
+
+            for (const allocation of allocations) {
+              const transferGroup = payment.transfer_group || `booking-${payment.booking_id}`;
+              const transfer = await stripe.transfers.create(
+                {
+                  amount: allocation.amountCents,
+                  currency: toStripeCurrencyCode(group.currency),
+                  destination: group.destinationAccountId,
+                  source_transaction: allocation.sourceTransactionId,
+                  transfer_group: transferGroup,
+                  metadata: {
+                    source: 'provider_payout_release',
+                    booking_purpose: 'provider_payout',
+                    booking_id: String(payment.booking_id || ''),
+                    provider_user_id: String(group.providerUserId || ''),
+                    provider_payout_payment_id: String(paymentId || ''),
+                    payment_intent_id: String(payment.payment_intent_id || ''),
+                    source_payment_id: String(allocation.sourcePaymentId || ''),
+                    source_payment_type: String(allocation.sourcePaymentType || ''),
+                    source_payment_intent_id: String(allocation.paymentIntentId || ''),
+                    payout_batch_id: batchId,
+                  },
+                },
+                {
+                  idempotencyKey: stableKey([
+                    'provider_payout_release',
+                    paymentId,
+                    allocation.sourceTransactionId,
+                    allocation.amountCents,
+                  ]),
+                }
+              );
+              createdTransfers.push(transfer);
+            }
+          }
+
+          const allTransfers = [...existingTransfers, ...createdTransfers].filter((transfer) => transfer?.id);
+          const transferredAmountCents = allTransfers.reduce(
+            (sum, transfer) => sum + getTransferNetAmountCents(transfer),
+            0
+          );
+
+          if (transferredAmountCents < targetAmountCents) {
+            throw Object.assign(
+              new Error('No se pudo cubrir completamente la liquidación del profesional con transfers vinculados.'),
+              { code: 'provider_payout_release_incomplete' }
+            );
+          }
+
+          await connection.query(
+            `
+            UPDATE payments
+            SET provider_payout_status = 'released',
+                provider_payout_released_at = ?,
+                provider_payout_transfer_id = ?
+            WHERE id = ?
+            `,
+            [
+              toDbDateTime(normalizedNow),
+              allTransfers[0]?.id || null,
+              paymentId,
+            ]
+          );
+
+          releasedPayments += 1;
+          releasedAmountCents += targetAmountCents;
+        } catch (error) {
+          skippedPayments += 1;
+          console.error('Error releasing provider payout payment:', {
+            providerUserId: group.providerUserId,
+            destinationAccountId: group.destinationAccountId,
+            paymentId,
+            bookingId: payment.booking_id,
+            error: error.message,
+            code: error.code || null,
+          });
+        }
       }
     }
 
@@ -16238,12 +16556,13 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
         { forUpdate: true }
       );
 
-      if (!hasConfiguredProviderPayoutMethod(providerReadiness)) {
+      try {
+        await assertProviderBookingPayoutReady(providerReadiness);
+      } catch (providerReadinessError) {
         await connection.rollback();
-        return res.status(409).json({
-          error: 'Para aceptar reservas debes configurar un método de cobro.',
-          error_code: 'provider_payout_method_required',
-        });
+        return res
+          .status(providerReadinessError.statusCode || 409)
+          .json(buildProviderPayoutReadinessResponse(providerReadinessError));
       }
     }
 
@@ -18903,6 +19222,21 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       depositPayment?.currency,
       normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
     );
+    const expectedProviderPayoutCents = normalizeStripeAmountCents(
+      booking.proposed_base_amount_cents
+      ?? booking.estimated_base_amount_cents
+      ?? 0
+    );
+    if (expectedProviderPayoutCents > 0) {
+      try {
+        await assertProviderTransferReady(booking.stripe_account_id);
+      } catch (providerReadinessError) {
+        await connection.rollback();
+        return res
+          .status(providerReadinessError.statusCode || 409)
+          .json(buildProviderPayoutReadinessResponse(providerReadinessError));
+      }
+    }
     const normalizedServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
     let normalizedSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
     const hasClosureProposal = booking.closure_proposal_id !== null && booking.closure_proposal_id !== undefined;
@@ -19144,6 +19478,13 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
             }
             if (intent.status === 'requires_action') {
               return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+            }
+            if (intent.status === 'requires_payment_method') {
+              return res.status(202).json({
+                requiresPaymentMethod: true,
+                clientSecret: intent.client_secret,
+                paymentIntentId: intent.id,
+              });
             }
             if (intent.status === 'processing') {
               return res.status(202).json({ processing: true, paymentIntentId: intent.id });
@@ -19517,6 +19858,13 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     }
     if (intent.status === 'requires_action') {
       return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'requires_payment_method') {
+      return res.status(202).json({
+        requiresPaymentMethod: true,
+        clientSecret: intent.client_secret,
+        paymentIntentId: intent.id,
+      });
     }
     if (intent.status === 'processing') {
       return res.status(202).json({ processing: true, paymentIntentId: intent.id });
