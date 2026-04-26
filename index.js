@@ -7489,10 +7489,8 @@ async function fetchOwnedService(connection, serviceId, userId, { lock = false, 
 async function releasePendingProviderPayouts({
   now = new Date(),
   limit = 500,
-  forceEligible = false,
 } = {}) {
   const normalizedNow = parseDateTimeInput(now) || new Date();
-  const shouldForceEligible = normalizeBooleanInput(forceEligible, false);
   const connection = await pool.promise().getConnection();
 
   try {
@@ -7517,12 +7515,12 @@ async function releasePendingProviderPayouts({
         AND p.provider_payout_amount_cents IS NOT NULL
         AND p.provider_payout_amount_cents > 0
         AND p.provider_payout_eligible_at IS NOT NULL
-        AND (p.provider_payout_eligible_at <= ? OR ? = 1)
+        AND p.provider_payout_eligible_at <= ?
       ORDER BY provider_user_id ASC, p.provider_payout_eligible_at ASC, p.id ASC
       LIMIT ?
       FOR UPDATE
       `,
-      [toDbDateTime(normalizedNow), shouldForceEligible ? 1 : 0, Math.max(1, Number(limit) || 500)]
+      [toDbDateTime(normalizedNow), Math.max(1, Number(limit) || 500)]
     );
 
     if (!rows || rows.length === 0) {
@@ -7646,64 +7644,6 @@ async function releasePendingProviderPayouts({
     connection.release();
   }
 }
-
-function isTemporaryPayoutTestEndpointAllowed() {
-  const stripeSecretKey = String(process.env.STRIPE_SECRET_KEY || '').trim();
-  const usesStripeTestKey = stripeSecretKey.startsWith('sk_test_') || stripeSecretKey.startsWith('rk_test_');
-  const explicitlyEnabled = normalizeBooleanInput(
-    process.env.ENABLE_TEMP_UNAUTH_PAYOUT_TEST_ENDPOINT,
-    false
-  );
-
-  return usesStripeTestKey || explicitlyEnabled;
-}
-
-// Endpoint temporal de pruebas: ejecuta manualmente la liberación semanal sin autenticación.
-app.post('/api/dev/release-provider-payouts', async (req, res) => {
-  if (!isTemporaryPayoutTestEndpointAllowed()) {
-    return res.status(403).json({
-      error: 'temporary_payout_test_endpoint_disabled',
-      message: 'Endpoint temporal deshabilitado: requiere clave Stripe de test y entorno no productivo.',
-    });
-  }
-
-  const nowInput = req.body?.now ?? req.query?.now ?? null;
-  const normalizedNow = nowInput ? parseDateTimeInput(nowInput) : new Date();
-  if (!normalizedNow) {
-    return res.status(400).json({
-      error: 'invalid_now',
-      message: 'El parámetro now debe ser una fecha válida.',
-    });
-  }
-
-  const requestedLimit = Number.parseInt(req.body?.limit ?? req.query?.limit, 10);
-  const limit = Number.isInteger(requestedLimit)
-    ? Math.min(500, Math.max(1, requestedLimit))
-    : 500;
-  const forceEligible = normalizeBooleanInput(req.body?.force ?? req.query?.force, false);
-
-  try {
-    const result = await releasePendingProviderPayouts({
-      now: normalizedNow,
-      limit,
-      forceEligible,
-    });
-
-    return res.json({
-      ok: true,
-      now: normalizedNow.toISOString(),
-      limit,
-      forceEligible,
-      ...result,
-    });
-  } catch (error) {
-    console.error('Error en endpoint temporal de liberación de payouts:', error);
-    return res.status(500).json({
-      error: 'temporary_payout_release_failed',
-      message: error.message,
-    });
-  }
-});
 
 const cron = require('node-cron');
 const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || '15m';
