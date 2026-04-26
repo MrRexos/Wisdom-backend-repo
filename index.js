@@ -2495,6 +2495,275 @@ async function reverseBookingTransfersIfNeeded({
   };
 }
 
+async function listStripeTransferReversals(transferId) {
+  const normalizedTransferId = typeof transferId === 'string' ? transferId.trim() : '';
+  if (!normalizedTransferId) {
+    return [];
+  }
+
+  const reversals = [];
+  let startingAfter = null;
+
+  while (true) {
+    const page = await stripe.transfers.listReversals(
+      normalizedTransferId,
+      {
+        limit: 100,
+        ...(startingAfter ? { starting_after: startingAfter } : {}),
+      }
+    );
+    const pageReversals = Array.isArray(page?.data) ? page.data : [];
+    if (pageReversals.length === 0) {
+      break;
+    }
+    reversals.push(...pageReversals);
+    if (!page?.has_more) {
+      break;
+    }
+    startingAfter = pageReversals[pageReversals.length - 1].id;
+  }
+
+  return reversals;
+}
+
+function calculateProviderPayoutReversalTargetCents({
+  providerPayoutAmountCents,
+  refundedAmountCents,
+  capturedAmountCents,
+}) {
+  const normalizedPayoutAmountCents = normalizeStripeAmountCents(providerPayoutAmountCents);
+  const normalizedRefundedAmountCents = normalizeStripeAmountCents(refundedAmountCents);
+  const normalizedCapturedAmountCents = normalizeStripeAmountCents(capturedAmountCents);
+  if (normalizedPayoutAmountCents <= 0 || normalizedRefundedAmountCents <= 0) {
+    return 0;
+  }
+
+  if (normalizedCapturedAmountCents <= 0) {
+    return Math.min(normalizedPayoutAmountCents, normalizedRefundedAmountCents);
+  }
+
+  const cappedRefundedAmountCents = Math.min(normalizedCapturedAmountCents, normalizedRefundedAmountCents);
+  return Math.min(
+    normalizedPayoutAmountCents,
+    Math.round((normalizedPayoutAmountCents * cappedRefundedAmountCents) / normalizedCapturedAmountCents)
+  );
+}
+
+function getProviderPayoutReversedAmountForPayment(reversals, paymentRow) {
+  const paymentId = String(paymentRow?.id || '').trim();
+  const bookingId = String(paymentRow?.booking_id || '').trim();
+
+  return (reversals || []).reduce((sum, reversal) => {
+    const metadata = reversal?.metadata || {};
+    const samePayment = paymentId && String(metadata.provider_payout_payment_id || metadata.payment_id || '').trim() === paymentId;
+    const sameBookingScopedReversal = bookingId
+      && String(metadata.booking_id || '').trim() === bookingId
+      && String(metadata.source || '').trim().toLowerCase().includes('provider_payout');
+
+    if (!samePayment && !sameBookingScopedReversal) {
+      return sum;
+    }
+
+    return sum + normalizeStripeAmountCents(reversal?.amount);
+  }, 0);
+}
+
+async function reverseProviderPayoutTransferForPayment(paymentRow, {
+  targetReversalAmountCents,
+  metadata = {},
+} = {}) {
+  const transferId = typeof paymentRow?.provider_payout_transfer_id === 'string'
+    ? paymentRow.provider_payout_transfer_id.trim()
+    : '';
+  const normalizedTargetReversalAmountCents = normalizeStripeAmountCents(targetReversalAmountCents);
+  if (!transferId || normalizedTargetReversalAmountCents <= 0) {
+    return { reversedAmountCents: 0, targetReversalAmountCents: normalizedTargetReversalAmountCents };
+  }
+
+  const transfer = await stripe.transfers.retrieve(transferId);
+  const reversals = await listStripeTransferReversals(transferId);
+  const alreadyReversedForPaymentCents = getProviderPayoutReversedAmountForPayment(reversals, paymentRow);
+  const remainingTargetCents = Math.max(0, normalizedTargetReversalAmountCents - alreadyReversedForPaymentCents);
+  if (remainingTargetCents <= 0) {
+    return {
+      reversedAmountCents: alreadyReversedForPaymentCents,
+      targetReversalAmountCents: normalizedTargetReversalAmountCents,
+    };
+  }
+
+  const transferNetAmountCents = getTransferNetAmountCents(transfer);
+  const amountToReverseCents = Math.min(transferNetAmountCents, remainingTargetCents);
+  if (amountToReverseCents <= 0) {
+    const error = new Error('No queda saldo reversible en el transfer del payout del profesional.');
+    error.code = 'provider_payout_transfer_not_reversible';
+    throw error;
+  }
+
+  await stripe.transfers.createReversal(
+    transferId,
+    {
+      amount: amountToReverseCents,
+      metadata: {
+        booking_id: String(paymentRow.booking_id || ''),
+        provider_payout_payment_id: String(paymentRow.id || ''),
+        payment_intent_id: String(paymentRow.payment_intent_id || ''),
+        provider_payout_transfer_id: transferId,
+        source: 'provider_payout_refund_reversal',
+        ...metadata,
+      },
+    },
+    {
+      idempotencyKey: stableKey([
+        'provider_payout_reversal',
+        paymentRow.id,
+        transferId,
+        normalizedTargetReversalAmountCents,
+      ]),
+    }
+  );
+
+  return {
+    reversedAmountCents: alreadyReversedForPaymentCents + amountToReverseCents,
+    targetReversalAmountCents: normalizedTargetReversalAmountCents,
+  };
+}
+
+async function syncProviderPayoutForPaymentRefund(paymentIntentId, {
+  refundedAmountCents,
+  capturedAmountCents,
+  metadata = {},
+} = {}) {
+  const normalizedPaymentIntentId = typeof paymentIntentId === 'string' ? paymentIntentId.trim() : '';
+  const normalizedRefundedAmountCents = normalizeStripeAmountCents(refundedAmountCents);
+  if (!normalizedPaymentIntentId || normalizedRefundedAmountCents <= 0) {
+    return { synced: false, reason: 'invalid_refund_context' };
+  }
+
+  const connection = await pool.promise().getConnection();
+  let paymentRow = null;
+  let targetReversalAmountCents = 0;
+  try {
+    await connection.beginTransaction();
+    const [[payment]] = await connection.query(
+      `SELECT id,
+              booking_id,
+              type,
+              payment_intent_id,
+              provider_payout_amount_cents,
+              provider_payout_status,
+              provider_payout_eligible_at,
+              provider_payout_released_at,
+              provider_payout_transfer_id
+         FROM payments
+        WHERE payment_intent_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [normalizedPaymentIntentId]
+    );
+
+    if (!payment || normalizeStripeAmountCents(payment.provider_payout_amount_cents) <= 0) {
+      await connection.rollback();
+      return { synced: false, reason: 'provider_payout_not_applicable' };
+    }
+
+    targetReversalAmountCents = calculateProviderPayoutReversalTargetCents({
+      providerPayoutAmountCents: payment.provider_payout_amount_cents,
+      refundedAmountCents: normalizedRefundedAmountCents,
+      capturedAmountCents,
+    });
+    if (targetReversalAmountCents <= 0) {
+      await connection.rollback();
+      return { synced: false, reason: 'provider_payout_reversal_not_needed' };
+    }
+
+    const payoutStatus = String(payment.provider_payout_status || '').trim().toLowerCase();
+    const payoutAmountCents = normalizeStripeAmountCents(payment.provider_payout_amount_cents);
+    if (payoutStatus === 'pending_release') {
+      const remainingPayoutAmountCents = Math.max(0, payoutAmountCents - targetReversalAmountCents);
+      if (remainingPayoutAmountCents > 0) {
+        await connection.query(
+          `UPDATE payments
+              SET provider_payout_amount_cents = ?,
+                  provider_payout_status = 'pending_release'
+            WHERE id = ?`,
+          [remainingPayoutAmountCents, payment.id]
+        );
+      } else {
+        await setPaymentProviderPayoutState(connection, payment.id, {
+          amountCents: 0,
+          status: 'none',
+        });
+      }
+      await connection.commit();
+      return {
+        synced: true,
+        action: remainingPayoutAmountCents > 0 ? 'pending_payout_reduced' : 'pending_payout_canceled',
+        targetReversalAmountCents,
+      };
+    }
+
+    if (payoutStatus !== 'released') {
+      await connection.rollback();
+      return { synced: false, reason: 'provider_payout_not_released', payoutStatus };
+    }
+
+    if (!payment.provider_payout_transfer_id) {
+      const error = new Error('El payout del profesional está marcado como liberado pero no tiene transfer asociado.');
+      error.code = 'provider_payout_transfer_missing';
+      throw error;
+    }
+
+    paymentRow = payment;
+    await connection.commit();
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  const reversalResult = await reverseProviderPayoutTransferForPayment(paymentRow, {
+    targetReversalAmountCents,
+    metadata,
+  });
+  const payoutAmountCents = normalizeStripeAmountCents(paymentRow.provider_payout_amount_cents);
+  const fullyReversed = reversalResult.reversedAmountCents >= payoutAmountCents;
+
+  if (fullyReversed) {
+    const finalizeConnection = await pool.promise().getConnection();
+    try {
+      await finalizeConnection.beginTransaction();
+      await finalizeConnection.query(
+        `UPDATE payments
+            SET provider_payout_status = 'none',
+                provider_payout_amount_cents = NULL,
+                provider_payout_eligible_at = NULL
+          WHERE id = ?
+            AND provider_payout_status = 'released'`,
+        [paymentRow.id]
+      );
+      await finalizeConnection.commit();
+    } catch (error) {
+      try { await finalizeConnection.rollback(); } catch {}
+      throw error;
+    } finally {
+      finalizeConnection.release();
+    }
+  }
+
+  if (reversalResult.reversedAmountCents < targetReversalAmountCents) {
+    const error = new Error('No se pudo revertir completamente el payout liberado del profesional.');
+    error.code = 'provider_payout_reversal_incomplete';
+    throw error;
+  }
+
+  return {
+    synced: true,
+    action: fullyReversed ? 'released_payout_reversed' : 'released_payout_partially_reversed',
+    ...reversalResult,
+  };
+}
+
 async function ensureNetBookingTransferAmount({
   bookingId,
   transferGroup,
@@ -2593,6 +2862,16 @@ async function ensureRefundForPaymentIntent({
   const effectiveRefundAmountCents = Math.min(refundableAmountCents, normalizedRequestedAmountCents);
 
   if (effectiveRefundAmountCents <= 0) {
+    if (alreadyRefundedAmountCents > 0) {
+      await syncPaymentRefundStateFromStripe(paymentIntentId, {
+        reasonCode: 'stripe_refund_synced',
+      });
+      await syncProviderPayoutForPaymentRefund(paymentIntentId, {
+        refundedAmountCents: alreadyRefundedAmountCents,
+        capturedAmountCents,
+        metadata,
+      });
+    }
     return null;
   }
 
@@ -2609,6 +2888,12 @@ async function ensureRefundForPaymentIntent({
 
   await syncPaymentRefundStateFromStripe(paymentIntentId, {
     reasonCode: 'stripe_refund_synced',
+  });
+
+  await syncProviderPayoutForPaymentRefund(paymentIntentId, {
+    refundedAmountCents: alreadyRefundedAmountCents + effectiveRefundAmountCents,
+    capturedAmountCents,
+    metadata,
   });
 
   if (transferGroup) {
@@ -3003,32 +3288,27 @@ async function prepareBookingEditableUpdate(connection, currentBooking, requestB
   if (hasAddressField) {
     nextAddressId = normalizeNullableInteger(requestBody.address_id);
     if (nextAddressId !== null) {
-      const [[existingAddress]] = await connection.query(
-        `
-        SELECT
-          id,
-          address_type,
-          street_number,
-          address_1,
-          address_2,
-          postal_code,
-          city,
-          state,
-          country,
-          latitude,
-          longitude
-        FROM address
-        WHERE id = ?
-        LIMIT 1
-        FOR UPDATE
-        `,
-        [nextAddressId]
+      const existingAddress = await assertUserOwnsAddress(
+        connection,
+        currentBooking.client_user_id,
+        nextAddressId,
+        {
+          fields: `
+            a.id,
+            a.address_type,
+            a.street_number,
+            a.address_1,
+            a.address_2,
+            a.postal_code,
+            a.city,
+            a.state,
+            a.country,
+            a.latitude,
+            a.longitude
+          `,
+          forUpdate: true,
+        }
       );
-      if (!existingAddress) {
-        const error = new Error('address_id no existe.');
-        error.statusCode = 400;
-        throw error;
-      }
       nextAddressSnapshot = {
         id: existingAddress.id,
         address_type: existingAddress.address_type,
@@ -8028,6 +8308,142 @@ function getBookingAccessFlags(user, booking) {
     isProviderOwner: requesterUserId !== null && requesterUserId === providerUserId,
     isStaff: isStaffUser(user),
   };
+}
+
+function buildUserOwnedAddressSelect({ fields = 'a.id', forUpdate = false } = {}) {
+  return `
+    SELECT ${fields}
+    FROM address a
+    WHERE a.id = ?
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM directions d
+          WHERE d.address_id = a.id
+            AND d.user_id = ?
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM user_address ua
+          WHERE ua.address_id = a.id
+            AND ua.user_id = ?
+        )
+      )
+    LIMIT 1
+    ${forUpdate ? 'FOR UPDATE' : ''}
+  `;
+}
+
+async function getUserOwnedAddress(connection, userId, addressId, {
+  fields = 'a.id',
+  forUpdate = false,
+} = {}) {
+  const normalizedUserId = normalizeNullableInteger(userId);
+  const normalizedAddressId = normalizeNullableInteger(addressId);
+  if (!normalizedUserId || !normalizedAddressId) {
+    return null;
+  }
+
+  const [[address]] = await connection.query(
+    buildUserOwnedAddressSelect({ fields, forUpdate }),
+    [normalizedAddressId, normalizedUserId, normalizedUserId]
+  );
+
+  return address || null;
+}
+
+async function assertUserOwnsAddress(connection, userId, addressId, options = {}) {
+  const address = await getUserOwnedAddress(connection, userId, addressId, options);
+  if (!address) {
+    const error = new Error('address_id no existe o no pertenece al usuario.');
+    error.statusCode = 400;
+    error.errorCode = 'address_not_owned';
+    throw error;
+  }
+  return address;
+}
+
+const DNI_FILE_TOKEN_VERSION = 'dni_file_v1';
+const DNI_FILE_TOKEN_TTL_MS = 60 * 60 * 1000;
+
+function base64UrlEncodeJson(value) {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+}
+
+function signDniFileTokenPayload(encodedPayload) {
+  return crypto
+    .createHmac('sha256', process.env.DNI_FILE_TOKEN_SECRET || process.env.JWT_SECRET || '')
+    .update(encodedPayload)
+    .digest('base64url');
+}
+
+function createBoundDniFileToken({ fileId, userId }) {
+  const normalizedUserId = normalizeNullableInteger(userId);
+  const normalizedFileId = typeof fileId === 'string' ? fileId.trim() : '';
+  if (!normalizedUserId || !normalizedFileId.startsWith('file_')) {
+    const error = new Error('invalid_dni_file_token_payload');
+    error.statusCode = 500;
+    throw error;
+  }
+
+  const encodedPayload = base64UrlEncodeJson({
+    file_id: normalizedFileId,
+    user_id: normalizedUserId,
+    iat: Date.now(),
+    nonce: crypto.randomBytes(16).toString('base64url'),
+  });
+  const signature = signDniFileTokenPayload(encodedPayload);
+  return `${DNI_FILE_TOKEN_VERSION}.${encodedPayload}.${signature}`;
+}
+
+function timingSafeEqualString(left, right) {
+  const leftBuffer = Buffer.from(String(left || ''), 'utf8');
+  const rightBuffer = Buffer.from(String(right || ''), 'utf8');
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function verifyBoundDniFileToken(token, expectedUserId) {
+  const normalizedExpectedUserId = normalizeNullableInteger(expectedUserId);
+  const normalizedToken = typeof token === 'string' ? token.trim() : '';
+  const parts = normalizedToken.split('.');
+  if (!normalizedExpectedUserId || parts.length !== 3 || parts[0] !== DNI_FILE_TOKEN_VERSION) {
+    const error = new Error('dni_file_token_invalid');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const [, encodedPayload, receivedSignature] = parts;
+  const expectedSignature = signDniFileTokenPayload(encodedPayload);
+  if (!timingSafeEqualString(receivedSignature, expectedSignature)) {
+    const error = new Error('dni_file_token_invalid');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+  } catch {
+    const error = new Error('dni_file_token_invalid');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const tokenUserId = normalizeNullableInteger(payload?.user_id);
+  const issuedAt = Number(payload?.iat || 0);
+  const fileId = typeof payload?.file_id === 'string' ? payload.file_id.trim() : '';
+  if (
+    tokenUserId !== normalizedExpectedUserId ||
+    !fileId.startsWith('file_') ||
+    !Number.isFinite(issuedAt) ||
+    Date.now() - issuedAt > DNI_FILE_TOKEN_TTL_MS
+  ) {
+    const error = new Error('dni_file_token_invalid');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  return fileId;
 }
 
 function isPasswordTooShort(password) {
@@ -13621,7 +14037,7 @@ app.post('/api/user/:id/strike', authenticateToken, (req, res) => {
 });
 
 //Ruta para guardar address + direction
-app.post('/api/directions', (req, res) => {
+app.post('/api/directions', authenticateToken, (req, res) => {
   const {
     user_id,
     address_type,
@@ -13633,6 +14049,7 @@ app.post('/api/directions', (req, res) => {
     state,
     country,
   } = req.body;
+  const requestedUserId = normalizeNullableInteger(user_id ?? req.user?.id);
   const latitude = normalizeCoordinateValue(req.body?.latitude ?? req.body?.address_latitude, {
     min: -90,
     max: 90,
@@ -13643,8 +14060,11 @@ app.post('/api/directions', (req, res) => {
   });
 
   // Verificar que los campos requeridos estén presentes, excepto address_2 y street_number que pueden ser nulos
-  if (!user_id || !address_type || !address_1 || !postal_code || !city || !state || !country) {
+  if (!requestedUserId || !address_type || !address_1 || !postal_code || !city || !state || !country) {
     return res.status(400).json({ error: 'Algunos campos requeridos faltan.' });
+  }
+  if (!isStaffUser(req.user) && Number(req.user?.id) !== requestedUserId) {
+    return res.status(403).json({ error: 'Acceso denegado' });
   }
 
   // Si street_number o address_2 son undefined o vacíos, se establecen como NULL
@@ -13672,7 +14092,7 @@ app.post('/api/directions', (req, res) => {
 
       // Ahora insertar en la tabla directions utilizando el user_id y el address_id
       const directionsQuery = 'INSERT INTO directions (user_id, address_id) VALUES (?, ?)';
-      const directionsValues = [user_id, addressId];
+      const directionsValues = [requestedUserId, addressId];
 
       connection.query(directionsQuery, directionsValues, (err, result) => {
         connection.release(); // Liberar la conexión después de usarla
@@ -13689,11 +14109,15 @@ app.post('/api/directions', (req, res) => {
 });
 
 //Ruta para obtener todas las direcciones de un user
-app.get('/api/directions/:user_id', (req, res) => {
+app.get('/api/directions/:user_id', authenticateToken, (req, res) => {
   const { user_id } = req.params;
+  const requestedUserId = normalizeNullableInteger(user_id);
 
-  if (!user_id) {
+  if (!requestedUserId) {
     return res.status(400).json({ error: 'El user_id es requerido.' });
+  }
+  if (!isStaffUser(req.user) && Number(req.user?.id) !== requestedUserId) {
+    return res.status(403).json({ error: 'Acceso denegado' });
   }
 
   pool.getConnection((err, connection) => {
@@ -13710,7 +14134,7 @@ app.get('/api/directions/:user_id', (req, res) => {
       WHERE d.user_id = ?
     `;
 
-    connection.query(query, [user_id], (err, results) => {
+    connection.query(query, [requestedUserId], (err, results) => {
       connection.release(); // Liberar la conexión después de usarla
 
       if (err) {
@@ -13728,8 +14152,9 @@ app.get('/api/directions/:user_id', (req, res) => {
 });
 
 //Actualziar address 
-app.put('/api/address/:id', (req, res) => {
-  const { id } = req.params; // ID de la address a actualizar
+app.put('/api/address/:id', authenticateToken, (req, res) => {
+  const addressId = normalizeNullableInteger(req.params.id); // ID de la address a actualizar
+  const requestedUserId = normalizeNullableInteger(req.user?.id);
   const {
     address_type,
     street_number,
@@ -13740,6 +14165,12 @@ app.put('/api/address/:id', (req, res) => {
     state,
     country,
   } = req.body;
+  if (!addressId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+  if (!requestedUserId) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
   const latitude = normalizeCoordinateValue(req.body?.latitude ?? req.body?.address_latitude, {
     min: -90,
     max: 90,
@@ -13766,10 +14197,14 @@ app.put('/api/address/:id', (req, res) => {
 
     // Actualizar la dirección en la tabla address
       const addressQuery = `
-        UPDATE address 
+        UPDATE address AS a
         SET address_type = ?, street_number = ?, address_1 = ?, address_2 = ?, postal_code = ?, city = ?, state = ?, country = ?, latitude = ?, longitude = ?
-        WHERE id = ?`;
-    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country, latitude, longitude, id];
+        WHERE a.id = ?
+          AND (
+            EXISTS (SELECT 1 FROM directions d WHERE d.address_id = a.id AND d.user_id = ?)
+            OR EXISTS (SELECT 1 FROM user_address ua WHERE ua.address_id = a.id AND ua.user_id = ?)
+          )`;
+    const addressValues = [address_type, streetNumberValue, address_1, address2Value, postal_code, city, state, country, latitude, longitude, addressId, requestedUserId, requestedUserId];
 
     connection.query(addressQuery, addressValues, (err, result) => {
       connection.release(); // Liberar la conexión después de usarla
@@ -13783,49 +14218,67 @@ app.put('/api/address/:id', (req, res) => {
         return res.status(404).json({ error: 'Dirección no encontrada.' });
       }
 
-      res.status(200).json({ message: 'Dirección actualizada con éxito', address_id: Number(id) });
+      res.status(200).json({ message: 'Dirección actualizada con éxito', address_id: Number(addressId) });
     });
   });
 });
 
 //Borrar address por su id
-app.delete('/api/address/:id', (req, res) => {
-  const { id } = req.params; // ID de la dirección a eliminar
+app.delete('/api/address/:id', authenticateToken, async (req, res) => {
+  const addressId = normalizeNullableInteger(req.params.id); // ID de la dirección a eliminar
+  const requestedUserId = normalizeNullableInteger(req.user?.id);
+  if (!addressId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+  if (!requestedUserId) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
 
-  pool.getConnection((err, connection) => {
-    if (err) {
-      console.error('Error al obtener la conexión:', err);
-      return res.status(500).json({ error: 'Error al obtener la conexión.' });
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const ownedAddress = await getUserOwnedAddress(connection, requestedUserId, addressId, { forUpdate: true });
+    if (!ownedAddress) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Dirección no encontrada.' });
     }
 
-    // Eliminar la dirección en la tabla address
-    const deleteQuery = 'DELETE FROM address WHERE id = ?';
-    const deleteValues = [id];
+    await connection.query('DELETE FROM directions WHERE user_id = ? AND address_id = ?', [requestedUserId, addressId]);
+    await connection.query('DELETE FROM user_address WHERE user_id = ? AND address_id = ?', [requestedUserId, addressId]);
+    await connection.query(
+      `DELETE a FROM address a
+        WHERE a.id = ?
+          AND NOT EXISTS (SELECT 1 FROM directions d WHERE d.address_id = a.id)
+          AND NOT EXISTS (SELECT 1 FROM user_address ua WHERE ua.address_id = a.id)
+          AND NOT EXISTS (SELECT 1 FROM collection_method cm WHERE cm.address_id = a.id)
+          AND NOT EXISTS (SELECT 1 FROM booking b WHERE b.address_id = a.id)`,
+      [addressId]
+    );
 
-    connection.query(deleteQuery, deleteValues, (err, result) => {
-      connection.release(); // Liberar la conexión después de usarla
-
-      if (err) {
-        console.error('Error al eliminar la dirección:', err);
-        return res.status(500).json({ error: 'Error al eliminar la dirección.' });
-      }
-
-      if (result.affectedRows === 0) {
-        return res.status(404).json({ error: 'Dirección no encontrada.' });
-      }
-
-      res.status(200).json({ message: 'Dirección eliminada con éxito' });
-    });
-  });
+    await connection.commit();
+    return res.status(200).json({ message: 'Dirección eliminada con éxito' });
+  } catch (err) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error al eliminar la dirección:', err);
+    return res.status(500).json({ error: 'Error al eliminar la dirección.' });
+  } finally {
+    connection.release();
+  }
 });
 
 //Crear reserva
 app.post('/api/bookings', authenticateToken, async (req, res) => {
   const authenticatedUserId = parseRequestedUserId(req.user?.id);
-  const requestedUserId = normalizeNullableInteger(req.body.client_user_id ?? req.body.user_id);
+  const requestedUserId = normalizeNullableInteger(req.body.client_user_id ?? req.body.user_id ?? authenticatedUserId);
   const serviceId = normalizeNullableInteger(req.body.service_id);
 
-  if (!authenticatedUserId || !requestedUserId || requestedUserId !== authenticatedUserId) {
+  if (!authenticatedUserId) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
+  if (!requestedUserId) {
+    return res.status(400).json({ error: 'client_user_id es requerido.' });
+  }
+  if (!isStaffUser(req.user) && requestedUserId !== authenticatedUserId) {
     return res.status(403).json({ error: 'No autorizado para crear la reserva.' });
   }
 
@@ -13916,30 +14369,30 @@ app.post('/api/bookings', authenticateToken, async (req, res) => {
     if (bookingAddressRule.mode === 'hidden') {
       addressId = null;
     } else if (addressId !== null) {
-      const [[existingAddress]] = await connection.query(
-        `
-        SELECT
-          id,
-          address_type,
-          street_number,
-          address_1,
-          address_2,
-          postal_code,
-          city,
-          state,
-          country,
-          latitude,
-          longitude
-        FROM address
-        WHERE id = ?
-        LIMIT 1
-        FOR UPDATE
-        `,
-        [addressId]
-      );
-      if (!existingAddress) {
+      let existingAddress;
+      try {
+        existingAddress = await assertUserOwnsAddress(connection, requestedUserId, addressId, {
+          fields: `
+            a.id,
+            a.address_type,
+            a.street_number,
+            a.address_1,
+            a.address_2,
+            a.postal_code,
+            a.city,
+            a.state,
+            a.country,
+            a.latitude,
+            a.longitude
+          `,
+          forUpdate: true,
+        });
+      } catch (addressOwnershipError) {
         await connection.rollback();
-        return res.status(400).json({ error: 'address_id no existe.' });
+        return res.status(addressOwnershipError.statusCode || 400).json({
+          error: addressOwnershipError.message,
+          error_code: addressOwnershipError.errorCode || undefined,
+        });
       }
 
       assertBookingAddressRulesForService({
@@ -15058,13 +15511,17 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
     if (typeof req.body.address_id !== 'undefined') {
       const nextAddressId = normalizeNullableInteger(req.body.address_id);
       if (nextAddressId !== null) {
-        const [[existingAddress]] = await connection.query(
-          'SELECT id FROM address WHERE id = ? LIMIT 1 FOR UPDATE',
-          [nextAddressId]
-        );
-        if (!existingAddress) {
+        try {
+          await assertUserOwnsAddress(connection, booking.client_user_id, nextAddressId, {
+            fields: 'a.id',
+            forUpdate: true,
+          });
+        } catch (addressOwnershipError) {
           await connection.rollback();
-          return res.status(400).json({ error: 'address_id no existe.' });
+          return res.status(addressOwnershipError.statusCode || 400).json({
+            error: addressOwnershipError.message,
+            error_code: addressOwnershipError.errorCode || undefined,
+          });
         }
       }
       extraPatch.address_id = nextAddressId;
@@ -16819,6 +17276,18 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
     });
   }
 
+  let stripeFileTokenAnverso;
+  let stripeFileTokenReverso;
+  try {
+    stripeFileTokenAnverso = verifyBoundDniFileToken(fileTokenAnverso, requestedUserId);
+    stripeFileTokenReverso = verifyBoundDniFileToken(fileTokenReverso, requestedUserId);
+  } catch (dniTokenError) {
+    return res.status(dniTokenError.statusCode || 403).json({
+      error: 'Documento de identidad inválido o caducado. Vuelve a subir el DNI.',
+      error_code: dniTokenError.message,
+    });
+  }
+
   const connection = await pool.promise().getConnection();
   let transactionStarted = false;
   let lockName = null;
@@ -16892,8 +17361,8 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
         phone,
         verification: {
           document: {
-            front: fileTokenAnverso,
-            back: fileTokenReverso,
+            front: stripeFileTokenAnverso,
+            back: stripeFileTokenReverso,
           },
         },
       },
@@ -20294,7 +20763,7 @@ app.post('/api/admin/terms-update-email', async (req, res) => {
   }
 });
 
-app.post('/api/upload-dni', (req, res) => {
+app.post('/api/upload-dni', authenticateToken, (req, res) => {
   uploadDni.single('file')(req, res, async (err) => {
     if (err) {
       if (err.message === 'INVALID_FILE_TYPE') {
@@ -20308,6 +20777,11 @@ app.post('/api/upload-dni', (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: 'File is required' });
     }
+    const requestedUserId = normalizeNullableInteger(req.user?.id);
+    if (!requestedUserId) {
+      await fs.promises.unlink(req.file.path).catch(() => { });
+      return res.status(401).json({ error: 'missing_user' });
+    }
 
     const filePath = req.file.path;
     try {
@@ -20320,7 +20794,12 @@ app.post('/api/upload-dni', (req, res) => {
         },
       });
       await fs.promises.unlink(filePath);
-      return res.status(201).json({ fileToken: stripeFile.id });
+      return res.status(201).json({
+        fileToken: createBoundDniFileToken({
+          fileId: stripeFile.id,
+          userId: requestedUserId,
+        }),
+      });
     } catch (stripeErr) {
       await fs.promises.unlink(filePath).catch(() => { });
       console.error('Stripe file upload error:', stripeErr);
@@ -20568,7 +21047,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
       case 'charge.refunded': {
         const charge = event.data.object;
         const piId = getStripeObjectId(charge.payment_intent);
-        const { fullyRefunded } = getStripeChargeRefundStatus(charge);
+        const { refundedAmountCents, capturedAmountCents, fullyRefunded } = getStripeChargeRefundStatus(charge);
         if (!piId) break;
         let shouldReleaseEphemeralPaymentMethods = false;
         let refundedBookingId = null;
@@ -20589,6 +21068,31 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           shouldReleaseEphemeralPaymentMethods = nextSettlementStatus === 'refunded';
         }
         await connection.commit();
+        if (refundedBookingId && refundedAmountCents > 0) {
+          try {
+            await syncProviderPayoutForPaymentRefund(piId, {
+              refundedAmountCents,
+              capturedAmountCents,
+              metadata: {
+                booking_id: String(refundedBookingId),
+                source: 'charge_refunded_webhook',
+              },
+            });
+          } catch (providerPayoutError) {
+            console.error('Error reversing provider payout after refund webhook:', {
+              bookingId: refundedBookingId,
+              paymentIntentId: piId,
+              error: providerPayoutError.message,
+            });
+            await markRefundFailureForManualReview({
+              bookingId: refundedBookingId,
+              paymentIntentId: piId,
+              reasonCode: 'provider_payout_reversal_failed',
+              source: 'charge_refunded_webhook',
+              error: providerPayoutError,
+            });
+          }
+        }
         if (refundedBookingId && shouldReleaseEphemeralPaymentMethods) {
           try {
             await releaseEphemeralBookingPaymentMethodsIfClosed(refundedBookingId);
