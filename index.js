@@ -63,8 +63,36 @@ const IMG_INSTA = 'https://storage.googleapis.com/wisdom-images/email_insta_logo
 const IMG_X = 'https://storage.googleapis.com/wisdom-images/email_x_logo.png';
 
 const Stripe = require('stripe');
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+function loadRequiredEnvironmentVariables(variableNames) {
+  const values = {};
+  const missingVariables = [];
+
+  for (const variableName of variableNames) {
+    const value = typeof process.env[variableName] === 'string'
+      ? process.env[variableName].trim()
+      : '';
+
+    if (!value) {
+      missingVariables.push(variableName);
+    } else {
+      values[variableName] = value;
+    }
+  }
+
+  if (missingVariables.length > 0) {
+    throw new Error(`Missing required environment variable(s): ${missingVariables.join(', ')}`);
+  }
+
+  return values;
+}
+
+const stripeEnvironment = loadRequiredEnvironmentVariables([
+  'STRIPE_SECRET_KEY',
+  'STRIPE_WEBHOOK_SECRET',
+]);
+const stripe = new Stripe(stripeEnvironment.STRIPE_SECRET_KEY);
+const endpointSecret = stripeEnvironment.STRIPE_WEBHOOK_SECRET;
 const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || 'com.rexos.Wisdom';
 const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || '';
 const APPLE_KEY_ID = process.env.APPLE_KEY_ID || '';
@@ -20282,17 +20310,36 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
   });
 });
 
-// Borrar una reserva por su id
-app.delete('/api/delete_booking/:id', async (req, res) => {
+// Bloquea el borrado físico de reservas sin revelar reservas ajenas.
+app.delete('/api/delete_booking/:id', authenticateToken, async (req, res) => {
   const bookingId = normalizeNullableInteger(req.params.id);
   if (!bookingId) {
     return res.status(400).json({ error: 'Id inválido.' });
   }
 
+  const requesterUserId = normalizeNullableInteger(req.user?.id);
+  const isStaff = isStaffUser(req.user);
+  if (!requesterUserId && !isStaff) {
+    return res.status(404).json({ message: 'Reserva no encontrada' });
+  }
+
   try {
+    const bookingLookupQuery = isStaff
+      ? 'SELECT id FROM booking WHERE id = ? LIMIT 1'
+      : `
+        SELECT id
+        FROM booking
+        WHERE id = ?
+          AND (client_user_id = ? OR provider_user_id_snapshot = ?)
+        LIMIT 1
+      `;
+    const bookingLookupParams = isStaff
+      ? [bookingId]
+      : [bookingId, requesterUserId, requesterUserId];
+
     const [[booking]] = await promisePool.query(
-      'SELECT id FROM booking WHERE id = ? LIMIT 1',
-      [bookingId]
+      bookingLookupQuery,
+      bookingLookupParams
     );
 
     if (!booking) {
