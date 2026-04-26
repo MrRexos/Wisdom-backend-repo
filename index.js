@@ -4542,6 +4542,7 @@ async function getPaymentRow(conn, bookingId, type) {
   const [rows] = await conn.query(
     `SELECT id, booking_id, type, payment_intent_id, amount_cents, status, currency,
             payment_method_id, payment_method_last4,
+            transfer_group,
             provider_payout_amount_cents,
             provider_payout_status,
             provider_payout_eligible_at,
@@ -4762,6 +4763,43 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
     [normalizedBookingId, normalizedType, ...updateParams]
   );
+}
+
+function buildBookingPaymentIntentMetadata({ bookingId, type, savePaymentMethod = null, autoCharge = false } = {}) {
+  const metadata = {
+    booking_id: String(bookingId || ''),
+    type: String(type || ''),
+  };
+
+  if (savePaymentMethod !== null) {
+    metadata.save_payment_method = savePaymentMethod ? '1' : '0';
+  }
+
+  if (autoCharge) {
+    metadata.auto_charge = '1';
+  }
+
+  return metadata;
+}
+
+function buildBookingPaymentIntentCreateIdempotencyKey({ bookingId, type, paymentId, amountCents, currency }) {
+  return stableKey([
+    'payment_intent_create',
+    String(type || 'payment'),
+    String(bookingId || ''),
+    String(paymentId || ''),
+    String(normalizeStripeAmountCents(amountCents)),
+    toStripeCurrencyCode(currency),
+  ]);
+}
+
+function buildBookingPaymentIntentConfirmIdempotencyKey({ paymentId, paymentIntentId, paymentMethodId }) {
+  return stableKey([
+    'payment_intent_confirm',
+    String(paymentId || ''),
+    String(paymentIntentId || ''),
+    String(paymentMethodId || ''),
+  ]);
 }
 
 async function getBookingSettlementContext(connection, bookingId, { forUpdate = false } = {}) {
@@ -18391,10 +18429,14 @@ const round2 = (n) => {
 
     // A partir de aquí, fuera de transacción
     const transferGroup = `booking-${id}`;
-    // Clave de idempotencia sensible al importe para evitar conflictos si varía la comisión/importe entre intentos
-    const idemParts = ['payment', String(payment.id), 'amt', String(commissionCents)];
-    if (payment_method_id) idemParts.push('pm', String(payment_method_id));
-    const idemKey = stableKey(idemParts);
+    const createIdemKey = buildBookingPaymentIntentCreateIdempotencyKey({
+      bookingId: id,
+      type: 'deposit',
+      paymentId: payment.id,
+      amountCents: commissionCents,
+      currency: chargeCurrency,
+    });
+    let confirmIdemKey = null;
 
     let intent;
     let pm = null;
@@ -18406,73 +18448,93 @@ const round2 = (n) => {
           expand: ['payment_method', 'latest_charge.payment_method_details'],
         });
 
-        // Si falta método de pago y el cliente nos envía uno ahora, adjuntarlo y confirmar on-session
-        if (intent.status === 'requires_payment_method' && payment_method_id) {
-          pm = await stripe.paymentMethods.retrieve(payment_method_id);
-          if (pm.customer && pm.customer !== customerId) {
-            return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
-          }
-          if (!pm.customer) {
-            try {
-              pm = await stripe.paymentMethods.attach(payment_method_id, { customer: customerId });
-            } catch (eAttach) {
-              console.error('No se pudo adjuntar el PM al customer (depósito):', eAttach);
-              return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
-            }
-          }
-          await stripe.paymentIntents.update(intent.id, {
-            payment_method: payment_method_id,
+      } else {
+        // Crear sin tarjeta ni confirmación para que los reintentos con otra tarjeta reutilicen el mismo Intent.
+        intent = await stripe.paymentIntents.create(
+          {
+            amount: commissionCents,
+            currency: toStripeCurrencyCode(chargeCurrency),
             customer: customerId,
             setup_future_usage: 'off_session',
-            metadata: {
-              booking_id: String(id),
+            receipt_email: booking.customer_email || undefined,
+            automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+            transfer_group: transferGroup,
+            metadata: buildBookingPaymentIntentMetadata({
+              bookingId: id,
               type: 'deposit',
-              save_payment_method: requestedSavePaymentMethod ? '1' : '0',
-            },
+            }),
+          },
+          { idempotencyKey: createIdemKey }
+        );
+
+        const connIntent = await pool.promise().getConnection();
+        try {
+          await connIntent.beginTransaction();
+          await upsertPayment(connIntent, {
+            bookingId: id,
+            type: 'deposit',
+            paymentIntentId: intent.id,
+            amountCents: commissionCents,
+            commissionSnapshotCents: commissionCents,
+            finalPriceSnapshotCents: finalCentsSnapshot,
+            status: mapStatus(intent.status),
+            currency: chargeCurrency,
+            transferGroup,
+            paymentMethodId: null,
+            paymentMethodLast4: null,
+            lastErrorCode: null,
+            lastErrorMessage: null,
           });
-          intent = await stripe.paymentIntents.confirm(intent.id);
+          await connIntent.commit();
+        } catch (persistIntentError) {
+          try { await connIntent.rollback(); } catch { }
+          throw persistIntentError;
+        } finally {
+          connIntent.release();
         }
-      } else {
-        // Crear intent nuevo: si traen PM, confirmar on-session; si no, devolver client_secret para confirmar en el cliente
-        if (payment_method_id) {
-          intent = await stripe.paymentIntents.create(
-            {
-              amount: commissionCents,
-              currency: toStripeCurrencyCode(chargeCurrency),
-              customer: customerId,
-              payment_method: payment_method_id,
-              confirm: true,
-              receipt_email: booking.customer_email || undefined,
-              automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-              transfer_group: transferGroup,
-              setup_future_usage: 'off_session',
-              metadata: {
-                booking_id: String(id),
-                type: 'deposit',
-                save_payment_method: requestedSavePaymentMethod ? '1' : '0',
-              },
-            },
-            { idempotencyKey: idemKey }
-          );
-        } else {
-          intent = await stripe.paymentIntents.create(
-            {
-              amount: commissionCents,
-              currency: toStripeCurrencyCode(chargeCurrency),
-              customer: customerId,
-              setup_future_usage: 'off_session',
-              receipt_email: booking.customer_email || undefined,
-              automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-              transfer_group: transferGroup,
-              metadata: {
-                booking_id: String(id),
-                type: 'deposit',
-                save_payment_method: requestedSavePaymentMethod ? '1' : '0',
-              },
-            },
-            { idempotencyKey: idemKey }
-          );
+      }
+
+      if (['requires_payment_method', 'requires_confirmation'].includes(intent.status) && payment_method_id) {
+        pm = await stripe.paymentMethods.retrieve(payment_method_id);
+        if (pm.customer && pm.customer !== customerId) {
+          return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
         }
+        if (!pm.customer) {
+          try {
+            pm = await stripe.paymentMethods.attach(payment_method_id, { customer: customerId });
+          } catch (eAttach) {
+            console.error('No se pudo adjuntar el PM al customer (depósito):', eAttach);
+            return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
+          }
+        }
+        await stripe.paymentIntents.update(intent.id, {
+          payment_method: payment_method_id,
+          setup_future_usage: 'off_session',
+          metadata: buildBookingPaymentIntentMetadata({
+            bookingId: id,
+            type: 'deposit',
+            savePaymentMethod: requestedSavePaymentMethod,
+          }),
+        });
+        confirmIdemKey = buildBookingPaymentIntentConfirmIdempotencyKey({
+          paymentId: payment.id,
+          paymentIntentId: intent.id,
+          paymentMethodId: payment_method_id,
+        });
+        intent = await stripe.paymentIntents.confirm(
+          intent.id,
+          {},
+          { idempotencyKey: confirmIdemKey }
+        );
+      } else if (intent.status === 'requires_payment_method') {
+        await stripe.paymentIntents.update(intent.id, {
+          setup_future_usage: 'off_session',
+          metadata: buildBookingPaymentIntentMetadata({
+            bookingId: id,
+            type: 'deposit',
+            savePaymentMethod: requestedSavePaymentMethod,
+          }),
+        });
       }
       // Asegura expansión para capturar last4 y errores
       if (!intent.payment_method || !intent.latest_charge) {
@@ -18497,7 +18559,8 @@ const round2 = (n) => {
           amountCents: commissionCents,
           customerId,
           transferGroup,
-          idemKey
+          createIdemKey,
+          confirmIdemKey,
         }
       });
 
@@ -18918,64 +18981,31 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           const ensureCurrency = normalizeCurrencyCode(paySnap?.currency, chargeCurrency);
 
           if (amountEnsure > 0) {
-            const pmIdBody = usablePaymentMethodId || null;
-            const idemEnsureParts = ['payment', String(row.id), pmIdBody ? String(pmIdBody) : 'ensure'];
-            const idemEnsure = stableKey(idemEnsureParts);
             let pmEnsure = null;
+            const idemEnsure = buildBookingPaymentIntentCreateIdempotencyKey({
+              bookingId: id,
+              type: 'final',
+              paymentId: row.id,
+              amountCents: amountEnsure,
+              currency: ensureCurrency,
+            });
 
-            if (pmIdBody) {
-              // Adjuntar PM si es necesario
-              pmEnsure = await stripe.paymentMethods.retrieve(pmIdBody);
-              if (pmEnsure.customer && pmEnsure.customer !== customerId) {
-                return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
-              }
-              if (!pmEnsure.customer) {
-                try {
-                  pmEnsure = await stripe.paymentMethods.attach(pmIdBody, { customer: customerId });
-                } catch (eAttach) {
-                  console.error('No se pudo adjuntar el PM al customer (ensure):', eAttach);
-                  return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
-                }
-              }
-
-              intent = await stripe.paymentIntents.create(
-                {
-                  amount: amountEnsure,
-                  currency: toStripeCurrencyCode(ensureCurrency),
-                  customer: customerId,
-                  payment_method: pmIdBody,
-                  confirm: true,
-                  off_session: true,
-                  receipt_email: booking.customer_email || undefined,
-                  automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-                  transfer_group: transferGroupEnsure,
-                  metadata: {
-                    booking_id: String(id),
-                    type: 'final',
-                    save_payment_method: requestedSavePaymentMethod ? '1' : '0',
-                  },
-                },
-                { idempotencyKey: idemEnsure }
-              );
-            } else {
-              // Crear intent sin PM para devolver clientSecret y confirmar en el cliente
-              intent = await stripe.paymentIntents.create(
-                {
-                  amount: amountEnsure,
-                  currency: toStripeCurrencyCode(ensureCurrency),
-                  customer: customerId,
-                  receipt_email: booking.customer_email || undefined,
-                  automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
-                  transfer_group: transferGroupEnsure,
-                  metadata: {
-                    booking_id: String(id),
-                    type: 'final',
-                    save_payment_method: requestedSavePaymentMethod ? '1' : '0',
-                  },
-                },
-                { idempotencyKey: idemEnsure }
-              );
-            }
+            // Crear sin tarjeta ni confirmación: así el mismo cobro conserva el mismo PaymentIntent aunque el cliente cambie de tarjeta.
+            intent = await stripe.paymentIntents.create(
+              {
+                amount: amountEnsure,
+                currency: toStripeCurrencyCode(ensureCurrency),
+                customer: customerId,
+                receipt_email: booking.customer_email || undefined,
+                automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
+                transfer_group: transferGroupEnsure,
+                metadata: buildBookingPaymentIntentMetadata({
+                  bookingId: id,
+                  type: 'final',
+                }),
+              },
+              { idempotencyKey: idemEnsure }
+            );
 
             // Guardar el intent recién creado
             const paymentPersistence = await resolvePaymentIntentPersistence(intent, {
@@ -18995,7 +19025,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
                 status: mapStatus(intent.status),
                 currency: ensureCurrency,
                 transferGroup: transferGroupEnsure,
-                paymentMethodId: paymentPersistence.paymentMethodId || usablePaymentMethodId || null,
+                paymentMethodId: paymentPersistence.paymentMethodId || null,
                 paymentMethodLast4: paymentPersistence.paymentMethodLast4 || null,
                 lastErrorCode: paymentPersistence.lastErrorCode,
                 lastErrorMessage: paymentPersistence.lastErrorMessage,
@@ -19020,8 +19050,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         }
         const status = intent ? intent.status : row.status;
 
-        // Si falta método de pago y el cliente lo envía ahora, adjuntarlo y confirmar
-        if (intent && status === 'requires_payment_method' && usablePaymentMethodId) {
+        // Si falta confirmación o método de pago y el cliente lo envía ahora, confirmar on-session.
+        if (intent && ['requires_payment_method', 'requires_confirmation'].includes(status) && usablePaymentMethodId) {
           const pmId = usablePaymentMethodId;
           try {
             // Adjuntar PM al customer si viene suelto
@@ -19038,16 +19068,29 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
               }
             }
 
-            await stripe.paymentIntents.update(intent.id, {
+            const updatePayload = {
               payment_method: pmId,
-              customer: customerId,
-              metadata: {
-                booking_id: String(id),
+              metadata: buildBookingPaymentIntentMetadata({
+                bookingId: id,
                 type: 'final',
-                save_payment_method: requestedSavePaymentMethod ? '1' : '0',
-              },
-            });
-            intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
+                savePaymentMethod: requestedSavePaymentMethod,
+              }),
+            };
+            if (requestedSavePaymentMethod) {
+              updatePayload.setup_future_usage = 'off_session';
+            }
+            await stripe.paymentIntents.update(intent.id, updatePayload);
+            intent = await stripe.paymentIntents.confirm(
+              intent.id,
+              {},
+              {
+                idempotencyKey: buildBookingPaymentIntentConfirmIdempotencyKey({
+                  paymentId: row.id,
+                  paymentIntentId: intent.id,
+                  paymentMethodId: pmId,
+                }),
+              }
+            );
 
             const paymentPersistence = await resolvePaymentIntentPersistence(intent, {
               paymentMethodFallback: pm2,
@@ -19225,12 +19268,16 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       }
     }
 
-    // Stripe fuera de transacción: crear/confirmar Intent
+    // Stripe fuera de transacción: crear el Intent de forma estable y confirmarlo on-session.
     const transferGroup = `booking-${id}`;
-    // Usar una clave de idempotencia que incluya el método de pago para permitir cambiar de tarjeta sin conflicto
-    const idemKeyParts = ['payment', String(payment.id)];
-    if (pmToUse) idemKeyParts.push(String(pmToUse));
-    const idemKey = stableKey(idemKeyParts);
+    const createIdemKey = buildBookingPaymentIntentCreateIdempotencyKey({
+      bookingId: id,
+      type: 'final',
+      paymentId: payment.id,
+      amountCents: amountToCharge,
+      currency: chargeCurrency,
+    });
+    let confirmIdemKey = null;
 
     let intent;
     try {
@@ -19238,29 +19285,72 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         intent = await stripe.paymentIntents.retrieve(payment.payment_intent_id, {
           expand: ['payment_method', 'latest_charge.payment_method_details'],
         });
-        if (intent.status === 'requires_payment_method') {
-          await stripe.paymentIntents.update(intent.id, { payment_method: pmToUse, customer: customerId });
-          intent = await stripe.paymentIntents.confirm(intent.id, { off_session: true });
-        }
       } else {
         intent = await stripe.paymentIntents.create(
           {
             amount: amountToCharge,
             currency: toStripeCurrencyCode(chargeCurrency),
             customer: customerId,
-            payment_method: pmToUse,
-            confirm: true,
-            off_session: true,
             receipt_email: booking.customer_email || undefined,
             automatic_payment_methods: { enabled: true, allow_redirects: 'never' },
             transfer_group: transferGroup,
-            metadata: {
-              booking_id: String(id),
+            metadata: buildBookingPaymentIntentMetadata({
+              bookingId: id,
               type: 'final',
-              save_payment_method: requestedSavePaymentMethod ? '1' : '0',
-            },
+            }),
           },
-          { idempotencyKey: idemKey }
+          { idempotencyKey: createIdemKey }
+        );
+
+        const connIntent = await pool.promise().getConnection();
+        try {
+          await connIntent.beginTransaction();
+          await upsertPayment(connIntent, {
+            bookingId: id,
+            type: 'final',
+            paymentIntentId: intent.id,
+            amountCents: amountToCharge,
+            commissionSnapshotCents: commissionChosenCents,
+            finalPriceSnapshotCents: finalChosenCents,
+            status: mapStatus(intent.status),
+            currency: chargeCurrency,
+            transferGroup,
+            paymentMethodId: null,
+            paymentMethodLast4: null,
+            lastErrorCode: null,
+            lastErrorMessage: null,
+          });
+          await connIntent.commit();
+        } catch (persistIntentError) {
+          try { await connIntent.rollback(); } catch { }
+          throw persistIntentError;
+        } finally {
+          connIntent.release();
+        }
+      }
+
+      if (['requires_payment_method', 'requires_confirmation'].includes(intent.status)) {
+        const updatePayload = {
+          payment_method: pmToUse,
+          metadata: buildBookingPaymentIntentMetadata({
+            bookingId: id,
+            type: 'final',
+            savePaymentMethod: requestedSavePaymentMethod,
+          }),
+        };
+        if (requestedSavePaymentMethod) {
+          updatePayload.setup_future_usage = 'off_session';
+        }
+        await stripe.paymentIntents.update(intent.id, updatePayload);
+        confirmIdemKey = buildBookingPaymentIntentConfirmIdempotencyKey({
+          paymentId: payment.id,
+          paymentIntentId: intent.id,
+          paymentMethodId: pmToUse,
+        });
+        intent = await stripe.paymentIntents.confirm(
+          intent.id,
+          {},
+          { idempotencyKey: confirmIdemKey }
         );
       }
       // Asegura expansión para capturar last4 y errores
@@ -19283,7 +19373,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           amountCents: amountToCharge,
           customerId,
           transferGroup,
-          idemKey,
+          createIdemKey,
+          confirmIdemKey,
           destination: booking.stripe_account_id,
         },
       });
