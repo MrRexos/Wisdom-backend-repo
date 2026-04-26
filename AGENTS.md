@@ -396,7 +396,6 @@
 - `is_verified` (TINYINT(1), NOT NULL, DEFAULT 0)
 - `strikes_num` (TINYINT(1), NOT NULL, DEFAULT 0)
 - `date_of_birth` (DATE, NULL)
-- `nif` (VARCHAR(32), NULL)
 - `stripe_account_id` (VARCHAR(64), NULL)
 - `stripe_customer_id` (VARCHAR(64), NULL)
 - `phone` (CHAR(16), NULL)

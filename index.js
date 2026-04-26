@@ -18176,6 +18176,129 @@ async function rollbackCollectionMethodStripeArtifacts({
   }
 }
 
+function normalizeStripeProfessionalTaxIdValue(value = '') {
+  const normalizedValue = String(value || '').trim().toUpperCase();
+  return normalizedValue.length >= 5 && normalizedValue.length <= 64 ? normalizedValue : '';
+}
+
+function getStripeProfessionalTaxIdType({ country = '', value = '' } = {}) {
+  const normalizedCountry = normalizeCollectionMethodCountry(country);
+  const normalizedValue = normalizeStripeProfessionalTaxIdValue(value);
+
+  if (!normalizedValue) {
+    return null;
+  }
+
+  if (normalizedCountry === 'ES') {
+    return normalizedValue.startsWith('ES') ? 'eu_vat' : 'es_cif';
+  }
+
+  return null;
+}
+
+function isUsableStripeAccountId(value = '') {
+  return typeof value === 'string' && value.trim().startsWith('acct_');
+}
+
+async function listStripeAccountTaxIds(stripeAccountId) {
+  const normalizedStripeAccountId = typeof stripeAccountId === 'string' ? stripeAccountId.trim() : '';
+  if (!isUsableStripeAccountId(normalizedStripeAccountId) || !stripe?.taxIds?.list) {
+    return [];
+  }
+
+  const taxIds = await stripe.taxIds.list({
+    owner: {
+      type: 'account',
+      account: normalizedStripeAccountId,
+    },
+    limit: 100,
+  });
+
+  return Array.isArray(taxIds?.data) ? taxIds.data : [];
+}
+
+async function ensureStripeAccountTaxId({ stripeAccountId, country, value }) {
+  const normalizedStripeAccountId = typeof stripeAccountId === 'string' ? stripeAccountId.trim() : '';
+  const normalizedValue = normalizeStripeProfessionalTaxIdValue(value);
+  const taxIdType = getStripeProfessionalTaxIdType({ country, value: normalizedValue });
+
+  if (!isUsableStripeAccountId(normalizedStripeAccountId) || !taxIdType || !stripe?.taxIds?.create) {
+    return null;
+  }
+
+  try {
+    const existingTaxIds = await listStripeAccountTaxIds(normalizedStripeAccountId);
+    const existingMatch = existingTaxIds.find((taxId) => (
+      taxId?.type === taxIdType &&
+      normalizeStripeProfessionalTaxIdValue(taxId?.value) === normalizedValue
+    ));
+
+    if (existingMatch) {
+      return existingMatch;
+    }
+
+    return await stripe.taxIds.create({
+      type: taxIdType,
+      value: normalizedValue,
+      owner: {
+        type: 'account',
+        account: normalizedStripeAccountId,
+      },
+    });
+  } catch (error) {
+    console.error('Error al guardar el tax ID del profesional en Stripe:', {
+      stripeAccountId: normalizedStripeAccountId,
+      country: normalizeCollectionMethodCountry(country),
+      stripeCode: error?.code || null,
+      stripeMessage: error?.message || null,
+    });
+    return null;
+  }
+}
+
+async function resolveProviderTaxIdFromStripeAccount(stripeAccountId) {
+  const normalizedStripeAccountId = typeof stripeAccountId === 'string' ? stripeAccountId.trim() : '';
+  if (!isUsableStripeAccountId(normalizedStripeAccountId)) {
+    return null;
+  }
+
+  try {
+    const taxIds = await listStripeAccountTaxIds(normalizedStripeAccountId);
+    const taxIdValue = taxIds
+      .map((taxId) => normalizeStripeProfessionalTaxIdValue(taxId?.value))
+      .find(Boolean);
+
+    if (taxIdValue) {
+      return taxIdValue;
+    }
+  } catch (error) {
+    console.error('Error al obtener los tax IDs del profesional desde Stripe:', {
+      stripeAccountId: normalizedStripeAccountId,
+      stripeCode: error?.code || null,
+      stripeMessage: error?.message || null,
+    });
+  }
+
+  try {
+    const account = await stripe.accounts.retrieve(normalizedStripeAccountId);
+    return [
+      account?.individual?.id_number,
+      account?.company?.tax_id,
+      account?.individual?.metadata?.tax_id,
+      account?.metadata?.tax_id,
+    ]
+      .map((candidate) => normalizeStripeProfessionalTaxIdValue(candidate))
+      .find(Boolean) || null;
+  } catch (error) {
+    console.error('Error al obtener el account del profesional desde Stripe:', {
+      stripeAccountId: normalizedStripeAccountId,
+      stripeCode: error?.code || null,
+      stripeMessage: error?.message || null,
+    });
+    return null;
+  }
+}
+
 app.get('/api/user/:id/collection-method', authenticateToken, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res);
   if (!requestedUserId) return;
@@ -18230,7 +18353,10 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
 
   const fullName = typeof req.body?.full_name === 'string' ? req.body.full_name.trim() : '';
   const rawDateOfBirth = typeof req.body?.date_of_birth === 'string' ? req.body.date_of_birth.trim() : '';
-  const nif = typeof req.body?.nif === 'string' ? req.body.nif.trim().toUpperCase() : '';
+  const rawIdNumber = typeof req.body?.id_number === 'string'
+    ? req.body.id_number
+    : (typeof req.body?.nif === 'string' ? req.body.nif : '');
+  const idNumber = normalizeStripeProfessionalTaxIdValue(rawIdNumber);
   const rawIban = typeof req.body?.iban === 'string' ? req.body.iban : '';
   const rawRoutingNumber = typeof req.body?.routing_number === 'string' ? req.body.routing_number : '';
   const rawAccountNumber = typeof req.body?.account_number === 'string' ? req.body.account_number : '';
@@ -18265,7 +18391,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
   if (
     !fullName ||
     !dateOfBirth ||
-    !nif ||
+    !idNumber ||
     !hasValidBankDetails ||
     !addressType ||
     !address1 ||
@@ -18345,6 +18471,11 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
     if (hasStripeAccount && existingCollectionMethod) {
       await connection.commit();
       transactionStarted = false;
+      await ensureStripeAccountTaxId({
+        stripeAccountId: user.stripe_account_id,
+        country,
+        value: idNumber,
+      });
       return res.status(200).json({
         message: 'Método de cobro ya configurado',
         stripe_account_id: user.stripe_account_id,
@@ -18358,7 +18489,7 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
       individual: {
         first_name: firstName,
         last_name: lastName,
-        id_number: nif,
+        id_number: idNumber,
         dob: {
           day: dateOfBirth.day,
           month: dateOfBirth.month,
@@ -18471,12 +18602,17 @@ app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) 
     }
 
     await connection.query(
-      'UPDATE user_account SET date_of_birth = ?, nif = ?, phone = ?, stripe_account_id = ?, is_professional = 1, professional_started_datetime = IF(is_professional = 1, professional_started_datetime, NOW()) WHERE id = ?',
-      [dateOfBirth.canonical, nif, phone, stripeAccountId, requestedUserId]
+      'UPDATE user_account SET date_of_birth = ?, phone = ?, stripe_account_id = ?, is_professional = 1, professional_started_datetime = IF(is_professional = 1, professional_started_datetime, NOW()) WHERE id = ?',
+      [dateOfBirth.canonical, phone, stripeAccountId, requestedUserId]
     );
 
     await connection.commit();
     transactionStarted = false;
+    await ensureStripeAccountTaxId({
+      stripeAccountId,
+      country,
+      value: idNumber,
+    });
 
     return res.status(201).json({
       message: 'Método de cobro creado',
@@ -19970,7 +20106,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         sp.phone AS provider_phone,
         sp.first_name AS provider_first_name,
         sp.surname AS provider_surname,
-        sp.nif AS provider_nif,
+        sp.stripe_account_id AS provider_stripe_account_id,
         a.address_1 AS provider_address_1,
         a.address_2 AS provider_address_2,
         a.street_number AS provider_street_number,
@@ -20098,6 +20234,9 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       const invoiceType = (typeParam === 'deposit' || typeParam === 'final')
         ? typeParam
         : (data.is_paid ? 'final' : 'deposit');
+      if (invoiceType === 'final') {
+        data.provider_tax_id = await resolveProviderTaxIdFromStripeAccount(data.provider_stripe_account_id);
+      }
       const invoiceCurrency = normalizeCurrencyCode(
         invoiceType === 'deposit'
           ? depositPayment?.currency
@@ -20200,7 +20339,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
 
         doc.font('Inter').fontSize(11);
         doc.text(`Name or company name: ${providerFullName || '—'}`);
-        doc.text(`Tax ID: ${data.provider_nif || '__________'}`);
+        doc.text(`Tax ID: ${data.provider_tax_id || '__________'}`);
         doc.text(`Address: ${addrParts || '—'}`);
       }
 
