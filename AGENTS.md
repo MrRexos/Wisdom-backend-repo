@@ -199,7 +199,7 @@
 - `is_default` (TINYINT(1), NOT NULL, DEFAULT 0)
 
 ## Tabla: `payments`
-- `id` (INT UNSIGNED, PK, auto_increment, NOT NULL)
+- `id` (INT UNSIGNED, PK, UNIQUE, auto_increment, NOT NULL)
 - `booking_id` (INT, FK -> booking.id, NULL)
 - `type` (VARCHAR(100), NOT NULL)
 - `payment_intent_id` (VARCHAR(250), NULL)
@@ -220,6 +220,8 @@
 - `updated_at` (TIMESTAMP, DEFAULT_GENERATED on update CURRENT_TIMESTAMP, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
 - `payment_method_id` (VARCHAR(64), NULL)
 - `transfer_group` (VARCHAR(64), NULL)
+- `UNIQUE KEY ux_payments_booking_type (booking_id, type)`
+- `UNIQUE KEY ux_payments_payment_intent_id (payment_intent_id)`
 
 ## Tabla: `price`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
@@ -499,6 +501,8 @@
 ### Tabla: `payments`
 - `id`: **PK** (Key Name: `PRIMARY`)
 - `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_payments_booking_id_booking_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
+- `booking_id`, `type`: **UNIQUE** (Key Name: `ux_payments_booking_type`)
+- `payment_intent_id`: **UNIQUE** (Key Name: `ux_payments_payment_intent_id`, permite múltiples `NULL`)
 
 ### Tabla: `price`
 - `id`: **PK** (Key Name: `PRIMARY`)

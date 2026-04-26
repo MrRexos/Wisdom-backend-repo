@@ -4286,33 +4286,140 @@ async function setPaymentProviderPayoutState(conn, paymentId, {
   );
 }
 
+async function lockPaymentBookingForUpdate(conn, bookingId) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    const error = new Error('invalid_booking_id');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const [[bookingRow]] = await conn.query(
+    'SELECT id FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
+    [normalizedBookingId]
+  );
+
+  if (!bookingRow) {
+    const error = new Error('booking_not_found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  return normalizedBookingId;
+}
+
 async function upsertPaymentRow(conn, { bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, currency }) {
+  const normalizedBookingId = await lockPaymentBookingForUpdate(conn, bookingId);
+  const normalizedType = String(type || '').trim();
+  const [existingRows] = await conn.query(
+    `SELECT id
+     FROM payments
+     WHERE booking_id = ? AND type = ?
+     ORDER BY id DESC
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedBookingId, normalizedType]
+  );
+
+  if (existingRows.length > 0) {
+    await conn.query(
+      `UPDATE payments
+       SET amount_cents = ?,
+           commission_snapshot_cents = ?,
+           final_price_snapshot_cents = ?,
+           status = ?,
+           currency = COALESCE(?, currency)
+       WHERE id = ?`,
+      [
+        amountCents,
+        commissionSnapshotCents,
+        finalPriceSnapshotCents,
+        status,
+        normalizeCurrencyCode(currency, 'EUR'),
+        existingRows[0].id,
+      ]
+    );
+    return;
+  }
+
   await conn.query(
     `INSERT INTO payments (booking_id, type, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, currency)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE amount_cents = VALUES(amount_cents), commission_snapshot_cents = VALUES(commission_snapshot_cents), final_price_snapshot_cents = VALUES(final_price_snapshot_cents), status = VALUES(status), currency = COALESCE(VALUES(currency), currency)`,
-    [bookingId, type, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, normalizeCurrencyCode(currency, 'EUR')]
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [normalizedBookingId, normalizedType, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, normalizeCurrencyCode(currency, 'EUR')]
   );
 }
 
 // UPSERT helper para la tabla payments
 async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, currency, transferGroup, paymentMethodId, paymentMethodLast4, lastErrorCode, lastErrorMessage }) {
-  await conn.query(`
-    INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, currency, transfer_group, payment_method_id, payment_method_last4, last_error_code, last_error_message, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-    ON DUPLICATE KEY UPDATE
-      payment_intent_id = VALUES(payment_intent_id),
-      amount_cents = VALUES(amount_cents),
-      commission_snapshot_cents = COALESCE(VALUES(commission_snapshot_cents), commission_snapshot_cents),
-      final_price_snapshot_cents = COALESCE(VALUES(final_price_snapshot_cents), final_price_snapshot_cents),
-      status       = VALUES(status),
-      currency = COALESCE(VALUES(currency), currency),
-      transfer_group = COALESCE(VALUES(transfer_group), transfer_group),
-      payment_method_id = COALESCE(VALUES(payment_method_id), payment_method_id),
-      payment_method_last4 = COALESCE(VALUES(payment_method_last4), payment_method_last4),
-      last_error_code = VALUES(last_error_code),
-      last_error_message = VALUES(last_error_message)
-  `, [bookingId, type, paymentIntentId, amountCents ?? 0, commissionSnapshotCents ?? null, finalPriceSnapshotCents ?? null, status, normalizeCurrencyCode(currency, 'EUR'), transferGroup || null, paymentMethodId || null, paymentMethodLast4 || null, lastErrorCode ?? null, lastErrorMessage ?? null]);
+  const normalizedBookingId = await lockPaymentBookingForUpdate(conn, bookingId);
+  const normalizedType = String(type || '').trim();
+  const normalizedPaymentIntentId = paymentIntentId || null;
+  let existingPayment = null;
+
+  if (normalizedPaymentIntentId) {
+    const [intentRows] = await conn.query(
+      `SELECT id, payment_intent_id
+       FROM payments
+       WHERE payment_intent_id = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedPaymentIntentId]
+    );
+    existingPayment = intentRows[0] || null;
+  }
+
+  if (!existingPayment) {
+    const [scopeRows] = await conn.query(
+      `SELECT id, payment_intent_id
+       FROM payments
+       WHERE booking_id = ? AND type = ?
+       ORDER BY id DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedBookingId, normalizedType]
+    );
+    existingPayment = scopeRows[0] || null;
+  }
+
+  const updateParams = [
+    normalizedPaymentIntentId,
+    amountCents ?? 0,
+    commissionSnapshotCents ?? null,
+    finalPriceSnapshotCents ?? null,
+    status,
+    normalizeCurrencyCode(currency, 'EUR'),
+    transferGroup || null,
+    paymentMethodId || null,
+    paymentMethodLast4 || null,
+    lastErrorCode ?? null,
+    lastErrorMessage ?? null,
+  ];
+
+  if (existingPayment) {
+    await conn.query(
+      `UPDATE payments
+       SET payment_intent_id = COALESCE(?, payment_intent_id),
+           amount_cents = ?,
+           commission_snapshot_cents = COALESCE(?, commission_snapshot_cents),
+           final_price_snapshot_cents = COALESCE(?, final_price_snapshot_cents),
+           status = ?,
+           currency = COALESCE(?, currency),
+           transfer_group = COALESCE(?, transfer_group),
+           payment_method_id = COALESCE(?, payment_method_id),
+           payment_method_last4 = COALESCE(?, payment_method_last4),
+           last_error_code = ?,
+           last_error_message = ?
+       WHERE id = ?`,
+      [...updateParams, existingPayment.id]
+    );
+    return;
+  }
+
+  await conn.query(
+    `INSERT INTO payments (booking_id, type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, status, currency, transfer_group, payment_method_id, payment_method_last4, last_error_code, last_error_message, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+    [normalizedBookingId, normalizedType, ...updateParams]
+  );
 }
 
 async function getBookingSettlementContext(connection, bookingId, { forUpdate = false } = {}) {
@@ -7131,6 +7238,27 @@ function ensureSameUserOrRespond(req, res, rawUserId = req.params?.id) {
   }
 
   return requestedUserId;
+}
+
+function isStaffUser(user) {
+  return Boolean(user && ['admin', 'support'].includes(user.role));
+}
+
+function getBookingAccessFlags(user, booking) {
+  const requesterUserId = normalizeNullableInteger(user?.id);
+  const clientUserId = normalizeNullableInteger(booking?.client_user_id ?? booking?.user_id);
+  const providerUserId = normalizeNullableInteger(
+    booking?.provider_user_id
+    ?? booking?.provider_user_id_snapshot
+    ?? booking?.service_user_id
+  );
+
+  return {
+    requesterUserId,
+    isClientOwner: requesterUserId !== null && requesterUserId === clientUserId,
+    isProviderOwner: requesterUserId !== null && requesterUserId === providerUserId,
+    isStaff: isStaffUser(user),
+  };
 }
 
 function isPasswordTooShort(password) {
@@ -14103,9 +14231,7 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
       return res.status(404).json({ error: 'Reserva no encontrada.' });
     }
 
-    const isClientOwner = req.user && Number(req.user.id) === Number(booking.client_user_id);
-    const isProviderOwner = req.user && Number(req.user.id) === Number(booking.provider_user_id_snapshot);
-    const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
+    const { isClientOwner, isProviderOwner, isStaff } = getBookingAccessFlags(req.user, booking);
     if (!isClientOwner && !isProviderOwner && !isStaff) {
       await connection.rollback();
       return res.status(403).json({ error: 'No autorizado.' });
@@ -14156,6 +14282,20 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
           ? 'awaiting_payment'
           : 'none'
       );
+    }
+
+    const normalizedRequestedLegacyStatus = typeof req.body.status !== 'undefined'
+      ? String(req.body.status || '').trim().toLowerCase().replace(/-/g, '_')
+      : null;
+    const isLegacyCompletedStatus = normalizedRequestedLegacyStatus === 'completed';
+    const requestsManualSettlementMutation = (
+      typeof req.body.is_paid !== 'undefined'
+      || typeof req.body.settlement_status !== 'undefined'
+      || (mappedLegacyStatus.settlementStatus && !isLegacyCompletedStatus)
+    );
+    if (requestsManualSettlementMutation && !isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo soporte puede modificar el estado de pago manualmente.' });
     }
 
     const extraPatch = {};
@@ -15448,13 +15588,19 @@ app.patch('/api/bookings/:id/is_paid', authenticateToken, async (req, res) => {
   try {
     await connection.beginTransaction();
     const [[booking]] = await connection.query(
-      'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
+      'SELECT id, client_user_id, provider_user_id_snapshot, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
       [bookingId]
     );
 
     if (!booking) {
       await connection.rollback();
       return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const { isStaff } = getBookingAccessFlags(req.user, booking);
+    if (!isStaff) {
+      await connection.rollback();
+      return res.status(403).json({ error: 'Solo soporte puede modificar el estado de pago manualmente.' });
     }
 
     const nextSettlementStatus = req.body.is_paid ? 'paid' : (
@@ -17453,7 +17599,10 @@ app.post('/api/bookings/:id/transfer', authenticateToken, (req, res) => {
 
 // Generar y descargar factura en PDF de una reserva pagada (2 facturas)
 app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
-  const { id } = req.params;
+  const id = normalizeNullableInteger(req.params.id);
+  if (!id) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
 
   pool.getConnection((err, connection) => {
     if (err) {
@@ -17464,6 +17613,8 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
     const query = `
       SELECT
         b.id AS booking_id,
+        b.client_user_id,
+        COALESCE(b.provider_user_id_snapshot, s.user_id) AS provider_user_id,
         b.service_status,
         b.settlement_status,
         b.requested_start_datetime,
@@ -17531,6 +17682,11 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       }
 
       const data = results[0];
+      const { isClientOwner, isProviderOwner, isStaff } = getBookingAccessFlags(req.user, data);
+      if (!isClientOwner && !isProviderOwner && !isStaff) {
+        return res.status(403).json({ error: 'No autorizado.' });
+      }
+
       data.is_paid = deriveLegacyIsPaid(data.settlement_status);
       data.booking_start_datetime = data.requested_start_datetime;
       data.booking_end_datetime = data.requested_end_datetime;
