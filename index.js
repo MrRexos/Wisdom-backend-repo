@@ -53,6 +53,7 @@ const {
   isWithinLastMinuteWindow,
   getAcceptedBookingInactivityStage,
   normalizeLegacyStatusUpdate,
+  isProtectedLegacyClosureMutation,
   ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
   ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
 } = require('./src/bookingDomain');
@@ -6168,7 +6169,6 @@ async function protectBookingForStripeDispute(paymentIntentId, {
     });
 
     await connection.commit();
-    return sessionResult.insertId;
   } catch (error) {
     try { await connection.rollback(); } catch {}
     throw error;
@@ -16094,6 +16094,14 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
       }
 
       return res.status(409).json({ error: 'La solicitud ha expirado.' });
+    }
+
+    if (!isStaff && isProtectedLegacyClosureMutation(req.body, booking)) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'El cierre y los importes finales deben enviarse mediante la propuesta formal de cierre.',
+        error_code: 'legacy_closure_mutation_blocked',
+      });
     }
 
     const mappedLegacyStatus = typeof req.body.status !== 'undefined'

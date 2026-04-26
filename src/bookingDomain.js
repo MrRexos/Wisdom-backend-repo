@@ -55,6 +55,14 @@ const ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES = Object.freeze([
   }),
 ]);
 const ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE = "accepted_inactivity_auto_canceled";
+const LEGACY_CLOSURE_MUTATION_FIELDS = Object.freeze([
+  "final_price",
+  "proposed_final_price",
+  "service_duration",
+  "requested_duration_minutes",
+  "proposed_final_duration_minutes",
+  "zero_charge_mode",
+]);
 
 function isValidDate(value) {
   return value instanceof Date && !Number.isNaN(value.getTime());
@@ -851,6 +859,32 @@ function normalizeLegacyStatusUpdate(status, currentBooking = null) {
   }
 }
 
+function isProtectedLegacyClosureMutation(payload = {}, currentBooking = null) {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  const mappedLegacyStatus = Object.prototype.hasOwnProperty.call(payload, "status")
+    ? normalizeLegacyStatusUpdate(payload.status, currentBooking)
+    : {};
+  const requestedServiceStatus = Object.prototype.hasOwnProperty.call(payload, "service_status")
+    ? normalizeServiceStatus(payload.service_status, null)
+    : mappedLegacyStatus.serviceStatus;
+  const currentServiceStatus = normalizeServiceStatus(
+    currentBooking?.service_status,
+    "pending_deposit"
+  );
+  const targetServiceStatus = requestedServiceStatus || currentServiceStatus;
+
+  if (targetServiceStatus === "finished") {
+    return true;
+  }
+
+  return LEGACY_CLOSURE_MUTATION_FIELDS.some((field) => (
+    Object.prototype.hasOwnProperty.call(payload, field)
+  ));
+}
+
 module.exports = {
   AUTO_CHARGE_TOLERANCE_FACTOR,
   ONE_WEEK_MS,
@@ -888,4 +922,5 @@ module.exports = {
   hasBookingChangeRequestExpired,
   buildTransitionPatch,
   normalizeLegacyStatusUpdate,
+  isProtectedLegacyClosureMutation,
 };

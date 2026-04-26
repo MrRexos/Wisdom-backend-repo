@@ -27,6 +27,7 @@ const {
   isWithinLastMinuteWindow,
   normalizeMinimumNoticeMinutes,
   normalizeLegacyStatusUpdate,
+  isProtectedLegacyClosureMutation,
   shouldResetBookingToAcceptedAfterFutureReschedule,
 } = require("./bookingDomain");
 
@@ -424,6 +425,38 @@ test("normalizeLegacyStatusUpdate maps old statuses to the new axes", () => {
     serviceStatus: "canceled",
     cancellationReasonCode: "rejected",
   });
+});
+
+test("isProtectedLegacyClosureMutation flags direct closure and final amount payloads", () => {
+  const inProgressBooking = { service_status: "in_progress", settlement_status: "none" };
+
+  assert.equal(
+    isProtectedLegacyClosureMutation({ status: "completed" }, inProgressBooking),
+    true
+  );
+  assert.equal(
+    isProtectedLegacyClosureMutation({ service_status: "finished" }, inProgressBooking),
+    true
+  );
+  assert.equal(
+    isProtectedLegacyClosureMutation({ final_price: 0 }, inProgressBooking),
+    true
+  );
+  assert.equal(
+    isProtectedLegacyClosureMutation({ requested_duration_minutes: 0 }, inProgressBooking),
+    true
+  );
+  assert.equal(
+    isProtectedLegacyClosureMutation(
+      { status: "in_progress" },
+      { service_status: "accepted", settlement_status: "none" }
+    ),
+    false
+  );
+  assert.equal(
+    isProtectedLegacyClosureMutation({ status: "canceled" }, inProgressBooking),
+    false
+  );
 });
 
 test("buildTransitionPatch stamps timestamps when entering lifecycle milestones", () => {
