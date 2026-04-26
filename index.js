@@ -616,6 +616,16 @@ const mapStatus = (piStatus) => {
 // Helpers adicionales para pagos
 const stableKey = (parts) => parts.join(':');
 const MAX_OPEN_GENERAL_PROBLEM_ISSUES_PER_BOOKING = 5;
+const BOOKING_PAYMENT_TYPES = new Set(['deposit', 'final']);
+const FINANCIAL_PAYMENT_STATUSES = new Set([
+  'succeeded',
+  'refund_pending',
+  'partially_refunded',
+  'refunded',
+  'dispute_open',
+  'dispute_won',
+  'dispute_lost',
+]);
 
 // Redondeos consistentes con frontend (BookingScreen)
 const round1 = (n) => {
@@ -2578,6 +2588,21 @@ async function ensureRefundForPaymentIntent({
     return null;
   }
 
+  const refund = await stripe.refunds.create(
+    {
+      payment_intent: paymentIntentId,
+      amount: effectiveRefundAmountCents,
+      metadata,
+    },
+    {
+      idempotencyKey: stableKey(['refund', paymentIntentId, effectiveRefundAmountCents]),
+    }
+  );
+
+  await syncPaymentRefundStateFromStripe(paymentIntentId, {
+    reasonCode: 'stripe_refund_synced',
+  });
+
   if (transferGroup) {
     await reverseBookingTransfersIfNeeded({
       transferGroup,
@@ -2588,16 +2613,7 @@ async function ensureRefundForPaymentIntent({
     });
   }
 
-  return stripe.refunds.create(
-    {
-      payment_intent: paymentIntentId,
-      amount: effectiveRefundAmountCents,
-      metadata,
-    },
-    {
-      idempotencyKey: stableKey(['refund', paymentIntentId, effectiveRefundAmountCents, metadata?.source || 'booking']),
-    }
-  );
+  return refund;
 }
 
 async function triggerStripeRefundForPaymentIntent(paymentIntentId, metadata = {}) {
@@ -4488,6 +4504,452 @@ async function getBookingSettlementContext(connection, bookingId, { forUpdate = 
   return rows[0] || null;
 }
 
+function normalizeBookingPaymentType(value) {
+  const normalizedType = String(value || '').trim().toLowerCase();
+  return BOOKING_PAYMENT_TYPES.has(normalizedType) ? normalizedType : null;
+}
+
+function getStripeObjectId(value) {
+  if (typeof value === 'string') {
+    return value.trim() || null;
+  }
+  if (value && typeof value === 'object' && typeof value.id === 'string') {
+    return value.id.trim() || null;
+  }
+  return null;
+}
+
+function normalizeStripeAmountCents(value) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? Math.max(0, Math.round(numericValue)) : 0;
+}
+
+function getStripeChargeRefundStatus(charge) {
+  if (!charge) {
+    return { refundedAmountCents: 0, capturedAmountCents: 0, fullyRefunded: false };
+  }
+
+  const refundedAmountCents = normalizeStripeAmountCents(charge.amount_refunded);
+  const capturedAmountCents = normalizeStripeAmountCents(
+    charge.amount_captured ?? charge.amount
+  );
+
+  return {
+    refundedAmountCents,
+    capturedAmountCents,
+    fullyRefunded: capturedAmountCents > 0 && refundedAmountCents >= capturedAmountCents,
+  };
+}
+
+async function validateStripePaymentIntentForBookingWebhook(connection, pi, {
+  bookingId,
+  type,
+  eventType,
+} = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  const normalizedType = normalizeBookingPaymentType(type);
+  const paymentIntentId = typeof pi?.id === 'string' ? pi.id : null;
+
+  if (!normalizedBookingId || !normalizedType || !paymentIntentId) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      reason: 'invalid_payment_intent_metadata',
+    };
+  }
+
+  const [[paymentByIntent]] = await connection.query(
+    `SELECT id, booking_id, type, payment_intent_id, amount_cents, status, currency, transfer_group
+     FROM payments
+     WHERE payment_intent_id = ?
+     LIMIT 1
+     FOR UPDATE`,
+    [paymentIntentId]
+  );
+
+  const [[paymentByScope]] = await connection.query(
+    `SELECT id, booking_id, type, payment_intent_id, amount_cents, status, currency, transfer_group
+     FROM payments
+     WHERE booking_id = ? AND type = ?
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedBookingId, normalizedType]
+  );
+
+  const paymentRow = paymentByIntent || paymentByScope || null;
+  if (!paymentRow) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      reason: 'payment_row_missing',
+    };
+  }
+
+  if (
+    paymentByIntent
+    && (
+      Number(paymentByIntent.booking_id) !== normalizedBookingId
+      || normalizeBookingPaymentType(paymentByIntent.type) !== normalizedType
+    )
+  ) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      paymentRow,
+      reason: 'payment_intent_scope_mismatch',
+    };
+  }
+
+  if (paymentByIntent && paymentByScope && Number(paymentByIntent.id) !== Number(paymentByScope.id)) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      paymentRow,
+      reason: 'payment_intent_conflicts_with_booking_type',
+    };
+  }
+
+  if (paymentByScope?.payment_intent_id && paymentByScope.payment_intent_id !== paymentIntentId) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      paymentRow: paymentByScope,
+      reason: 'booking_type_already_has_different_payment_intent',
+    };
+  }
+
+  const booking = await getBookingSettlementContext(connection, normalizedBookingId, { forUpdate: true });
+  if (!booking) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      paymentRow,
+      reason: 'booking_not_found',
+    };
+  }
+
+  const expectedAmountCents = normalizeStripeAmountCents(paymentRow.amount_cents);
+  const intentAmountCents = normalizeStripeAmountCents(pi.amount);
+  if (expectedAmountCents > 0 && intentAmountCents !== expectedAmountCents) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: 'payment_intent_amount_mismatch',
+      expectedAmountCents,
+      actualAmountCents: intentAmountCents,
+    };
+  }
+
+  const receivedAmountCents = normalizeStripeAmountCents(pi.amount_received);
+  if (eventType === 'payment_intent.succeeded' && expectedAmountCents > 0 && receivedAmountCents !== expectedAmountCents) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: 'payment_intent_received_amount_mismatch',
+      expectedAmountCents,
+      actualAmountCents: receivedAmountCents,
+    };
+  }
+
+  const expectedCurrency = normalizeCurrencyCode(
+    paymentRow.currency,
+    normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR')
+  );
+  const intentCurrency = normalizeCurrencyCode(pi.currency, null);
+  if (expectedCurrency && intentCurrency && intentCurrency !== expectedCurrency) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: 'payment_intent_currency_mismatch',
+      expectedCurrency,
+      actualCurrency: intentCurrency,
+    };
+  }
+
+  const expectedCustomerId = getStripeObjectId(booking.customer_id);
+  const intentCustomerId = getStripeObjectId(pi.customer);
+  if (expectedCustomerId && intentCustomerId && intentCustomerId !== expectedCustomerId) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: 'payment_intent_customer_mismatch',
+      expectedCustomerId,
+      actualCustomerId: intentCustomerId,
+    };
+  }
+
+  const expectedTransferGroup = paymentRow.transfer_group || `booking-${normalizedBookingId}`;
+  if (pi.transfer_group && expectedTransferGroup && pi.transfer_group !== expectedTransferGroup) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: 'payment_intent_transfer_group_mismatch',
+      expectedTransferGroup,
+      actualTransferGroup: pi.transfer_group,
+    };
+  }
+
+  return {
+    valid: true,
+    bookingId: normalizedBookingId,
+    type: normalizedType,
+    booking,
+    paymentRow,
+    amountCents: expectedAmountCents || intentAmountCents,
+    currency: expectedCurrency || intentCurrency || 'EUR',
+  };
+}
+
+async function flagBookingPaymentForManualReview(connection, bookingId, {
+  changedByUserId = null,
+  nextSettlementStatus = 'manual_review_required',
+  reasonCode = 'payment_manual_review_required',
+  details = 'La reserva requiere revisión manual de pagos.',
+  issueType = 'payment_dispute',
+} = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return false;
+  }
+
+  const booking = await getBookingSettlementContext(connection, normalizedBookingId, { forUpdate: true });
+  if (!booking) {
+    return false;
+  }
+
+  await upsertBookingIssueReport(connection, {
+    bookingId: normalizedBookingId,
+    reportedByUserId: changedByUserId,
+    reportedAgainstUserId: booking.provider_user_id_snapshot || booking.effective_provider_user_id || null,
+    issueType,
+    status: 'open',
+    details,
+  });
+
+  await transitionBookingStateRecord(connection, booking, {
+    nextServiceStatus: normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'finished'
+      ? 'finished'
+      : booking.service_status,
+    nextSettlementStatus,
+    changedByUserId,
+    reasonCode,
+    extraPatch: {
+      client_approval_deadline_at: null,
+    },
+  });
+
+  return true;
+}
+
+async function deriveAndSyncBookingRefundSettlementStatus(connection, bookingId, {
+  changedByUserId = null,
+  reasonCode = 'booking_refund_state_synced',
+} = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return null;
+  }
+
+  const booking = await getBookingSettlementContext(connection, normalizedBookingId, { forUpdate: true });
+  if (!booking) {
+    return null;
+  }
+
+  const [paymentRows] = await connection.query(
+    `SELECT id, type, amount_cents, status
+     FROM payments
+     WHERE booking_id = ? AND type IN ('deposit', 'final')
+     FOR UPDATE`,
+    [normalizedBookingId]
+  );
+
+  const financialRows = (paymentRows || []).filter((row) => {
+    const amountCents = normalizeStripeAmountCents(row.amount_cents);
+    const status = String(row.status || '').trim().toLowerCase();
+    return amountCents > 0 && FINANCIAL_PAYMENT_STATUSES.has(status);
+  });
+
+  if (financialRows.length === 0) {
+    return normalizeSettlementStatus(booking.settlement_status, 'none');
+  }
+
+  const statuses = financialRows.map((row) => String(row.status || '').trim().toLowerCase());
+  const hasRefundPending = statuses.includes('refund_pending');
+  const hasRefunded = statuses.includes('refunded');
+  const hasPartiallyRefunded = statuses.includes('partially_refunded');
+  const allFinancialPaymentsRefunded = statuses.every((status) => status === 'refunded');
+
+  let nextSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+  if (allFinancialPaymentsRefunded) {
+    nextSettlementStatus = 'refunded';
+  } else if (hasRefundPending) {
+    nextSettlementStatus = 'refund_pending';
+  } else if (hasRefunded || hasPartiallyRefunded) {
+    nextSettlementStatus = 'partially_refunded';
+  }
+
+  if (nextSettlementStatus !== normalizeSettlementStatus(booking.settlement_status, 'none')) {
+    await transitionBookingStateRecord(connection, booking, {
+      nextServiceStatus: booking.service_status,
+      nextSettlementStatus,
+      changedByUserId,
+      reasonCode,
+      extraPatch: {
+        client_approval_deadline_at: null,
+      },
+    });
+  }
+
+  return nextSettlementStatus;
+}
+
+async function syncPaymentRefundStateFromStripe(paymentIntentId, {
+  reasonCode = 'stripe_refund_synced',
+} = {}) {
+  const normalizedPaymentIntentId = typeof paymentIntentId === 'string' ? paymentIntentId.trim() : '';
+  if (!normalizedPaymentIntentId) {
+    return null;
+  }
+
+  const intent = await retrievePaymentIntentWithCharge(normalizedPaymentIntentId);
+  const latestCharge = intent?.latest_charge;
+  if (!latestCharge) {
+    return null;
+  }
+
+  const { refundedAmountCents, fullyRefunded } = getStripeChargeRefundStatus(latestCharge);
+  if (refundedAmountCents <= 0) {
+    return null;
+  }
+
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
+    const [[payment]] = await connection.query(
+      'SELECT id, booking_id, type FROM payments WHERE payment_intent_id = ? FOR UPDATE',
+      [normalizedPaymentIntentId]
+    );
+
+    if (!payment) {
+      await connection.rollback();
+      return null;
+    }
+
+    await connection.query(
+      'UPDATE payments SET status = ? WHERE id = ?',
+      [fullyRefunded ? 'refunded' : 'partially_refunded', payment.id]
+    );
+
+    const nextSettlementStatus = await deriveAndSyncBookingRefundSettlementStatus(connection, payment.booking_id, {
+      reasonCode,
+    });
+
+    await connection.commit();
+    return {
+      bookingId: payment.booking_id,
+      paymentId: payment.id,
+      fullyRefunded,
+      settlementStatus: nextSettlementStatus,
+    };
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function verifyPaymentIntentCapturedForSettlement({
+  paymentIntentId,
+  expectedAmountCents,
+  expectedCurrency,
+  expectedCustomerId = null,
+} = {}) {
+  const normalizedPaymentIntentId = typeof paymentIntentId === 'string' ? paymentIntentId.trim() : '';
+  const normalizedExpectedAmount = normalizeStripeAmountCents(expectedAmountCents);
+  const normalizedExpectedCurrency = normalizeCurrencyCode(expectedCurrency, null);
+  if (!normalizedPaymentIntentId || normalizedExpectedAmount <= 0) {
+    return { valid: false, reason: 'invalid_payment_intent_verification_input' };
+  }
+
+  const intent = await retrievePaymentIntentWithCharge(normalizedPaymentIntentId);
+  const latestCharge = intent?.latest_charge;
+  if (!intent || !latestCharge) {
+    return { valid: false, reason: 'payment_intent_charge_missing' };
+  }
+
+  if (intent.status !== 'succeeded') {
+    return { valid: false, reason: 'payment_intent_not_succeeded', status: intent.status };
+  }
+
+  const intentCurrency = normalizeCurrencyCode(intent.currency, null);
+  if (normalizedExpectedCurrency && intentCurrency && intentCurrency !== normalizedExpectedCurrency) {
+    return {
+      valid: false,
+      reason: 'payment_intent_currency_mismatch',
+      expectedCurrency: normalizedExpectedCurrency,
+      actualCurrency: intentCurrency,
+    };
+  }
+
+  const expectedCustomer = getStripeObjectId(expectedCustomerId);
+  const actualCustomer = getStripeObjectId(intent.customer);
+  if (expectedCustomer && actualCustomer && expectedCustomer !== actualCustomer) {
+    return {
+      valid: false,
+      reason: 'payment_intent_customer_mismatch',
+      expectedCustomerId: expectedCustomer,
+      actualCustomerId: actualCustomer,
+    };
+  }
+
+  const { refundedAmountCents } = getStripeChargeRefundStatus(latestCharge);
+  if (refundedAmountCents > 0) {
+    return {
+      valid: false,
+      reason: 'payment_intent_already_refunded',
+      refundedAmountCents,
+    };
+  }
+
+  const amountReceivedCents = normalizeStripeAmountCents(intent.amount_received);
+  const capturedAmountCents = normalizeStripeAmountCents(
+    latestCharge.amount_captured ?? latestCharge.amount
+  );
+  const effectiveCapturedAmountCents = Math.max(amountReceivedCents, capturedAmountCents);
+  if (effectiveCapturedAmountCents < normalizedExpectedAmount) {
+    return {
+      valid: false,
+      reason: 'payment_intent_captured_amount_too_low',
+      expectedAmountCents: normalizedExpectedAmount,
+      actualAmountCents: effectiveCapturedAmountCents,
+    };
+  }
+
+  return { valid: true, intent, latestCharge };
+}
+
 function buildActualBookingSettlementSnapshot({
   booking,
   depositPayment,
@@ -4578,32 +5040,18 @@ async function markBookingSettlementForReview(bookingId, {
   const connection = await pool.promise().getConnection();
   try {
     await connection.beginTransaction();
+    const flagged = await flagBookingPaymentForManualReview(connection, normalizedBookingId, {
+      changedByUserId,
+      nextSettlementStatus,
+      reasonCode,
+      details,
+      issueType,
+    });
 
-    const booking = await getBookingSettlementContext(connection, normalizedBookingId, { forUpdate: true });
-    if (!booking) {
+    if (!flagged) {
       await connection.rollback();
       return false;
     }
-
-    await upsertBookingIssueReport(connection, {
-      bookingId: normalizedBookingId,
-      reportedByUserId: changedByUserId,
-      reportedAgainstUserId: booking.provider_user_id_snapshot || booking.effective_provider_user_id || null,
-      issueType,
-      status: 'open',
-      details,
-    });
-    await transitionBookingStateRecord(connection, booking, {
-      nextServiceStatus: normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'finished'
-        ? 'finished'
-        : booking.service_status,
-      nextSettlementStatus,
-      changedByUserId,
-      reasonCode,
-      extraPatch: {
-        client_approval_deadline_at: null,
-      },
-    });
 
     await connection.commit();
 
@@ -4672,11 +5120,14 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
       depositPayment,
     });
     transferGroup = finalPayment?.transfer_group || depositPayment?.transfer_group || `booking-${normalizedBookingId}`;
-    const normalizedSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+    const finalPaymentStatus = String(finalPayment?.status || '').trim().toLowerCase();
     if (
       settlementSnapshot.amountDueFromClientCents > 0
-      && !['succeeded', 'partially_refunded', 'refunded'].includes(String(finalPayment?.status || '').trim().toLowerCase())
-      && normalizedSettlementStatus !== 'paid'
+      && (
+        !finalPayment?.payment_intent_id
+        || finalPaymentStatus !== 'succeeded'
+        || normalizeStripeAmountCents(finalPayment.amount_cents) < settlementSnapshot.amountDueFromClientCents
+      )
     ) {
       await initialConnection.rollback();
       return { settled: false, reason: 'final_payment_not_succeeded' };
@@ -4692,6 +5143,40 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
     return { settled: false, reason: 'load_failed', error };
   } finally {
     initialConnection.release();
+  }
+
+  try {
+    if (settlementSnapshot.amountDueFromClientCents > 0 && finalPayment?.payment_intent_id) {
+      const paymentVerification = await verifyPaymentIntentCapturedForSettlement({
+        paymentIntentId: finalPayment.payment_intent_id,
+        expectedAmountCents: settlementSnapshot.amountDueFromClientCents,
+        expectedCurrency: settlementSnapshot.chargeCurrency,
+        expectedCustomerId: booking.customer_id,
+      });
+
+      if (!paymentVerification.valid) {
+        await markBookingSettlementForReview(normalizedBookingId, {
+          changedByUserId,
+          nextSettlementStatus: 'manual_review_required',
+          reasonCode: 'final_payment_integrity_failed',
+          details: `El pago final no supera la verificación de Stripe: ${paymentVerification.reason}.`,
+        });
+        return { settled: false, reason: paymentVerification.reason };
+      }
+    }
+  } catch (verificationError) {
+    console.error('Error verifying final PaymentIntent before settlement:', {
+      bookingId: normalizedBookingId,
+      paymentIntentId: finalPayment?.payment_intent_id || null,
+      error: verificationError.message,
+    });
+    await markBookingSettlementForReview(normalizedBookingId, {
+      changedByUserId,
+      nextSettlementStatus: 'manual_review_required',
+      reasonCode: 'final_payment_integrity_check_failed',
+      details: `No se pudo verificar el pago final en Stripe: ${verificationError.message}`,
+    });
+    return { settled: false, reason: 'final_payment_verification_failed', error: verificationError };
   }
 
   try {
@@ -19588,22 +20073,48 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
       case 'payment_intent.payment_failed':
       case 'payment_intent.canceled': {
         let pi = event.data.object;
-        const bookingId = pi?.metadata?.booking_id;
-        const type = pi?.metadata?.type;
+        const bookingId = normalizeNullableInteger(pi?.metadata?.booking_id);
+        const type = normalizeBookingPaymentType(pi?.metadata?.type);
         if (!bookingId || !type) break;
 
         const paymentPersistence = await resolvePaymentIntentPersistence(pi);
         pi = paymentPersistence.intent || pi;
 
-        const amountCents = typeof pi.amount_received === 'number'
-          ? pi.amount_received
-          : (typeof pi.amount === 'number' ? pi.amount : 0);
         let depositNotification = null;
         let shouldReleaseEphemeralPaymentMethods = false;
         let closureFollowUpEmailMode = null;
         const shouldSavePaymentMethod = normalizeBooleanInput(pi?.metadata?.save_payment_method, false);
 
         await connection.beginTransaction();
+        const webhookValidation = await validateStripePaymentIntentForBookingWebhook(connection, pi, {
+          bookingId,
+          type,
+          eventType: event.type,
+        });
+
+        if (!webhookValidation.valid) {
+          const details = `Webhook de Stripe rechazado para PaymentIntent ${pi?.id || 'desconocido'} (${event.type}): ${webhookValidation.reason}.`;
+          await flagBookingPaymentForManualReview(connection, webhookValidation.bookingId || bookingId, {
+            nextSettlementStatus: 'manual_review_required',
+            reasonCode: 'stripe_webhook_validation_failed',
+            details,
+          });
+          await connection.commit();
+          console.error('Stripe webhook payment validation failed:', {
+            eventType: event.type,
+            paymentIntentId: pi?.id || null,
+            bookingId,
+            type,
+            reason: webhookValidation.reason,
+            expectedAmountCents: webhookValidation.expectedAmountCents,
+            actualAmountCents: webhookValidation.actualAmountCents,
+            expectedCurrency: webhookValidation.expectedCurrency,
+            actualCurrency: webhookValidation.actualCurrency,
+          });
+          break;
+        }
+
+        const amountCents = webhookValidation.amountCents;
         await upsertPayment(connection, {
           bookingId,
           type,
@@ -19829,39 +20340,34 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 
       case 'charge.refunded': {
         const charge = event.data.object;
-        const piId = charge.payment_intent;
-        const fullyRefunded = charge.amount_refunded >= (charge.amount_captured || charge.amount);
+        const piId = getStripeObjectId(charge.payment_intent);
+        const { fullyRefunded } = getStripeChargeRefundStatus(charge);
         if (!piId) break;
+        let shouldReleaseEphemeralPaymentMethods = false;
+        let refundedBookingId = null;
         await connection.beginTransaction();
         const [[payment]] = await connection.query(
-          'SELECT booking_id, type FROM payments WHERE payment_intent_id = ? FOR UPDATE',
+          'SELECT id, booking_id, type FROM payments WHERE payment_intent_id = ? FOR UPDATE',
           [piId]
         );
         if (payment) {
+          refundedBookingId = payment.booking_id;
           await connection.query(
-            'UPDATE payments SET status = ? WHERE payment_intent_id = ?',
-            [fullyRefunded ? 'refunded' : 'partially_refunded', piId]
+            'UPDATE payments SET status = ? WHERE id = ?',
+            [fullyRefunded ? 'refunded' : 'partially_refunded', payment.id]
           );
-          if (fullyRefunded) {
-            const [[bookingRow]] = await connection.query(
-              'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
-              [payment.booking_id]
-            );
-            if (bookingRow) {
-              await transitionBookingStateRecord(connection, bookingRow, {
-                nextSettlementStatus: 'refunded',
-                reasonCode: payment.type === 'final' ? 'final_refunded_webhook' : 'deposit_refunded_webhook',
-              });
-            }
-          }
+          const nextSettlementStatus = await deriveAndSyncBookingRefundSettlementStatus(connection, payment.booking_id, {
+            reasonCode: payment.type === 'final' ? 'final_refunded_webhook' : 'deposit_refunded_webhook',
+          });
+          shouldReleaseEphemeralPaymentMethods = nextSettlementStatus === 'refunded';
         }
         await connection.commit();
-        if (payment?.booking_id && fullyRefunded) {
+        if (refundedBookingId && shouldReleaseEphemeralPaymentMethods) {
           try {
-            await releaseEphemeralBookingPaymentMethodsIfClosed(payment.booking_id);
+            await releaseEphemeralBookingPaymentMethodsIfClosed(refundedBookingId);
           } catch (cleanupError) {
             console.error('Error releasing ephemeral payment methods after refund webhook:', {
-              bookingId: payment.booking_id,
+              bookingId: refundedBookingId,
               error: cleanupError.message,
             });
           }
