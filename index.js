@@ -617,6 +617,14 @@ const mapStatus = (piStatus) => {
 const stableKey = (parts) => parts.join(':');
 const MAX_OPEN_GENERAL_PROBLEM_ISSUES_PER_BOOKING = 5;
 const BOOKING_PAYMENT_TYPES = new Set(['deposit', 'final']);
+const PAYMENT_STATUSES_PROTECTED_FROM_SUCCESS_REGRESSION = new Set([
+  'refund_pending',
+  'partially_refunded',
+  'refunded',
+  'dispute_open',
+  'dispute_won',
+  'dispute_lost',
+]);
 const FINANCIAL_PAYMENT_STATUSES = new Set([
   'succeeded',
   'refund_pending',
@@ -2849,18 +2857,13 @@ async function expireRequestedBookingByIdIfNeeded(bookingId) {
   }
 
   if (refundRequest?.paymentIntentId) {
-    try {
-      await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
-        booking_id: String(refundRequest.bookingId),
-        source: 'booking_expired',
-      });
-    } catch (refundError) {
-      console.error('Error refunding expired booking deposit:', {
-        bookingId: refundRequest.bookingId,
-        paymentIntentId: refundRequest.paymentIntentId,
-        error: refundError.message,
-      });
-    }
+    await executeRefundRequestOrFlagForManualReview(refundRequest, {
+      booking_id: String(refundRequest.bookingId),
+      source: 'booking_expired',
+    }, {
+      failureReasonCode: 'booking_expired_refund_failed',
+      logMessage: 'Error refunding expired booking deposit:',
+    });
   }
 
   return {
@@ -4370,11 +4373,12 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
   const normalizedBookingId = await lockPaymentBookingForUpdate(conn, bookingId);
   const normalizedType = String(type || '').trim();
   const normalizedPaymentIntentId = paymentIntentId || null;
+  const normalizedIncomingStatus = String(status || '').trim().toLowerCase();
   let existingPayment = null;
 
   if (normalizedPaymentIntentId) {
     const [intentRows] = await conn.query(
-      `SELECT id, payment_intent_id
+      `SELECT id, payment_intent_id, status
        FROM payments
        WHERE payment_intent_id = ?
        LIMIT 1
@@ -4386,7 +4390,7 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
 
   if (!existingPayment) {
     const [scopeRows] = await conn.query(
-      `SELECT id, payment_intent_id
+      `SELECT id, payment_intent_id, status
        FROM payments
        WHERE booking_id = ? AND type = ?
        ORDER BY id DESC
@@ -4397,12 +4401,20 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
     existingPayment = scopeRows[0] || null;
   }
 
+  const existingStatus = String(existingPayment?.status || '').trim().toLowerCase();
+  const statusToPersist = (
+    PAYMENT_STATUSES_PROTECTED_FROM_SUCCESS_REGRESSION.has(existingStatus)
+    && ['succeeded', 'processing', 'requires_action'].includes(normalizedIncomingStatus)
+  )
+    ? existingStatus
+    : normalizedIncomingStatus;
+
   const updateParams = [
     normalizedPaymentIntentId,
     amountCents ?? 0,
     commissionSnapshotCents ?? null,
     finalPriceSnapshotCents ?? null,
-    status,
+    statusToPersist,
     normalizeCurrencyCode(currency, 'EUR'),
     transferGroup || null,
     paymentMethodId || null,
@@ -5080,6 +5092,278 @@ async function markBookingSettlementForReview(bookingId, {
   } finally {
     connection.release();
   }
+}
+
+async function markRefundFailureForManualReview({
+  bookingId,
+  paymentIntentId = null,
+  changedByUserId = null,
+  reasonCode = 'stripe_refund_failed',
+  source = 'booking_refund',
+  error = null,
+} = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return false;
+  }
+
+  const normalizedPaymentIntentId = typeof paymentIntentId === 'string' ? paymentIntentId.trim() : null;
+  const errorCode = String(error?.code || error?.type || 'stripe_refund_failed').slice(0, 120);
+  const errorMessage = String(error?.message || error || 'Error desconocido').slice(0, 1000);
+  const details = `No se pudo completar automáticamente el reembolso (${source}). PaymentIntent: ${normalizedPaymentIntentId || 'desconocido'}. Error: ${errorMessage}`;
+
+  const connection = await pool.promise().getConnection();
+  let flagged = false;
+  try {
+    await connection.beginTransaction();
+
+    if (normalizedPaymentIntentId) {
+      await connection.query(
+        `
+        UPDATE payments
+        SET last_error_code = ?,
+            last_error_message = ?
+        WHERE payment_intent_id = ?
+        `,
+        [errorCode, errorMessage, normalizedPaymentIntentId]
+      );
+    }
+
+    flagged = await flagBookingPaymentForManualReview(connection, normalizedBookingId, {
+      changedByUserId,
+      nextSettlementStatus: 'manual_review_required',
+      reasonCode,
+      details,
+      issueType: 'payment_dispute',
+    });
+
+    if (!flagged) {
+      await connection.rollback();
+      return false;
+    }
+
+    await connection.commit();
+  } catch (reviewError) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error marking failed refund for manual review:', {
+      bookingId: normalizedBookingId,
+      paymentIntentId: normalizedPaymentIntentId,
+      error: reviewError.message,
+    });
+    return false;
+  } finally {
+    connection.release();
+  }
+
+  try {
+    await sendBookingSupportAlertEmail({
+      bookingId: normalizedBookingId,
+      headline: 'Reembolso pendiente de revisión',
+      details,
+      category: 'payment_dispute',
+    });
+  } catch (emailError) {
+    console.error('Error sending refund failure support alert email:', {
+      bookingId: normalizedBookingId,
+      paymentIntentId: normalizedPaymentIntentId,
+      error: emailError.message,
+    });
+  }
+
+  return flagged;
+}
+
+async function executeRefundRequestOrFlagForManualReview(refundRequest, metadata = {}, {
+  changedByUserId = null,
+  failureReasonCode = 'stripe_refund_failed',
+  logMessage = 'Error refunding booking payment:',
+} = {}) {
+  if (!refundRequest?.paymentIntentId) {
+    return false;
+  }
+
+  try {
+    await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, metadata);
+    return true;
+  } catch (refundError) {
+    console.error(logMessage, {
+      bookingId: refundRequest.bookingId,
+      paymentIntentId: refundRequest.paymentIntentId,
+      error: refundError.message,
+    });
+    await markRefundFailureForManualReview({
+      bookingId: refundRequest.bookingId,
+      paymentIntentId: refundRequest.paymentIntentId,
+      changedByUserId,
+      reasonCode: failureReasonCode,
+      source: metadata?.source || refundRequest.reasonCode || 'booking_refund',
+      error: refundError,
+    });
+    return false;
+  }
+}
+
+async function applySuccessfulDepositPaymentForBooking(connection, {
+  bookingId,
+  intent,
+  paymentPersistence = {},
+  saveForFuture = false,
+  changedByUserId = null,
+  reasonCode = 'deposit_succeeded',
+  staleReasonCode = 'late_deposit_succeeded_refund_pending',
+  amountCents = null,
+  currency = null,
+} = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId || !intent?.id) {
+    return { applied: false, reason: 'invalid_deposit_success_input' };
+  }
+
+  const [[depositPaymentRow]] = await connection.query(
+    `SELECT id, amount_cents, final_price_snapshot_cents, currency, status
+     FROM payments
+     WHERE payment_intent_id = ?
+     LIMIT 1
+     FOR UPDATE`,
+    [intent.id]
+  );
+
+  const [[bookingRow]] = await connection.query(
+    `SELECT
+       b.id,
+       b.client_user_id,
+       b.service_status,
+       b.settlement_status,
+       b.deposit_confirmed_at,
+       b.requested_start_datetime,
+       b.requested_end_datetime,
+       b.service_currency_snapshot,
+       b.estimated_total_amount_cents,
+       COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
+       client.first_name AS client_first_name,
+       client.surname AS client_surname,
+       client.username AS client_username,
+       client.email AS client_email,
+       prof.first_name AS professional_first_name,
+       prof.surname AS professional_surname,
+       prof.username AS professional_username,
+       prof.email AS professional_email
+     FROM booking b
+     LEFT JOIN user_account client ON client.id = b.client_user_id
+     LEFT JOIN service s ON s.id = b.service_id
+     LEFT JOIN user_account prof ON prof.id = COALESCE(s.user_id, b.provider_user_id_snapshot)
+     WHERE b.id = ?
+     LIMIT 1
+     FOR UPDATE`,
+    [normalizedBookingId]
+  );
+
+  if (!bookingRow) {
+    return { applied: false, reason: 'booking_not_found' };
+  }
+
+  await syncBookingSelectedPaymentMethodFromIntent(connection, {
+    bookingId: normalizedBookingId,
+    userId: bookingRow.client_user_id,
+    intent,
+    paymentMethodFallback: paymentPersistence.paymentMethodFallback || null,
+    saveForFuture,
+  });
+
+  const normalizedServiceStatus = normalizeServiceStatus(bookingRow.service_status, 'pending_deposit');
+  const normalizedSettlementStatus = normalizeSettlementStatus(bookingRow.settlement_status, 'none');
+  const depositPatch = {
+    deposit_confirmed_at: bookingRow.deposit_confirmed_at || new Date(),
+    deposit_amount_cents_snapshot: depositPaymentRow?.amount_cents ?? amountCents,
+    deposit_currency_snapshot: normalizeCurrencyCode(depositPaymentRow?.currency, currency || intent?.currency || 'EUR'),
+  };
+
+  if (normalizedServiceStatus === 'pending_deposit') {
+    await transitionBookingStateRecord(connection, bookingRow, {
+      nextServiceStatus: 'requested',
+      nextSettlementStatus: normalizedSettlementStatus === 'payment_failed' ? 'none' : bookingRow.settlement_status,
+      changedByUserId,
+      reasonCode,
+      extraPatch: depositPatch,
+    });
+
+    return {
+      applied: true,
+      action: 'promoted_to_requested',
+      depositNotification: {
+        booking: {
+          id: bookingRow.id,
+          serviceTitle: bookingRow.service_title,
+          start: bookingRow.requested_start_datetime,
+          end: bookingRow.requested_end_datetime,
+          finalPrice: bookingRow.estimated_total_amount_cents != null
+            ? fromMinorUnits(bookingRow.estimated_total_amount_cents, bookingRow.service_currency_snapshot || 'EUR')
+            : null,
+          professional: {
+            firstName: bookingRow.professional_first_name,
+            surname: bookingRow.professional_surname,
+            username: bookingRow.professional_username,
+            email: bookingRow.professional_email,
+          },
+          client: {
+            firstName: bookingRow.client_first_name,
+            surname: bookingRow.client_surname,
+            username: bookingRow.client_username,
+            email: bookingRow.client_email,
+          },
+        },
+        depositAmountCents: depositPaymentRow?.amount_cents ?? amountCents,
+        finalPriceSnapshotCents: depositPaymentRow?.final_price_snapshot_cents ?? null,
+        currency: normalizeCurrencyCode(depositPaymentRow?.currency, currency || intent?.currency || 'EUR'),
+      },
+    };
+  }
+
+  if (['canceled', 'expired'].includes(normalizedServiceStatus) && !bookingRow.deposit_confirmed_at) {
+    await transitionBookingStateRecord(connection, bookingRow, {
+      nextServiceStatus: bookingRow.service_status,
+      nextSettlementStatus: 'refund_pending',
+      changedByUserId,
+      reasonCode: staleReasonCode,
+      extraPatch: {
+        ...depositPatch,
+        client_approval_deadline_at: null,
+      },
+    });
+
+    if (depositPaymentRow?.id) {
+      await connection.query(
+        'UPDATE payments SET status = ? WHERE id = ?',
+        ['refund_pending', depositPaymentRow.id]
+      );
+    }
+
+    return {
+      applied: true,
+      action: 'refund_pending_for_closed_booking',
+      refundRequest: {
+        bookingId: normalizedBookingId,
+        paymentIntentId: intent.id,
+        reasonCode: staleReasonCode,
+      },
+    };
+  }
+
+  if (!bookingRow.deposit_confirmed_at) {
+    await transitionBookingStateRecord(connection, bookingRow, {
+      nextServiceStatus: bookingRow.service_status,
+      nextSettlementStatus: bookingRow.settlement_status,
+      changedByUserId,
+      reasonCode: `${reasonCode}_recorded_without_transition`,
+      extraPatch: depositPatch,
+    });
+  }
+
+  return {
+    applied: false,
+    action: 'ignored_non_pending_booking',
+    serviceStatus: normalizedServiceStatus,
+  };
 }
 
 async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
@@ -8563,18 +8847,13 @@ cron.schedule('*/10 * * * *', async () => {
       }
 
       if (result.refundRequest?.paymentIntentId) {
-        try {
-          await triggerStripeRefundForPaymentIntent(result.refundRequest.paymentIntentId, {
-            booking_id: String(result.refundRequest.bookingId),
-            source: 'accepted_inactivity_auto_canceled',
-          });
-        } catch (refundError) {
-          console.error('Error refunding deposit after accepted inactivity auto-cancel:', {
-            bookingId: result.refundRequest.bookingId,
-            paymentIntentId: result.refundRequest.paymentIntentId,
-            error: refundError.message,
-          });
-        }
+        await executeRefundRequestOrFlagForManualReview(result.refundRequest, {
+          booking_id: String(result.refundRequest.bookingId),
+          source: 'accepted_inactivity_auto_canceled',
+        }, {
+          failureReasonCode: 'accepted_inactivity_refund_failed',
+          logMessage: 'Error refunding deposit after accepted inactivity auto-cancel:',
+        });
       } else {
         try {
           await releaseEphemeralBookingPaymentMethodsIfClosed(row.id);
@@ -14419,18 +14698,14 @@ app.post('/api/bookings/:id/prepare-rebooking', authenticateToken, async (req, r
     await connection.commit();
 
     if (refundRequest?.paymentIntentId) {
-      try {
-        await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
-          booking_id: String(refundRequest.bookingId),
-          source: finalServiceStatus === 'expired' ? 'booking_expired_rebooking' : 'booking_replaced',
-        });
-      } catch (refundError) {
-        console.error('Error refunding booking deposit before rebooking:', {
-          bookingId: refundRequest.bookingId,
-          paymentIntentId: refundRequest.paymentIntentId,
-          error: refundError.message,
-        });
-      }
+      await executeRefundRequestOrFlagForManualReview(refundRequest, {
+        booking_id: String(refundRequest.bookingId),
+        source: finalServiceStatus === 'expired' ? 'booking_expired_rebooking' : 'booking_replaced',
+      }, {
+        changedByUserId: req.user?.id || null,
+        failureReasonCode: 'rebooking_refund_failed',
+        logMessage: 'Error refunding booking deposit before rebooking:',
+      });
     }
 
     if (shouldReleaseEphemeralPaymentMethods) {
@@ -14733,18 +15008,14 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
       await connection.commit();
 
       if (refundRequest?.paymentIntentId) {
-        try {
-          await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
-            booking_id: String(refundRequest.bookingId),
-            source: 'booking_expired',
-          });
-        } catch (refundError) {
-          console.error('Error refunding expired booking deposit during status update:', {
-            bookingId: refundRequest.bookingId,
-            paymentIntentId: refundRequest.paymentIntentId,
-            error: refundError.message,
-          });
-        }
+        await executeRefundRequestOrFlagForManualReview(refundRequest, {
+          booking_id: String(refundRequest.bookingId),
+          source: 'booking_expired',
+        }, {
+          changedByUserId: req.user?.id || null,
+          failureReasonCode: 'booking_expired_refund_failed',
+          logMessage: 'Error refunding expired booking deposit during status update:',
+        });
       }
 
       return res.status(409).json({ error: 'La solicitud ha expirado.' });
@@ -15032,18 +15303,16 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
     }
 
     if (refundRequest?.paymentIntentId) {
-      try {
-        await triggerStripeRefundForPaymentIntent(refundRequest.paymentIntentId, {
-          booking_id: String(refundRequest.bookingId),
-          source: normalizedNextServiceStatus === 'expired' ? 'booking_expired' : 'booking_canceled',
-        });
-      } catch (refundError) {
-        console.error('Error refunding booking deposit after state update:', {
-          bookingId: refundRequest.bookingId,
-          paymentIntentId: refundRequest.paymentIntentId,
-          error: refundError.message,
-        });
-      }
+      await executeRefundRequestOrFlagForManualReview(refundRequest, {
+        booking_id: String(refundRequest.bookingId),
+        source: normalizedNextServiceStatus === 'expired' ? 'booking_expired' : 'booking_canceled',
+      }, {
+        changedByUserId: req.user?.id || null,
+        failureReasonCode: normalizedNextServiceStatus === 'expired'
+          ? 'booking_expired_refund_failed'
+          : 'booking_canceled_refund_failed',
+        logMessage: 'Error refunding booking deposit after state update:',
+      });
     }
 
     if (normalizedNextServiceStatus === 'canceled' && !refundRequest?.paymentIntentId) {
@@ -16853,6 +17122,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
   let payment;
   let commissionCents;
   let chargeCurrency = 'EUR';
+  let depositSuccessResult = null;
 
   const connection = await pool.promise().getConnection();
   try {
@@ -17206,23 +17476,19 @@ const round2 = (n) => {
         lastErrorMessage: paymentPersistence.lastErrorMessage,
       });
       if (intent.status === 'succeeded') {
-        await syncBookingSelectedPaymentMethodFromIntent(conn2, {
+        depositSuccessResult = await applySuccessfulDepositPaymentForBooking(conn2, {
           bookingId: id,
-          userId: booking.user_id,
           intent,
-          paymentMethodFallback: pm || null,
+          paymentPersistence: {
+            ...paymentPersistence,
+            paymentMethodFallback: pm || null,
+          },
           saveForFuture: requestedSavePaymentMethod,
-        });
-        await transitionBookingStateRecord(conn2, booking, {
-          nextServiceStatus: 'requested',
-          nextSettlementStatus: booking.settlement_status === 'payment_failed' ? 'none' : booking.settlement_status,
           changedByUserId: req.user?.id || null,
           reasonCode: 'deposit_succeeded',
-          extraPatch: {
-            deposit_confirmed_at: new Date(),
-            deposit_amount_cents_snapshot: commissionCents,
-            deposit_currency_snapshot: chargeCurrency,
-          },
+          staleReasonCode: 'late_deposit_succeeded_refund_pending',
+          amountCents: commissionCents,
+          currency: chargeCurrency,
         });
       } else if (intent.status === 'canceled') {
         await transitionBookingStateRecord(conn2, booking, {
@@ -17255,6 +17521,22 @@ const round2 = (n) => {
       amountCents: commissionCents,
       transferGroup
     });
+
+    if (depositSuccessResult?.refundRequest?.paymentIntentId) {
+      await executeRefundRequestOrFlagForManualReview(depositSuccessResult.refundRequest, {
+        booking_id: String(depositSuccessResult.refundRequest.bookingId),
+        source: 'late_deposit_succeeded_closed_booking',
+      }, {
+        changedByUserId: req.user?.id || null,
+        failureReasonCode: 'late_deposit_refund_failed',
+        logMessage: 'Error refunding late deposit for closed booking:',
+      });
+      return res.status(409).json({
+        error: 'La reserva ya estaba cerrada. El depósito tardío no se ha aplicado y se ha solicitado el reembolso.',
+        refundPending: true,
+        paymentIntentId: intent.id,
+      });
+    }
 
     if (intent.status === 'requires_payment_method') {
       return res.status(202).json({
@@ -20081,6 +20363,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         pi = paymentPersistence.intent || pi;
 
         let depositNotification = null;
+        let depositRefundRequest = null;
         let shouldReleaseEphemeralPaymentMethods = false;
         let closureFollowUpEmailMode = null;
         const shouldSavePaymentMethod = normalizeBooleanInput(pi?.metadata?.save_payment_method, false);
@@ -20130,84 +20413,18 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         });
 
         if (event.type === 'payment_intent.succeeded' && type === 'deposit') {
-          const [[depositPaymentRow]] = await connection.query(
-            `SELECT amount_cents, final_price_snapshot_cents, currency
-             FROM payments
-             WHERE payment_intent_id = ?
-             LIMIT 1`,
-            [pi.id]
-          );
-          const [[bookingRow]] = await connection.query(
-            `SELECT
-               b.id,
-               b.client_user_id,
-               b.service_status,
-               b.settlement_status,
-               b.requested_start_datetime,
-               b.requested_end_datetime,
-               b.service_currency_snapshot,
-               b.estimated_total_amount_cents,
-               COALESCE(s.service_title, b.service_title_snapshot) AS service_title,
-               client.first_name AS client_first_name,
-               client.surname AS client_surname,
-               client.username AS client_username,
-               client.email AS client_email,
-               prof.first_name AS professional_first_name,
-               prof.surname AS professional_surname,
-               prof.username AS professional_username,
-               prof.email AS professional_email
-             FROM booking b
-             LEFT JOIN user_account client ON client.id = b.client_user_id
-             LEFT JOIN service s ON s.id = b.service_id
-             LEFT JOIN user_account prof ON prof.id = COALESCE(s.user_id, b.provider_user_id_snapshot)
-             WHERE b.id = ?
-             LIMIT 1`,
-            [bookingId]
-          );
-          if (bookingRow) {
-            await syncBookingSelectedPaymentMethodFromIntent(connection, {
-              bookingId,
-              userId: bookingRow.client_user_id,
-              intent: pi,
-              saveForFuture: shouldSavePaymentMethod,
-            });
-            await transitionBookingStateRecord(connection, bookingRow, {
-              nextServiceStatus: 'requested',
-              nextSettlementStatus: bookingRow.settlement_status === 'payment_failed' ? 'none' : bookingRow.settlement_status,
-              reasonCode: 'deposit_succeeded_webhook',
-              extraPatch: {
-                deposit_confirmed_at: new Date(),
-                deposit_amount_cents_snapshot: depositPaymentRow?.amount_cents ?? amountCents,
-                deposit_currency_snapshot: normalizeCurrencyCode(depositPaymentRow?.currency, pi?.currency || 'EUR'),
-              },
-            });
-            depositNotification = {
-              booking: {
-                id: bookingRow.id,
-                serviceTitle: bookingRow.service_title,
-                start: bookingRow.requested_start_datetime,
-                end: bookingRow.requested_end_datetime,
-                finalPrice: bookingRow.estimated_total_amount_cents != null
-                  ? fromMinorUnits(bookingRow.estimated_total_amount_cents, bookingRow.service_currency_snapshot || 'EUR')
-                  : null,
-                professional: {
-                  firstName: bookingRow.professional_first_name,
-                  surname: bookingRow.professional_surname,
-                  username: bookingRow.professional_username,
-                  email: bookingRow.professional_email,
-                },
-                client: {
-                  firstName: bookingRow.client_first_name,
-                  surname: bookingRow.client_surname,
-                  username: bookingRow.client_username,
-                  email: bookingRow.client_email,
-                },
-              },
-              depositAmountCents: depositPaymentRow?.amount_cents ?? amountCents,
-              finalPriceSnapshotCents: depositPaymentRow?.final_price_snapshot_cents ?? null,
-              currency: normalizeCurrencyCode(depositPaymentRow?.currency, pi?.currency || 'EUR'),
-            };
-          }
+          const depositResult = await applySuccessfulDepositPaymentForBooking(connection, {
+            bookingId,
+            intent: pi,
+            paymentPersistence,
+            saveForFuture: shouldSavePaymentMethod,
+            reasonCode: 'deposit_succeeded_webhook',
+            staleReasonCode: 'late_deposit_succeeded_webhook',
+            amountCents,
+            currency: normalizeCurrencyCode(pi?.currency, 'EUR'),
+          });
+          depositNotification = depositResult.depositNotification || null;
+          depositRefundRequest = depositResult.refundRequest || null;
         }
         if (event.type === 'payment_intent.succeeded' && type === 'final') {
           const [[bookingRow]] = await connection.query(
@@ -20287,6 +20504,16 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         }
 
         await connection.commit();
+
+        if (depositRefundRequest?.paymentIntentId) {
+          await executeRefundRequestOrFlagForManualReview(depositRefundRequest, {
+            booking_id: String(depositRefundRequest.bookingId),
+            source: 'late_deposit_succeeded_webhook',
+          }, {
+            failureReasonCode: 'late_deposit_refund_failed',
+            logMessage: 'Error refunding late deposit after succeeded webhook:',
+          });
+        }
 
         if (event.type === 'payment_intent.succeeded' && type === 'final') {
           const settlementResult = await finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
