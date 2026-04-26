@@ -7650,13 +7650,12 @@ async function releasePendingProviderPayouts({
 function isTemporaryPayoutTestEndpointAllowed() {
   const stripeSecretKey = String(process.env.STRIPE_SECRET_KEY || '').trim();
   const usesStripeTestKey = stripeSecretKey.startsWith('sk_test_') || stripeSecretKey.startsWith('rk_test_');
-  const isProduction = String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production';
   const explicitlyEnabled = normalizeBooleanInput(
     process.env.ENABLE_TEMP_UNAUTH_PAYOUT_TEST_ENDPOINT,
     false
   );
 
-  return usesStripeTestKey && (!isProduction || explicitlyEnabled);
+  return usesStripeTestKey || explicitlyEnabled;
 }
 
 // Endpoint temporal de pruebas: ejecuta manualmente la liberación semanal sin autenticación.
