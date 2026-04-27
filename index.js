@@ -19583,69 +19583,6 @@ app.patch('/api/booking-support/issues/:issueReportId', authenticateToken, async
   }
 });
 
-// Actualizar el pago de una reserva
-app.patch('/api/bookings/:id/is_paid', authenticateToken, async (req, res) => {
-  if (typeof req.body.is_paid === 'undefined') {
-    return res.status(400).json({ error: 'is_paid es requerido.' });
-  }
-
-  const bookingId = normalizeNullableInteger(req.params.id);
-  if (!bookingId) {
-    return res.status(400).json({ error: 'Id inválido.' });
-  }
-
-  const connection = await promisePool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const [[booking]] = await connection.query(
-      'SELECT id, client_user_id, provider_user_id_snapshot, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
-      [bookingId]
-    );
-
-    if (!booking) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Reserva no encontrada.' });
-    }
-
-    const { isStaff } = getBookingAccessFlags(req.user, booking);
-    if (!isStaff) {
-      await connection.rollback();
-      return res.status(403).json({ error: 'Solo soporte puede modificar el estado de pago manualmente.' });
-    }
-
-    const nextSettlementStatus = req.body.is_paid ? 'paid' : (
-      normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'finished'
-        ? 'awaiting_payment'
-        : 'none'
-    );
-
-    await transitionBookingStateRecord(connection, booking, {
-      nextSettlementStatus,
-      changedByUserId: req.user?.id || null,
-      reasonCode: 'manual_payment_update',
-    });
-
-    await connection.commit();
-    if (nextSettlementStatus === 'paid') {
-      try {
-        await releaseEphemeralBookingPaymentMethodsIfClosed(bookingId);
-      } catch (cleanupError) {
-        console.error('Error releasing ephemeral payment methods after manual payment update:', {
-          bookingId,
-          error: cleanupError.message,
-        });
-      }
-    }
-    return res.status(200).json({ message: 'Pago actualizado' });
-  } catch (error) {
-    try { await connection.rollback(); } catch {}
-    console.error('Error al actualizar el pago de la reserva:', error);
-    return res.status(500).json({ error: 'Error al actualizar la reserva.' });
-  } finally {
-    connection.release();
-  }
-});
-
 const COLLECTION_METHOD_BANK_COUNTRY_TO_CURRENCY = Object.freeze({
   AR: 'ars',
   AT: 'eur',
