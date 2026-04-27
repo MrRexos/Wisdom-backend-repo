@@ -201,7 +201,7 @@
 ## Tabla: `payment_method`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
 - `user_id` (INT UNSIGNED, FK -> user_account.id, NULL)
-- `payment_type` (VARCHAR(100), NOT NULL)
+- `payment_type` (VARCHAR(100))
 - `provider` (VARCHAR(100), NULL)
 - `brand` (VARCHAR(50), NULL)
 - `card_number` (VARCHAR(25), NOT NULL)

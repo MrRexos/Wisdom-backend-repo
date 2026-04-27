@@ -683,6 +683,11 @@ const stableKey = (parts) => parts.join(':');
 const MAX_OPEN_GENERAL_PROBLEM_ISSUES_PER_BOOKING = 5;
 const BOOKING_PAYMENT_TYPES = new Set(['deposit', 'final']);
 const SETTLEMENT_STATUSES_PROTECTED_FROM_AUTOMATIC_PAYMENT = new Set([
+  'paid',
+  'refund_pending',
+  'partially_refunded',
+  'refunded',
+  'payment_failed',
   'manual_review_required',
   'in_dispute',
 ]);
@@ -708,11 +713,133 @@ const FINANCIAL_PAYMENT_STATUSES = new Set([
   'dispute_won',
   'dispute_lost',
 ]);
+const SERVICE_STATUSES_PROTECTED_FROM_AUTOMATIC_SETTLEMENT = new Set([
+  'canceled',
+  'expired',
+]);
 
 function isSettlementStatusProtectedFromAutomaticPayment(value) {
   return SETTLEMENT_STATUSES_PROTECTED_FROM_AUTOMATIC_PAYMENT.has(
     normalizeSettlementStatus(value, 'none')
   );
+}
+
+function isServiceStatusProtectedFromAutomaticSettlement(value) {
+  return SERVICE_STATUSES_PROTECTED_FROM_AUTOMATIC_SETTLEMENT.has(
+    normalizeServiceStatus(value, 'pending_deposit')
+  );
+}
+
+function isBookingAlreadyFinishedAndPaid(booking) {
+  return normalizeServiceStatus(booking?.service_status, 'pending_deposit') === 'finished'
+    && normalizeSettlementStatus(booking?.settlement_status, 'none') === 'paid';
+}
+
+function createBookingFinancialIntegrityError(code, message, statusCode = 409, extra = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = statusCode;
+  error.financialIntegrity = true;
+  Object.assign(error, extra);
+  return error;
+}
+
+function resolveRequiredBookingServiceCurrency(booking) {
+  const currency = normalizeCurrencyCode(booking?.service_currency_snapshot, null);
+  if (!currency) {
+    throw createBookingFinancialIntegrityError(
+      'booking_service_currency_snapshot_missing',
+      'Falta el snapshot de moneda original del servicio.'
+    );
+  }
+  return currency;
+}
+
+function assertPaymentCurrencyMatchesBooking(payment, bookingOrCurrency, {
+  paymentType = 'payment',
+  allowMissingPaymentCurrency = false,
+} = {}) {
+  if (!payment) {
+    return resolveRequiredBookingServiceCurrency(
+      typeof bookingOrCurrency === 'string'
+        ? { service_currency_snapshot: bookingOrCurrency }
+        : bookingOrCurrency
+    );
+  }
+
+  const bookingCurrency = typeof bookingOrCurrency === 'string'
+    ? normalizeCurrencyCode(bookingOrCurrency, null)
+    : resolveRequiredBookingServiceCurrency(bookingOrCurrency);
+  if (!bookingCurrency) {
+    throw createBookingFinancialIntegrityError(
+      'booking_service_currency_snapshot_missing',
+      'Falta el snapshot de moneda original del servicio.'
+    );
+  }
+
+  const paymentCurrency = normalizeCurrencyCode(payment.currency, null);
+  if (!paymentCurrency) {
+    if (allowMissingPaymentCurrency) {
+      return bookingCurrency;
+    }
+    throw createBookingFinancialIntegrityError(
+      `${paymentType}_currency_missing`,
+      'Falta la moneda del pago registrado.'
+    );
+  }
+
+  if (paymentCurrency !== bookingCurrency) {
+    throw createBookingFinancialIntegrityError(
+      `${paymentType}_currency_mismatch`,
+      'La moneda del pago no coincide con la moneda original del servicio.',
+      409,
+      { expectedCurrency: bookingCurrency, actualCurrency: paymentCurrency }
+    );
+  }
+
+  return bookingCurrency;
+}
+
+function assertSucceededDepositPaymentForSettlement(depositPayment, booking, {
+  requirePaymentIntent = true,
+} = {}) {
+  if (!depositPayment) {
+    throw createBookingFinancialIntegrityError(
+      'deposit_missing',
+      'La reserva no tiene un depósito confirmado.',
+      412
+    );
+  }
+
+  const depositStatus = String(depositPayment.status || '').trim().toLowerCase();
+  if (depositStatus !== 'succeeded') {
+    throw createBookingFinancialIntegrityError(
+      'deposit_not_succeeded',
+      'El depósito no está confirmado.',
+      412,
+      { depositStatus }
+    );
+  }
+
+  if (depositPayment.amount_cents === null || depositPayment.amount_cents === undefined) {
+    throw createBookingFinancialIntegrityError(
+      'deposit_amount_missing',
+      'Falta el importe del depósito confirmado.',
+      412
+    );
+  }
+
+  if (requirePaymentIntent && !depositPayment.payment_intent_id) {
+    throw createBookingFinancialIntegrityError(
+      'deposit_payment_intent_missing',
+      'El depósito confirmado no tiene PaymentIntent asociado.',
+      412
+    );
+  }
+
+  return assertPaymentCurrencyMatchesBooking(depositPayment, booking, {
+    paymentType: 'deposit',
+  });
 }
 
 // Redondeos consistentes con frontend (BookingScreen)
@@ -4070,13 +4197,18 @@ function convertMinorUnitsBetweenCurrencies(amountCents, fromCurrency, toCurrenc
 }
 
 function resolveClosureDepositAlreadyPaidAmountCents({ booking, depositPayment, targetCurrency }) {
-  const normalizedTargetCurrency = normalizeCurrencyCode(targetCurrency, 'EUR');
-  if (depositPayment) {
-    return convertMinorUnitsBetweenCurrencies(
-      depositPayment.amount_cents,
-      normalizeCurrencyCode(depositPayment.currency, normalizedTargetCurrency),
-      normalizedTargetCurrency
+  const normalizedTargetCurrency = normalizeCurrencyCode(targetCurrency, null);
+  if (!normalizedTargetCurrency) {
+    throw createBookingFinancialIntegrityError(
+      'booking_service_currency_snapshot_missing',
+      'Falta el snapshot de moneda original del servicio.'
     );
+  }
+  if (depositPayment) {
+    assertPaymentCurrencyMatchesBooking(depositPayment, normalizedTargetCurrency, {
+      paymentType: 'deposit',
+    });
+    return normalizeStripeAmountCents(depositPayment.amount_cents);
   }
 
   return normalizeStripeAmountCents(booking?.deposit_amount_cents_snapshot);
@@ -4132,7 +4264,7 @@ function buildClosureFinancialSnapshot({
   proposedFinalDurationMinutes = null,
   zeroChargeMode = false,
 }) {
-  const bookingCurrency = normalizeCurrencyCode(booking?.service_currency_snapshot, 'EUR');
+  const bookingCurrency = resolveRequiredBookingServiceCurrency(booking);
   const priceTypeSnapshot = String(booking?.price_type_snapshot || '').trim().toLowerCase();
   const estimatedTotalAmountCents = Number(booking?.estimated_total_amount_cents || 0);
   const estimatedDurationMinutes = normalizeNullableInteger(booking?.requested_duration_minutes);
@@ -5704,12 +5836,26 @@ async function validateStripePaymentIntentForBookingWebhook(connection, pi, {
     };
   }
 
-  const expectedCurrency = normalizeCurrencyCode(
-    paymentRow.currency,
-    normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR')
-  );
+  let expectedCurrency;
+  try {
+    expectedCurrency = resolveRequiredBookingServiceCurrency(booking);
+    assertPaymentCurrencyMatchesBooking(paymentRow, expectedCurrency, {
+      paymentType: normalizedType,
+    });
+  } catch (currencyError) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: currencyError.code || 'payment_currency_integrity_failed',
+      expectedCurrency: currencyError.expectedCurrency || null,
+      actualCurrency: currencyError.actualCurrency || null,
+    };
+  }
   const intentCurrency = normalizeCurrencyCode(pi.currency, null);
-  if (expectedCurrency && intentCurrency && intentCurrency !== expectedCurrency) {
+  if (!intentCurrency || intentCurrency !== expectedCurrency) {
     return {
       valid: false,
       bookingId: normalizedBookingId,
@@ -5758,7 +5904,7 @@ async function validateStripePaymentIntentForBookingWebhook(connection, pi, {
     booking,
     paymentRow,
     amountCents: expectedAmountCents || intentAmountCents,
-    currency: expectedCurrency || intentCurrency || 'EUR',
+    currency: expectedCurrency,
   };
 }
 
@@ -5950,7 +6096,7 @@ async function verifyPaymentIntentCapturedForSettlement({
   }
 
   const intentCurrency = normalizeCurrencyCode(intent.currency, null);
-  if (normalizedExpectedCurrency && intentCurrency && intentCurrency !== normalizedExpectedCurrency) {
+  if (normalizedExpectedCurrency && (!intentCurrency || intentCurrency !== normalizedExpectedCurrency)) {
     return {
       valid: false,
       reason: 'payment_intent_currency_mismatch',
@@ -6000,11 +6146,10 @@ function buildActualBookingSettlementSnapshot({
   booking,
   depositPayment,
 }) {
-  const bookingCurrency = normalizeCurrencyCode(booking?.service_currency_snapshot, 'EUR');
-  const chargeCurrency = normalizeCurrencyCode(
-    depositPayment?.currency,
-    normalizeCurrencyCode(booking?.customer_currency, bookingCurrency)
-  );
+  const bookingCurrency = resolveRequiredBookingServiceCurrency(booking);
+  const chargeCurrency = assertPaymentCurrencyMatchesBooking(depositPayment, bookingCurrency, {
+    paymentType: 'deposit',
+  });
   const totalAmountInBookingCurrency = Number(
     booking?.proposed_total_amount_cents
     ?? booking?.estimated_total_amount_cents
@@ -6016,22 +6161,8 @@ function buildActualBookingSettlementSnapshot({
     ?? booking?.estimated_base_amount_cents
     ?? 0
   );
-  const totalAmountInChargeCurrency = toMinorUnits(
-    convertAmount(
-      fromMinorUnits(totalAmountInBookingCurrency, bookingCurrency),
-      bookingCurrency,
-      chargeCurrency
-    ),
-    chargeCurrency
-  );
-  const providerPayoutAmountInChargeCurrency = toMinorUnits(
-    convertAmount(
-      fromMinorUnits(providerPayoutAmountInBookingCurrency, bookingCurrency),
-      bookingCurrency,
-      chargeCurrency
-    ),
-    chargeCurrency
-  );
+  const totalAmountInChargeCurrency = totalAmountInBookingCurrency;
+  const providerPayoutAmountInChargeCurrency = providerPayoutAmountInBookingCurrency;
   const settlementAmounts = computeSettlementAmounts({
     depositAlreadyPaidAmountCents: Number(depositPayment?.amount_cents || 0),
     proposedTotalAmountCents: totalAmountInChargeCurrency,
@@ -6350,7 +6481,7 @@ async function applySuccessfulDepositPaymentForBooking(connection, {
   }
 
   const [[depositPaymentRow]] = await connection.query(
-    `SELECT id, amount_cents, final_price_snapshot_cents, currency, status
+    `SELECT id, payment_intent_id, amount_cents, final_price_snapshot_cents, currency, status
      FROM payments
      WHERE payment_intent_id = ?
      LIMIT 1
@@ -6392,6 +6523,49 @@ async function applySuccessfulDepositPaymentForBooking(connection, {
     return { applied: false, reason: 'booking_not_found' };
   }
 
+  let bookingCurrency;
+  let depositCurrency;
+  try {
+    bookingCurrency = resolveRequiredBookingServiceCurrency(bookingRow);
+    depositCurrency = normalizeCurrencyCode(
+      depositPaymentRow?.currency,
+      normalizeCurrencyCode(currency || intent?.currency, null)
+    );
+    const intentCurrency = normalizeCurrencyCode(intent?.currency, null);
+    if (!intentCurrency || intentCurrency !== bookingCurrency) {
+      throw createBookingFinancialIntegrityError(
+        'deposit_payment_intent_currency_mismatch',
+        'La moneda del PaymentIntent del depósito no coincide con la moneda original del servicio.',
+        409,
+        { expectedCurrency: bookingCurrency, actualCurrency: intentCurrency }
+      );
+    }
+    assertPaymentCurrencyMatchesBooking(
+      { ...depositPaymentRow, currency: depositCurrency },
+      bookingCurrency,
+      { paymentType: 'deposit' }
+    );
+  } catch (currencyError) {
+    const normalizedSettlementStatus = normalizeSettlementStatus(bookingRow.settlement_status, 'none');
+    await transitionBookingStateRecord(connection, bookingRow, {
+      nextServiceStatus: bookingRow.service_status,
+      nextSettlementStatus: isSettlementStatusProtectedFromAutomaticPayment(normalizedSettlementStatus)
+        ? bookingRow.settlement_status
+        : 'manual_review_required',
+      changedByUserId,
+      reasonCode: currencyError.code || 'deposit_currency_integrity_failed',
+      extraPatch: {
+        client_approval_deadline_at: null,
+      },
+    });
+    return {
+      applied: false,
+      reason: currencyError.code || 'deposit_currency_integrity_failed',
+      expectedCurrency: currencyError.expectedCurrency || bookingCurrency || null,
+      actualCurrency: currencyError.actualCurrency || depositCurrency || null,
+    };
+  }
+
   await syncBookingSelectedPaymentMethodFromIntent(connection, {
     bookingId: normalizedBookingId,
     userId: bookingRow.client_user_id,
@@ -6405,7 +6579,7 @@ async function applySuccessfulDepositPaymentForBooking(connection, {
   const depositPatch = {
     deposit_confirmed_at: bookingRow.deposit_confirmed_at || new Date(),
     deposit_amount_cents_snapshot: depositPaymentRow?.amount_cents ?? amountCents,
-    deposit_currency_snapshot: normalizeCurrencyCode(depositPaymentRow?.currency, currency || intent?.currency || 'EUR'),
+    deposit_currency_snapshot: bookingCurrency,
   };
 
   if (normalizedServiceStatus === 'pending_deposit') {
@@ -6444,7 +6618,7 @@ async function applySuccessfulDepositPaymentForBooking(connection, {
         },
         depositAmountCents: depositPaymentRow?.amount_cents ?? amountCents,
         finalPriceSnapshotCents: depositPaymentRow?.final_price_snapshot_cents ?? null,
-        currency: normalizeCurrencyCode(depositPaymentRow?.currency, currency || intent?.currency || 'EUR'),
+        currency: bookingCurrency,
       },
     };
   }
@@ -6522,6 +6696,21 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
       return { settled: false, reason: 'booking_not_found' };
     }
 
+    if (isBookingAlreadyFinishedAndPaid(booking)) {
+      await initialConnection.rollback();
+      return { settled: true, reason: 'already_settled' };
+    }
+
+    const currentServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
+    if (isServiceStatusProtectedFromAutomaticSettlement(currentServiceStatus)) {
+      await initialConnection.rollback();
+      return {
+        settled: false,
+        reason: 'booking_service_status_terminal',
+        serviceStatus: currentServiceStatus,
+      };
+    }
+
     const currentSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
     if (isSettlementStatusProtectedFromAutomaticPayment(currentSettlementStatus)) {
       await initialConnection.rollback();
@@ -6537,6 +6726,18 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
     if (!depositPayment) {
       await initialConnection.rollback();
       return { settled: false, reason: 'deposit_missing' };
+    }
+    try {
+      assertSucceededDepositPaymentForSettlement(depositPayment, booking, {
+        requirePaymentIntent: true,
+      });
+    } catch (depositError) {
+      await initialConnection.rollback();
+      return {
+        settled: false,
+        reason: depositError.code || 'deposit_integrity_failed',
+        depositStatus: depositError.depositStatus || null,
+      };
     }
 
     settlementSnapshot = buildActualBookingSettlementSnapshot({
@@ -6570,6 +6771,21 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
       await initialConnection.rollback();
       return { settled: false, reason: 'final_payment_not_succeeded' };
     }
+    if (settlementSnapshot.amountDueFromClientCents > 0) {
+      try {
+        assertPaymentCurrencyMatchesBooking(finalPayment, settlementSnapshot.chargeCurrency, {
+          paymentType: 'final',
+        });
+      } catch (finalCurrencyError) {
+        await initialConnection.rollback();
+        return {
+          settled: false,
+          reason: finalCurrencyError.code || 'final_payment_currency_integrity_failed',
+          expectedCurrency: finalCurrencyError.expectedCurrency || settlementSnapshot.chargeCurrency,
+          actualCurrency: finalCurrencyError.actualCurrency || null,
+        };
+      }
+    }
 
     await initialConnection.commit();
   } catch (error) {
@@ -6584,6 +6800,25 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
   }
 
   try {
+    if (depositPayment?.payment_intent_id && normalizeStripeAmountCents(depositPayment.amount_cents) > 0) {
+      const depositVerification = await verifyPaymentIntentCapturedForSettlement({
+        paymentIntentId: depositPayment.payment_intent_id,
+        expectedAmountCents: depositPayment.amount_cents,
+        expectedCurrency: settlementSnapshot.chargeCurrency,
+        expectedCustomerId: booking.customer_id,
+      });
+
+      if (!depositVerification.valid) {
+        await markBookingSettlementForReview(normalizedBookingId, {
+          changedByUserId,
+          nextSettlementStatus: 'manual_review_required',
+          reasonCode: 'deposit_payment_integrity_failed',
+          details: `El depósito no supera la verificación de Stripe: ${depositVerification.reason}.`,
+        });
+        return { settled: false, reason: depositVerification.reason };
+      }
+    }
+
     if (settlementSnapshot.amountDueFromClientCents > 0 && finalPayment?.payment_intent_id) {
       const paymentVerification = await verifyPaymentIntentCapturedForSettlement({
         paymentIntentId: finalPayment.payment_intent_id,
@@ -6603,7 +6838,7 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
       }
     }
   } catch (verificationError) {
-    console.error('Error verifying final PaymentIntent before settlement:', {
+    console.error('Error verifying booking payments before settlement:', {
       bookingId: normalizedBookingId,
       paymentIntentId: finalPayment?.payment_intent_id || null,
       error: verificationError.message,
@@ -6611,10 +6846,10 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
     await markBookingSettlementForReview(normalizedBookingId, {
       changedByUserId,
       nextSettlementStatus: 'manual_review_required',
-      reasonCode: 'final_payment_integrity_check_failed',
-      details: `No se pudo verificar el pago final en Stripe: ${verificationError.message}`,
+      reasonCode: 'booking_payment_integrity_check_failed',
+      details: `No se pudieron verificar los pagos de la reserva en Stripe: ${verificationError.message}`,
     });
-    return { settled: false, reason: 'final_payment_verification_failed', error: verificationError };
+    return { settled: false, reason: 'payment_verification_failed', error: verificationError };
   }
 
   try {
@@ -6648,10 +6883,26 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
     await finalizeConnection.beginTransaction();
 
     const currentBooking = await getBookingSettlementContext(finalizeConnection, normalizedBookingId, { forUpdate: true });
+    const currentDepositPayment = await getPaymentRow(finalizeConnection, normalizedBookingId, 'deposit');
     const currentFinalPayment = await getPaymentRow(finalizeConnection, normalizedBookingId, 'final');
     if (!currentBooking) {
       await finalizeConnection.rollback();
       return { settled: false, reason: 'booking_not_found_after_processing' };
+    }
+
+    if (isBookingAlreadyFinishedAndPaid(currentBooking)) {
+      await finalizeConnection.rollback();
+      return { settled: true, reason: 'already_settled' };
+    }
+
+    const currentServiceStatus = normalizeServiceStatus(currentBooking.service_status, 'pending_deposit');
+    if (isServiceStatusProtectedFromAutomaticSettlement(currentServiceStatus)) {
+      await finalizeConnection.rollback();
+      return {
+        settled: false,
+        reason: 'booking_service_status_terminal',
+        serviceStatus: currentServiceStatus,
+      };
     }
 
     const currentSettlementStatus = normalizeSettlementStatus(currentBooking.settlement_status, 'none');
@@ -6661,6 +6912,35 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
         settled: false,
         reason: 'booking_protected_from_automatic_settlement',
         settlementStatus: currentSettlementStatus,
+      };
+    }
+    try {
+      assertSucceededDepositPaymentForSettlement(currentDepositPayment, currentBooking, {
+        requirePaymentIntent: true,
+      });
+      if (settlementSnapshot.amountDueFromClientCents > 0) {
+        const currentFinalPaymentStatus = String(currentFinalPayment?.status || '').trim().toLowerCase();
+        if (
+          !currentFinalPayment?.payment_intent_id
+          || currentFinalPaymentStatus !== 'succeeded'
+          || normalizeStripeAmountCents(currentFinalPayment.amount_cents) < settlementSnapshot.amountDueFromClientCents
+        ) {
+          throw createBookingFinancialIntegrityError(
+            'final_payment_not_succeeded',
+            'El pago final no está confirmado.',
+            412
+          );
+        }
+        assertPaymentCurrencyMatchesBooking(currentFinalPayment, settlementSnapshot.chargeCurrency, {
+          paymentType: 'final',
+        });
+      }
+    } catch (paymentIntegrityError) {
+      await finalizeConnection.rollback();
+      return {
+        settled: false,
+        reason: paymentIntegrityError.code || 'payment_integrity_failed',
+        depositStatus: paymentIntegrityError.depositStatus || null,
       };
     }
 
@@ -7502,6 +7782,16 @@ async function processPendingClosureAutoCharge(bookingId) {
       return { handled: false, reason: 'booking_not_found' };
     }
 
+    const normalizedServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
+    if (isServiceStatusProtectedFromAutomaticSettlement(normalizedServiceStatus)) {
+      await connection.rollback();
+      return {
+        handled: false,
+        reason: 'booking_service_status_terminal',
+        serviceStatus: normalizedServiceStatus,
+      };
+    }
+
     if (normalizeSettlementStatus(booking.settlement_status, 'none') !== 'pending_client_approval') {
       await connection.rollback();
       return { handled: false, reason: 'not_pending_client_approval' };
@@ -7523,6 +7813,23 @@ async function processPendingClosureAutoCharge(bookingId) {
         details: 'La reserva no tiene un depósito confirmado para poder cerrar automáticamente.',
       });
       return { handled: false, reason: 'missing_deposit' };
+    }
+    try {
+      assertSucceededDepositPaymentForSettlement(depositPayment, booking, {
+        requirePaymentIntent: true,
+      });
+    } catch (depositError) {
+      await connection.rollback();
+      await markBookingSettlementForReview(normalizedBookingId, {
+        nextSettlementStatus: 'in_dispute',
+        reasonCode: depositError.code || 'auto_charge_deposit_integrity_failed',
+        details: 'El depósito no está confirmado correctamente para poder cerrar automáticamente.',
+      });
+      return {
+        handled: false,
+        reason: depositError.code || 'deposit_integrity_failed',
+        depositStatus: depositError.depositStatus || null,
+      };
     }
 
     finalPayment = await getPaymentRow(connection, normalizedBookingId, 'final');
@@ -17307,7 +17614,7 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
       }
     }
 
-    const bookingCurrency = normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR');
+    const bookingCurrency = resolveRequiredBookingServiceCurrency(booking);
     const unitPriceAmount = booking.unit_price_amount_cents_snapshot === null || booking.unit_price_amount_cents_snapshot === undefined
       ? 0
       : fromMinorUnits(booking.unit_price_amount_cents_snapshot, bookingCurrency);
@@ -17538,13 +17845,19 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
     }
 
     const depositPayment = await getPaymentRow(connection, bookingId, 'deposit');
-    const depositPaymentStatus = String(depositPayment?.status || '').trim().toLowerCase();
-    if (!depositPayment || depositPaymentStatus !== 'succeeded' || depositPayment.amount_cents === null || depositPayment.amount_cents === undefined) {
+    try {
+      assertSucceededDepositPaymentForSettlement(depositPayment, booking, {
+        requirePaymentIntent: true,
+      });
+    } catch (depositError) {
       await connection.rollback();
-      return res.status(412).json({ error: 'Depósito no confirmado (requerido).' });
+      return res.status(depositError.statusCode || 412).json({
+        error: depositError.message,
+        error_code: depositError.code || 'deposit_integrity_failed',
+      });
     }
 
-    const bookingCurrency = normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR');
+    const bookingCurrency = resolveRequiredBookingServiceCurrency(booking);
     const priceTypeSnapshot = String(booking.price_type_snapshot || '').trim().toLowerCase();
     const unitPriceAmount = booking.unit_price_amount_cents_snapshot == null
       ? 0
@@ -19764,14 +20077,14 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
     );
     booking = rows[0];
     if (!booking) throw new Error('Reserva no encontrada');
-    if (normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'canceled') {
-      throw new Error('Reserva cancelada');
+    if (isServiceStatusProtectedFromAutomaticSettlement(booking.service_status)) {
+      throw createBookingFinancialIntegrityError(
+        'booking_service_status_terminal',
+        'La reserva ya está cerrada.'
+      );
     }
 
-    const bookingCurrency = normalizeCurrencyCode(
-      booking.service_currency_snapshot,
-      normalizeCurrencyCode(booking.service_currency, 'EUR')
-    );
+    const bookingCurrency = resolveRequiredBookingServiceCurrency(booking);
     booking.final_price = booking.proposed_total_amount_cents != null
       ? fromMinorUnits(booking.proposed_total_amount_cents, bookingCurrency)
       : (
@@ -19837,15 +20150,17 @@ const round2 = (n) => {
     });
 
     const existingDepositPayment = await getPaymentRow(connection, id, 'deposit');
-    chargeCurrency = normalizeCurrencyCode(
-      existingDepositPayment?.currency,
-      normalizeCurrencyCode(
-        booking.deposit_currency_snapshot,
-        normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
-      )
-    );
+    assertPaymentCurrencyMatchesBooking(existingDepositPayment, bookingCurrency, {
+      paymentType: 'deposit',
+      allowMissingPaymentCurrency: true,
+    });
+    chargeCurrency = bookingCurrency;
     const fallbackConvertedUnitPrice = booking.unit_price_amount_cents_snapshot == null
-      ? convertAmount(booking.unit_price || 0, booking.service_currency, chargeCurrency)
+      ? convertAmount(
+        booking.unit_price || 0,
+        normalizeCurrencyCode(booking.service_currency, bookingCurrency),
+        chargeCurrency
+      )
       : convertAmount(
         fromMinorUnits(booking.unit_price_amount_cents_snapshot, bookingCurrency),
         bookingCurrency,
@@ -20188,6 +20503,13 @@ const round2 = (n) => {
       stripeMessage: err.decline_code || err.param || null
     });
 
+    if (err?.financialIntegrity) {
+      return res.status(err.statusCode || 409).json({
+        error: err.message,
+        error_code: err.code || 'booking_financial_integrity_failed',
+      });
+    }
+
     // Si es un error de Stripe, devolver más detalles
     if (err.type && err.type.startsWith('Stripe')) {
       return res.status(400).json({
@@ -20304,14 +20626,27 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
     );
     booking = rows[0];
     if (!booking) throw new Error('Reserva no encontrada');
-    if (normalizeSettlementStatus(booking.settlement_status, 'none') === 'paid') {
-      throw new Error('Reserva ya pagada');
+    if (isBookingAlreadyFinishedAndPaid(booking)) {
+      await connection.rollback();
+      return res.status(200).json({ message: 'Reserva ya pagada.' });
+    }
+    if (isServiceStatusProtectedFromAutomaticSettlement(booking.service_status)) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'La reserva ya está cerrada.',
+        error_code: 'booking_service_status_terminal',
+      });
+    }
+    if (isSettlementStatusProtectedFromAutomaticPayment(booking.settlement_status)) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'El estado financiero de la reserva no permite el cobro final.',
+        error_code: 'booking_settlement_status_terminal',
+        settlement_status: normalizeSettlementStatus(booking.settlement_status, 'none'),
+      });
     }
 
-    const bookingCurrency = normalizeCurrencyCode(
-      booking.service_currency_snapshot,
-      normalizeCurrencyCode(booking.service_currency, 'EUR')
-    );
+    const bookingCurrency = resolveRequiredBookingServiceCurrency(booking);
     booking.final_price = booking.proposed_total_amount_cents != null
       ? fromMinorUnits(booking.proposed_total_amount_cents, bookingCurrency)
       : (
@@ -20353,7 +20688,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
 
     // Verificar depósito succeeded
     const [dep] = await connection.query(
-      `SELECT id, amount_cents, currency
+      `SELECT id, payment_intent_id, amount_cents, status, currency
        FROM payments
        WHERE booking_id = ? AND type = 'deposit' AND status = 'succeeded'
        LIMIT 1 FOR UPDATE`,
@@ -20364,10 +20699,18 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       return res.status(412).json({ error: 'Depósito no confirmado (requerido).' });
     }
     depositPayment = dep[0];
-    chargeCurrency = normalizeCurrencyCode(
-      depositPayment?.currency,
-      normalizeCurrencyCode(booking.customer_currency, normalizeCurrencyCode(booking.service_currency, 'EUR'))
-    );
+    try {
+      assertSucceededDepositPaymentForSettlement(depositPayment, booking, {
+        requirePaymentIntent: true,
+      });
+    } catch (depositError) {
+      await connection.rollback();
+      return res.status(depositError.statusCode || 412).json({
+        error: depositError.message,
+        error_code: depositError.code || 'deposit_integrity_failed',
+      });
+    }
+    chargeCurrency = bookingCurrency;
     const expectedProviderPayoutCents = normalizeStripeAmountCents(
       booking.proposed_base_amount_cents
       ?? booking.estimated_base_amount_cents
@@ -20553,6 +20896,17 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
     );
     if (existingFinal.length > 0) {
       const row = existingFinal[0];
+      try {
+        assertPaymentCurrencyMatchesBooking(row, chargeCurrency, {
+          paymentType: 'final',
+        });
+      } catch (finalCurrencyError) {
+        await connection.rollback();
+        return res.status(finalCurrencyError.statusCode || 409).json({
+          error: finalCurrencyError.message,
+          error_code: finalCurrencyError.code || 'final_payment_currency_integrity_failed',
+        });
+      }
       // Ya no necesitamos seguir con la transacción de nuevo cobro
       await connection.commit();
 
@@ -20577,7 +20931,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
           const paySnap = paySnapRows && paySnapRows[0];
           const amountEnsure = paySnap?.amount_cents || 0;
           const transferGroupEnsure = paySnap?.transfer_group || `booking-${id}`;
-          const ensureCurrency = normalizeCurrencyCode(paySnap?.currency, chargeCurrency);
+          const ensureCurrency = chargeCurrency;
 
           if (amountEnsure > 0) {
             let pmEnsure = null;
@@ -20707,7 +21061,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
                 commissionSnapshotCents: null,
                 finalPriceSnapshotCents: null,
                 status: mapStatus(intent.status),
-                currency: normalizeCurrencyCode(row.currency, chargeCurrency),
+                currency: chargeCurrency,
                 transferGroup: intent.transfer_group || null,
                 paymentMethodId: paymentPersistence.paymentMethodId || pmId,
                 paymentMethodLast4: paymentPersistence.paymentMethodLast4 || null,
@@ -21206,6 +21560,12 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       stripeError: err.type || err.code || null,
       stripeMessage: err.decline_code || err.param || null,
     });
+    if (err?.financialIntegrity) {
+      return res.status(err.statusCode || 409).json({
+        error: err.message,
+        error_code: err.code || 'booking_financial_integrity_failed',
+      });
+    }
     const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
       changedByUserId: req.user?.id || null,
       details: `No se pudo procesar el pago final: ${err.message}`,
@@ -23337,7 +23697,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           paymentIntentId: pi.id,
           amountCents,
           status: mapStatus(pi.status),
-          currency: normalizeCurrencyCode(pi?.currency, 'EUR'),
+          currency: webhookValidation.currency,
           transferGroup: pi.transfer_group || null,
           paymentMethodId: paymentPersistence.paymentMethodId || null,
           paymentMethodLast4: paymentPersistence.paymentMethodLast4 || null,
@@ -23359,7 +23719,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
             reasonCode: 'deposit_succeeded_webhook',
             staleReasonCode: 'late_deposit_succeeded_webhook',
             amountCents,
-            currency: normalizeCurrencyCode(pi?.currency, 'EUR'),
+            currency: webhookValidation.currency,
           });
           depositNotification = depositResult.depositNotification || null;
           depositRefundRequest = depositResult.refundRequest || null;
