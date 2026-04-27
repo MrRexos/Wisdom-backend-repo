@@ -4,6 +4,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node src/bookingDomain.test.js",
+    "test:stripe:e2e": "node src/stripeBookingFlow.e2e.test.js",
     "start": "node index.js"
   },
   "keywords": [],

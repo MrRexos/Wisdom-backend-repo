@@ -95,7 +95,10 @@ const stripeEnvironment = loadRequiredEnvironmentVariables([
   'STRIPE_SECRET_KEY',
   'STRIPE_WEBHOOK_SECRET',
 ]);
-const stripe = new Stripe(stripeEnvironment.STRIPE_SECRET_KEY);
+const STRIPE_API_VERSION = '2026-02-25.clover';
+const stripe = new Stripe(stripeEnvironment.STRIPE_SECRET_KEY, {
+  apiVersion: STRIPE_API_VERSION,
+});
 const endpointSecret = stripeEnvironment.STRIPE_WEBHOOK_SECRET;
 const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || 'com.rexos.Wisdom';
 const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID || '';
@@ -5142,7 +5145,10 @@ function isBookingClosedForEphemeralPaymentCleanup(booking) {
   return ['paid', 'refunded', 'payment_failed'].includes(normalizedSettlementStatus);
 }
 
-async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
+async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId, {
+  candidatePaymentMethodIds = [],
+  requireClosedBooking = true,
+} = {}) {
   const normalizedBookingId = normalizeNullableInteger(bookingId);
   if (!normalizedBookingId) {
     return { released: 0, skipped: true };
@@ -5150,7 +5156,12 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
 
   const connection = await pool.promise().getConnection();
   let booking = null;
-  let ephemeralRows = [];
+  let paymentMethodIdsToDetach = [];
+
+  const normalizeStripePaymentMethodId = (value) => {
+    const normalizedValue = typeof value === 'string' ? value.trim() : '';
+    return normalizedValue.startsWith('pm_') ? normalizedValue : null;
+  };
 
   try {
     await connection.beginTransaction();
@@ -5161,7 +5172,8 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
         id,
         client_user_id,
         service_status,
-        settlement_status
+        settlement_status,
+        selected_customer_payment_method_id
       FROM booking
       WHERE id = ?
       LIMIT 1
@@ -5170,14 +5182,24 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
       [normalizedBookingId]
     );
 
-    if (!bookingRow || !isBookingClosedForEphemeralPaymentCleanup(bookingRow)) {
+    if (!bookingRow || !bookingRow.client_user_id) {
+      await connection.rollback();
+      return { released: 0, skipped: true };
+    }
+
+    if (requireClosedBooking && !isBookingClosedForEphemeralPaymentCleanup(bookingRow)) {
       await connection.rollback();
       return { released: 0, skipped: true };
     }
 
     booking = bookingRow;
+    const candidateIds = new Set(
+      (Array.isArray(candidatePaymentMethodIds) ? candidatePaymentMethodIds : [candidatePaymentMethodIds])
+        .map(normalizeStripePaymentMethodId)
+        .filter(Boolean)
+    );
 
-    const [rows] = await connection.query(
+    const [ephemeralRows] = await connection.query(
       `
       SELECT DISTINCT
         pm.id,
@@ -5206,7 +5228,53 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
       [bookingRow.client_user_id, normalizedBookingId, normalizedBookingId]
     );
 
-    ephemeralRows = rows;
+    for (const row of ephemeralRows || []) {
+      const stripePaymentMethodId = normalizeStripePaymentMethodId(row.customer_payment_method_stripe_id);
+      if (stripePaymentMethodId) {
+        candidateIds.add(stripePaymentMethodId);
+      }
+    }
+
+    const [paymentRows] = await connection.query(
+      `
+      SELECT DISTINCT payment_method_id
+      FROM payments
+      WHERE booking_id = ?
+        AND payment_method_id IS NOT NULL
+        AND payment_method_id LIKE 'pm_%'
+      FOR UPDATE
+      `,
+      [normalizedBookingId]
+    );
+
+    for (const row of paymentRows || []) {
+      const stripePaymentMethodId = normalizeStripePaymentMethodId(row.payment_method_id);
+      if (stripePaymentMethodId) {
+        candidateIds.add(stripePaymentMethodId);
+      }
+    }
+
+    if (candidateIds.size > 0) {
+      const candidateList = Array.from(candidateIds);
+      const [savedRows] = await connection.query(
+        `
+        SELECT payment_type
+        FROM payment_method
+        WHERE user_id = ?
+          AND is_safed = 1
+          AND payment_type IN (${candidateList.map(() => '?').join(', ')})
+        FOR UPDATE
+        `,
+        [bookingRow.client_user_id, ...candidateList]
+      );
+      const savedIds = new Set(
+        (savedRows || [])
+          .map((row) => normalizeStripePaymentMethodId(row.payment_type))
+          .filter(Boolean)
+      );
+      paymentMethodIdsToDetach = candidateList.filter((paymentMethodId) => !savedIds.has(paymentMethodId));
+    }
+
     await connection.commit();
   } catch (error) {
     try { await connection.rollback(); } catch {}
@@ -5218,12 +5286,6 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
   } finally {
     connection.release();
   }
-
-  const paymentMethodIdsToDetach = [...new Set(
-    ephemeralRows
-      .map((row) => row.customer_payment_method_stripe_id)
-      .filter((value) => typeof value === 'string' && value.startsWith('pm_'))
-  )];
 
   if (paymentMethodIdsToDetach.length === 0) {
     return { released: 0, skipped: false };
@@ -5264,6 +5326,18 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
     await cleanupConnection.beginTransaction();
     await cleanupConnection.query(
       `
+      UPDATE booking b
+      JOIN payment_method pm ON pm.id = b.selected_customer_payment_method_id
+      SET b.selected_customer_payment_method_id = NULL
+      WHERE b.id = ?
+        AND pm.user_id = ?
+        AND pm.is_safed = 0
+        AND pm.payment_type IN (${detachedPaymentMethodIds.map(() => '?').join(', ')})
+      `,
+      [normalizedBookingId, booking.client_user_id, ...detachedPaymentMethodIds]
+    );
+    await cleanupConnection.query(
+      `
       UPDATE payment_method
       SET payment_type = NULL,
           is_default = 0,
@@ -5298,6 +5372,29 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
     released: detachedPaymentMethodIds.length,
     skipped: false,
   };
+}
+
+async function releaseEphemeralBookingPaymentMethodsAfterFailedAttempt(bookingId, candidatePaymentMethodIds, logContext = {}) {
+  const candidates = (Array.isArray(candidatePaymentMethodIds) ? candidatePaymentMethodIds : [candidatePaymentMethodIds])
+    .filter((value) => typeof value === 'string' && value.trim().startsWith('pm_'));
+
+  if (!candidates.length) {
+    return { released: 0, skipped: true };
+  }
+
+  try {
+    return await releaseEphemeralBookingPaymentMethodsIfClosed(bookingId, {
+      candidatePaymentMethodIds: candidates,
+      requireClosedBooking: false,
+    });
+  } catch (cleanupError) {
+    console.error('Error releasing ephemeral payment methods after failed payment attempt:', {
+      bookingId,
+      ...logContext,
+      error: cleanupError.message,
+    });
+    return { released: 0, skipped: false, error: cleanupError };
+  }
 }
 
 async function resolvePaymentIntentPersistence(intentLike, { paymentMethodFallback = null } = {}) {
@@ -5511,13 +5608,75 @@ async function upsertPaymentRow(conn, { bookingId, type, amountCents, commission
   );
 }
 
+async function resolveFinalPaymentAuditSnapshots(conn, bookingId, {
+  amountCents = null,
+  commissionSnapshotCents = null,
+  finalPriceSnapshotCents = null,
+} = {}) {
+  const snapshots = {
+    amountCents,
+    commissionSnapshotCents,
+    finalPriceSnapshotCents,
+  };
+
+  const missingAuditSnapshot = snapshots.commissionSnapshotCents === null
+    || snapshots.commissionSnapshotCents === undefined
+    || snapshots.finalPriceSnapshotCents === null
+    || snapshots.finalPriceSnapshotCents === undefined
+    || snapshots.amountCents === null
+    || snapshots.amountCents === undefined;
+
+  if (!missingAuditSnapshot) {
+    return snapshots;
+  }
+
+  try {
+    const booking = await getBookingSettlementContext(conn, bookingId, { forUpdate: true });
+    const depositPayment = await getPaymentRow(conn, bookingId, 'deposit');
+    if (!booking || !depositPayment) {
+      return snapshots;
+    }
+
+    const settlementSnapshot = buildActualBookingSettlementSnapshot({
+      booking,
+      depositPayment,
+    });
+
+    return {
+      amountCents: snapshots.amountCents ?? settlementSnapshot.amountDueFromClientCents,
+      commissionSnapshotCents: snapshots.commissionSnapshotCents ?? settlementSnapshot.platformAmountCents,
+      finalPriceSnapshotCents: snapshots.finalPriceSnapshotCents ?? settlementSnapshot.effectiveTotalAmountCents,
+    };
+  } catch (snapshotError) {
+    console.error('No se pudieron reconstruir snapshots de auditoría del pago final:', {
+      bookingId,
+      error: snapshotError.message,
+    });
+    return snapshots;
+  }
+}
+
 // UPSERT helper para la tabla payments
 async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCents, commissionSnapshotCents, finalPriceSnapshotCents, status, currency, transferGroup, paymentMethodId, paymentMethodLast4, lastErrorCode, lastErrorMessage }) {
   const normalizedBookingId = await lockPaymentBookingForUpdate(conn, bookingId);
   const normalizedType = String(type || '').trim();
   const normalizedPaymentIntentId = paymentIntentId || null;
   const normalizedIncomingStatus = String(status || '').trim().toLowerCase();
+  let effectiveAmountCents = amountCents ?? 0;
+  let effectiveCommissionSnapshotCents = commissionSnapshotCents ?? null;
+  let effectiveFinalPriceSnapshotCents = finalPriceSnapshotCents ?? null;
   let existingPayment = null;
+
+  if (normalizedType === 'final') {
+    const auditSnapshots = await resolveFinalPaymentAuditSnapshots(conn, normalizedBookingId, {
+      amountCents,
+      commissionSnapshotCents,
+      finalPriceSnapshotCents,
+    });
+    effectiveAmountCents = auditSnapshots.amountCents ?? effectiveAmountCents;
+    effectiveCommissionSnapshotCents = auditSnapshots.commissionSnapshotCents ?? effectiveCommissionSnapshotCents;
+    effectiveFinalPriceSnapshotCents = auditSnapshots.finalPriceSnapshotCents ?? effectiveFinalPriceSnapshotCents;
+  }
 
   if (normalizedPaymentIntentId) {
     const [intentRows] = await conn.query(
@@ -5557,9 +5716,9 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
 
   const updateParams = [
     protectExistingSnapshot ? null : normalizedPaymentIntentId,
-    protectExistingSnapshot ? existingPayment.amount_cents : (amountCents ?? 0),
-    protectExistingSnapshot ? existingPayment.commission_snapshot_cents : (commissionSnapshotCents ?? null),
-    protectExistingSnapshot ? existingPayment.final_price_snapshot_cents : (finalPriceSnapshotCents ?? null),
+    protectExistingSnapshot ? existingPayment.amount_cents : effectiveAmountCents,
+    protectExistingSnapshot ? existingPayment.commission_snapshot_cents : effectiveCommissionSnapshotCents,
+    protectExistingSnapshot ? existingPayment.final_price_snapshot_cents : effectiveFinalPriceSnapshotCents,
     statusToPersist,
     protectExistingSnapshot ? existingPayment.currency : normalizeCurrencyCode(currency, 'EUR'),
     protectExistingSnapshot ? existingPayment.transfer_group : (transferGroup || null),
@@ -6108,7 +6267,28 @@ async function validateStripePaymentIntentForBookingWebhook(connection, pi, {
 
   const expectedCustomerId = getStripeObjectId(booking.customer_id);
   const intentCustomerId = getStripeObjectId(pi.customer);
-  if (expectedCustomerId && intentCustomerId && intentCustomerId !== expectedCustomerId) {
+  if (!expectedCustomerId) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: 'booking_stripe_customer_missing',
+    };
+  }
+  if (!intentCustomerId) {
+    return {
+      valid: false,
+      bookingId: normalizedBookingId,
+      type: normalizedType,
+      booking,
+      paymentRow,
+      reason: 'payment_intent_customer_missing',
+      expectedCustomerId,
+    };
+  }
+  if (intentCustomerId !== expectedCustomerId) {
     return {
       valid: false,
       bookingId: normalizedBookingId,
@@ -6355,7 +6535,14 @@ async function verifyPaymentIntentCapturedForSettlement({
 
   const expectedCustomer = getStripeObjectId(expectedCustomerId);
   const actualCustomer = getStripeObjectId(intent.customer);
-  if (expectedCustomer && actualCustomer && expectedCustomer !== actualCustomer) {
+  if (expectedCustomer && !actualCustomer) {
+    return {
+      valid: false,
+      reason: 'payment_intent_customer_missing',
+      expectedCustomerId: expectedCustomer,
+    };
+  }
+  if (expectedCustomer && expectedCustomer !== actualCustomer) {
     return {
       valid: false,
       reason: 'payment_intent_customer_mismatch',
@@ -11416,15 +11603,59 @@ async function revokeAllUserSessions(userId) {
 // cron diario a las 3:00 AM
 cron.schedule('0 3 * * *', async () => {
   try {
-    await pool.promise().query(`
-      DELETE b FROM booking b
+    const [rows] = await pool.promise().query(`
+      SELECT DISTINCT b.id
+      FROM booking b
       LEFT JOIN payments p
         ON p.booking_id = b.id AND p.type = 'deposit'
       WHERE b.service_status = 'pending_deposit'
         AND b.order_datetime < (NOW() - INTERVAL 24 HOUR)
-        AND (p.id IS NULL OR p.status IN ('requires_payment_method','canceled','payment_failed'));
+        AND (p.id IS NULL OR p.status IN ('requires_payment_method','canceled','payment_failed'))
+      ORDER BY b.order_datetime ASC
+      LIMIT 100;
     `);
-    console.log('[CRON] Limpieza de reservas pending_deposit ejecutada');
+
+    let cleanedBookings = 0;
+    for (const row of rows || []) {
+      const bookingId = normalizeNullableInteger(row.id);
+      if (!bookingId) {
+        continue;
+      }
+
+      const connection = await pool.promise().getConnection();
+      try {
+        await connection.beginTransaction();
+        const [[booking]] = await connection.query(
+          'SELECT id, service_status, settlement_status FROM booking WHERE id = ? FOR UPDATE',
+          [bookingId]
+        );
+        if (booking && normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'pending_deposit') {
+          await transitionBookingStateRecord(connection, booking, {
+            nextSettlementStatus: 'payment_failed',
+            reasonCode: 'stale_pending_deposit_cleanup',
+          });
+        }
+        await connection.commit();
+      } catch (cleanupStateError) {
+        try { await connection.rollback(); } catch {}
+        console.error('[CRON] Error marking stale pending_deposit booking as failed:', {
+          bookingId,
+          error: cleanupStateError.message,
+        });
+        continue;
+      } finally {
+        connection.release();
+      }
+
+      await releaseEphemeralBookingPaymentMethodsIfClosed(bookingId);
+      await pool.promise().query(
+        'DELETE FROM booking WHERE id = ? AND service_status = ? AND settlement_status = ?',
+        [bookingId, 'pending_deposit', 'payment_failed']
+      );
+      cleanedBookings += 1;
+    }
+
+    console.log(`[CRON] Limpieza de reservas pending_deposit ejecutada (${cleanedBookings})`);
   } catch (e) {
     console.error('Error en cron cleanup:', e);
   }
@@ -20085,6 +20316,7 @@ app.post('/api/user/:id/id-document/detect-number', multerMid.single('file'), as
 app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const conn = await pool.promise().getConnection();
+  let shouldReleaseEphemeralPaymentMethods = false;
   try {
     await conn.beginTransaction();
     const [[b]] = await conn.query(
@@ -20105,8 +20337,12 @@ app.post('/api/bookings/:id/cancel-if-unpaid', authenticateToken, async (req, re
         changedByUserId: req.user?.id || null,
         reasonCode: 'deposit_payment_failed',
       });
+      shouldReleaseEphemeralPaymentMethods = true;
     }
     await conn.commit();
+    if (shouldReleaseEphemeralPaymentMethods) {
+      await releaseEphemeralBookingPaymentMethodsIfClosed(id);
+    }
     res.json({ ok: true });
   } catch (e) {
     try { await conn.rollback(); } catch { }
@@ -20327,6 +20563,7 @@ app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimi
             ? 'deposit_canceled_payment_sync'
             : 'deposit_failed_payment_sync',
         });
+        shouldReleaseEphemeralPaymentMethods = true;
       }
     }
 
@@ -20483,6 +20720,8 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
   let chargeCurrency = 'EUR';
   let depositSuccessResult = null;
   let resolvedPaymentMethodId = null;
+  let shouldReleaseEphemeralPaymentMethods = false;
+  let failedAttemptPaymentMethodId = null;
 
   const connection = await pool.promise().getConnection();
   try {
@@ -20879,11 +21118,21 @@ const round2 = (n) => {
           });
         }
         if (pi.status === 'requires_payment_method') {
+          failedAttemptPaymentMethodId = paymentPersistence.paymentMethodId || resolvedPaymentMethodId || null;
+          await releaseEphemeralBookingPaymentMethodsAfterFailedAttempt(id, failedAttemptPaymentMethodId, {
+            source: 'deposit_stripe_error_requires_payment_method',
+          });
           return res.status(202).json({
             requiresPaymentMethod: true,
             clientSecret: pi.client_secret,
             paymentIntentId: pi.id,
             ...buildPaymentAmountResponse(commissionCents, chargeCurrency),
+          });
+        }
+        if (pi.status === 'canceled') {
+          failedAttemptPaymentMethodId = paymentPersistence.paymentMethodId || resolvedPaymentMethodId || null;
+          await releaseEphemeralBookingPaymentMethodsAfterFailedAttempt(id, failedAttemptPaymentMethodId, {
+            source: 'deposit_stripe_error_canceled',
           });
         }
       }
@@ -20940,6 +21189,8 @@ const round2 = (n) => {
           changedByUserId: req.user?.id || null,
           reasonCode: 'deposit_canceled',
         });
+        shouldReleaseEphemeralPaymentMethods = true;
+        failedAttemptPaymentMethodId = paymentPersistence.paymentMethodId || resolvedPaymentMethodId || null;
       }
       await conn2.commit();
     } catch (e) {
@@ -20956,6 +21207,15 @@ const round2 = (n) => {
       });
     } finally {
       conn2.release();
+    }
+
+    if (intent.status === 'requires_payment_method') {
+      failedAttemptPaymentMethodId = paymentPersistence.paymentMethodId || resolvedPaymentMethodId || null;
+      await releaseEphemeralBookingPaymentMethodsAfterFailedAttempt(id, failedAttemptPaymentMethodId, {
+        source: 'deposit_requires_payment_method',
+      });
+    } else if (shouldReleaseEphemeralPaymentMethods) {
+      await releaseEphemeralBookingPaymentMethodsIfClosed(id);
     }
 
     console.log('PaymentIntent creado exitosamente:', {
@@ -21037,6 +21297,10 @@ const round2 = (n) => {
         error_code: err.code || 'booking_financial_integrity_failed',
       });
     }
+
+    await releaseEphemeralBookingPaymentMethodsAfterFailedAttempt(id, failedAttemptPaymentMethodId || resolvedPaymentMethodId, {
+      source: 'deposit_route_error',
+    });
 
     if (err.type && err.type.startsWith('Stripe')) {
       return res.status(400).json({
@@ -24319,6 +24583,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
                 ? 'deposit_canceled_webhook'
                 : 'deposit_failed_webhook',
             });
+            shouldReleaseEphemeralPaymentMethods = true;
           }
         }
         if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'final' && persistedPaymentStatus !== 'succeeded') {
