@@ -379,7 +379,7 @@ test("computeSettlementAmounts charges the delta when the final total exceeds th
   );
 });
 
-test("canReleaseProviderPayout requires finished paid booking and succeeded payments", () => {
+test("canReleaseProviderPayout requires finished paid booking and captured deposit", () => {
   const now = "2026-04-27T10:00:00.000Z";
   const booking = {
     service_status: "finished",
@@ -396,6 +396,24 @@ test("canReleaseProviderPayout requires finished paid booking and succeeded paym
   };
 
   assert.equal(canReleaseProviderPayout({ booking, payment, depositPayment, now }), true);
+  assert.equal(
+    canReleaseProviderPayout({
+      booking,
+      payment,
+      depositPayment: { status: "partially_refunded" },
+      now,
+    }),
+    true
+  );
+  assert.equal(
+    canReleaseProviderPayout({
+      booking,
+      payment,
+      depositPayment: { status: "refunded" },
+      now,
+    }),
+    false
+  );
   assert.equal(
     canReleaseProviderPayout({
       booking: { ...booking, settlement_status: "awaiting_payment" },

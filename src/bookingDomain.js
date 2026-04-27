@@ -434,11 +434,12 @@ function canReleaseProviderPayout({
 } = {}) {
   const normalizedNow = parseDateInput(now) || new Date();
   const payoutEligibleAt = parseDateInput(payment?.provider_payout_eligible_at);
+  const depositStatus = String(depositPayment?.status || "").trim().toLowerCase();
 
   return normalizeServiceStatus(booking?.service_status, "pending_deposit") === "finished"
     && normalizeSettlementStatus(booking?.settlement_status, "none") === "paid"
     && String(payment?.status || "").trim().toLowerCase() === "succeeded"
-    && String(depositPayment?.status || "").trim().toLowerCase() === "succeeded"
+    && ["succeeded", "partially_refunded"].includes(depositStatus)
     && String(payment?.provider_payout_status || "").trim().toLowerCase() === "pending_release"
     && normalizeAmountCents(payment?.provider_payout_amount_cents) > 0
     && payoutEligibleAt !== null
