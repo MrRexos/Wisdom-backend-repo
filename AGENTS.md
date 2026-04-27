@@ -234,6 +234,21 @@
 - `UNIQUE KEY ux_payments_booking_type (booking_id, type)`
 - `UNIQUE KEY ux_payments_payment_intent_id (payment_intent_id)`
 
+## Tabla: `stripe_webhook_event`
+- `event_id` (VARCHAR(255), PK, NOT NULL)
+- `event_type` (VARCHAR(100), NOT NULL)
+- `stripe_created_at` (DATETIME, NULL)
+- `payment_intent_id` (VARCHAR(250), NULL)
+- `booking_id` (INT, FK -> booking.id, NULL)
+- `payment_type` (ENUM('deposit','final'), NULL)
+- `processing_status` (ENUM('processing','processed','failed','ignored'), NOT NULL, DEFAULT processing)
+- `received_count` (INT UNSIGNED, NOT NULL, DEFAULT 1)
+- `first_received_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `last_received_at` (DATETIME, DEFAULT_GENERATED, NOT NULL, DEFAULT CURRENT_TIMESTAMP)
+- `processing_started_at` (DATETIME, NULL)
+- `processed_at` (DATETIME, NULL)
+- `last_error_message` (VARCHAR(1000), NULL)
+
 ## Tabla: `price`
 - `id` (INT, PK, UNIQUE, auto_increment, NOT NULL)
 - `price` (DECIMAL(9,2), NULL)
@@ -518,6 +533,10 @@
 - `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_payments_booking_id_booking_id`, ON DELETE SET NULL, ON UPDATE NO ACTION)
 - `booking_id`, `type`: **UNIQUE** (Key Name: `ux_payments_booking_type`)
 - `payment_intent_id`: **UNIQUE** (Key Name: `ux_payments_payment_intent_id`, permite múltiples `NULL`)
+
+### Tabla: `stripe_webhook_event`
+- `event_id`: **PK** (Key Name: `PRIMARY`)
+- `booking_id`: **FK** -> `booking`.`id` (Key Name: `fk_stripe_webhook_event_booking`, ON DELETE SET NULL, ON UPDATE NO ACTION)
 
 ### Tabla: `price`
 - `id`: **PK** (Key Name: `PRIMARY`)

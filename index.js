@@ -14,6 +14,7 @@ const path = require('path');
 const sharp = require('sharp');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const ipKeyGenerator = rateLimit.ipKeyGenerator || ((ip) => ip || 'unknown');
 const nodemailer = require('nodemailer');
 const crypto = require("crypto");
 const PDFDocument = require('pdfkit');
@@ -690,6 +691,7 @@ const SETTLEMENT_STATUSES_ELIGIBLE_FOR_FINAL_PAYMENT_REACTION = new Set([
   'awaiting_payment',
 ]);
 const PAYMENT_STATUSES_PROTECTED_FROM_SUCCESS_REGRESSION = new Set([
+  'succeeded',
   'refund_pending',
   'partially_refunded',
   'refunded',
@@ -5178,7 +5180,7 @@ async function upsertPayment(conn, { bookingId, type, paymentIntentId, amountCen
   const existingStatus = String(existingPayment?.status || '').trim().toLowerCase();
   const statusToPersist = (
     PAYMENT_STATUSES_PROTECTED_FROM_SUCCESS_REGRESSION.has(existingStatus)
-    && ['succeeded', 'processing', 'requires_action'].includes(normalizedIncomingStatus)
+    && existingStatus !== normalizedIncomingStatus
   )
     ? existingStatus
     : normalizedIncomingStatus;
@@ -5372,6 +5374,212 @@ function getStripeChargeRefundStatus(charge) {
     capturedAmountCents,
     fullyRefunded: capturedAmountCents > 0 && refundedAmountCents >= capturedAmountCents,
   };
+}
+
+function buildStripeWebhookEventContext(event) {
+  const object = event?.data?.object || null;
+  const objectName = typeof object?.object === 'string' ? object.object : '';
+  const paymentIntentId = objectName === 'payment_intent'
+    ? getStripeObjectId(object)
+    : getStripeObjectId(object?.payment_intent);
+  const metadata = objectName === 'payment_intent' ? (object.metadata || {}) : {};
+
+  return {
+    eventId: typeof event?.id === 'string' ? event.id.trim() : '',
+    eventType: typeof event?.type === 'string' ? event.type.trim() : '',
+    stripeCreatedAt: getStripeObjectCreatedAt(event),
+    paymentIntentId,
+    bookingId: normalizeNullableInteger(metadata.booking_id),
+    paymentType: normalizeBookingPaymentType(metadata.type),
+  };
+}
+
+async function beginStripeWebhookEventProcessing(event) {
+  const context = buildStripeWebhookEventContext(event);
+  if (!context.eventId) {
+    return { acquired: true, reason: 'event_id_missing', context };
+  }
+
+  const connection = await promisePool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [insertResult] = await connection.query(
+      `
+      INSERT IGNORE INTO stripe_webhook_event
+        (event_id, event_type, stripe_created_at, payment_intent_id, booking_id, payment_type, processing_status, received_count, last_received_at, processing_started_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'processing', 1, UTC_TIMESTAMP(), UTC_TIMESTAMP())
+      `,
+      [
+        context.eventId,
+        context.eventType || null,
+        toDbDateTime(context.stripeCreatedAt),
+        context.paymentIntentId || null,
+        context.bookingId || null,
+        context.paymentType || null,
+      ]
+    );
+
+    if (insertResult.affectedRows === 1) {
+      await connection.commit();
+      return { acquired: true, reason: 'created', context };
+    }
+
+    const [[existingEvent]] = await connection.query(
+      `
+      SELECT event_id, processing_status, processing_started_at
+      FROM stripe_webhook_event
+      WHERE event_id = ?
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [context.eventId]
+    );
+
+    const existingStatus = String(existingEvent?.processing_status || '').trim().toLowerCase();
+    if (existingStatus === 'processed' || existingStatus === 'ignored') {
+      await connection.query(
+        `
+        UPDATE stripe_webhook_event
+        SET received_count = received_count + 1,
+            last_received_at = UTC_TIMESTAMP()
+        WHERE event_id = ?
+        `,
+        [context.eventId]
+      );
+      await connection.commit();
+      return { acquired: false, reason: existingStatus, context };
+    }
+
+    if (existingStatus === 'failed') {
+      await connection.query(
+        `
+        UPDATE stripe_webhook_event
+        SET processing_status = 'processing',
+            event_type = COALESCE(?, event_type),
+            stripe_created_at = COALESCE(?, stripe_created_at),
+            payment_intent_id = COALESCE(?, payment_intent_id),
+            booking_id = COALESCE(?, booking_id),
+            payment_type = COALESCE(?, payment_type),
+            received_count = received_count + 1,
+            last_received_at = UTC_TIMESTAMP(),
+            processing_started_at = UTC_TIMESTAMP(),
+            processed_at = NULL,
+            last_error_message = NULL
+        WHERE event_id = ?
+        `,
+        [
+          context.eventType || null,
+          toDbDateTime(context.stripeCreatedAt),
+          context.paymentIntentId || null,
+          context.bookingId || null,
+          context.paymentType || null,
+          context.eventId,
+        ]
+      );
+      await connection.commit();
+      return { acquired: true, reason: 'retry_failed_event', context };
+    }
+
+    const processingStartedAt = parseDateTimeInput(existingEvent?.processing_started_at);
+    const processingIsStale = existingStatus === 'processing'
+      && (!processingStartedAt || Date.now() - processingStartedAt.getTime() > 10 * 60 * 1000);
+    if (processingIsStale) {
+      await connection.query(
+        `
+        UPDATE stripe_webhook_event
+        SET event_type = COALESCE(?, event_type),
+            stripe_created_at = COALESCE(?, stripe_created_at),
+            payment_intent_id = COALESCE(?, payment_intent_id),
+            booking_id = COALESCE(?, booking_id),
+            payment_type = COALESCE(?, payment_type),
+            received_count = received_count + 1,
+            last_received_at = UTC_TIMESTAMP(),
+            processing_started_at = UTC_TIMESTAMP(),
+            processed_at = NULL,
+            last_error_message = NULL
+        WHERE event_id = ?
+        `,
+        [
+          context.eventType || null,
+          toDbDateTime(context.stripeCreatedAt),
+          context.paymentIntentId || null,
+          context.bookingId || null,
+          context.paymentType || null,
+          context.eventId,
+        ]
+      );
+      await connection.commit();
+      return { acquired: true, reason: 'retry_stale_processing_event', context };
+    }
+
+    await connection.query(
+      `
+      UPDATE stripe_webhook_event
+      SET received_count = received_count + 1,
+          last_received_at = UTC_TIMESTAMP()
+      WHERE event_id = ?
+      `,
+      [context.eventId]
+    );
+    await connection.commit();
+    return { acquired: false, reason: 'processing', context };
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function markStripeWebhookEventProcessed(event, { ignored = false } = {}) {
+  const context = buildStripeWebhookEventContext(event);
+  if (!context.eventId) {
+    return;
+  }
+
+  await promisePool.query(
+    `
+    UPDATE stripe_webhook_event
+    SET processing_status = ?,
+        event_type = COALESCE(?, event_type),
+        stripe_created_at = COALESCE(?, stripe_created_at),
+        payment_intent_id = COALESCE(?, payment_intent_id),
+        booking_id = COALESCE(?, booking_id),
+        payment_type = COALESCE(?, payment_type),
+        processed_at = UTC_TIMESTAMP(),
+        last_error_message = NULL
+    WHERE event_id = ?
+    `,
+    [
+      ignored ? 'ignored' : 'processed',
+      context.eventType || null,
+      toDbDateTime(context.stripeCreatedAt),
+      context.paymentIntentId || null,
+      context.bookingId || null,
+      context.paymentType || null,
+      context.eventId,
+    ]
+  );
+}
+
+async function markStripeWebhookEventFailed(event, error) {
+  const context = buildStripeWebhookEventContext(event);
+  if (!context.eventId) {
+    return;
+  }
+
+  const errorMessage = String(error?.message || error || 'stripe_webhook_failed').slice(0, 1000);
+  await promisePool.query(
+    `
+    UPDATE stripe_webhook_event
+    SET processing_status = 'failed',
+        processed_at = UTC_TIMESTAMP(),
+        last_error_message = ?
+    WHERE event_id = ?
+    `,
+    [errorMessage, context.eventId]
+  );
 }
 
 async function validateStripePaymentIntentForBookingWebhook(connection, pi, {
@@ -10846,6 +11054,41 @@ const guestSessionLimiter = rateLimit({
   },
 });
 
+function createSensitiveApiRateLimiter({ windowMs, max, error = 'rate_limit_exceeded' }) {
+  return rateLimit({
+    windowMs,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+      const authenticatedUserId = normalizeNullableInteger(req.user?.id);
+      if (authenticatedUserId) {
+        return `user:${authenticatedUserId}`;
+      }
+      return `ip:${ipKeyGenerator(req.ip)}`;
+    },
+    handler: (req, res) => {
+      res.status(429).json({ error });
+    },
+  });
+}
+
+const bookingCreateLimiter = createSensitiveApiRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  error: 'booking_create_rate_limit_exceeded',
+});
+const bookingPaymentLimiter = createSensitiveApiRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  max: 12,
+  error: 'booking_payment_rate_limit_exceeded',
+});
+const collectionMethodWriteLimiter = createSensitiveApiRateLimiter({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  error: 'collection_method_rate_limit_exceeded',
+});
+
 
 
 // Ruta de prueba
@@ -15674,7 +15917,7 @@ app.delete('/api/address/:id', authenticateToken, async (req, res) => {
 });
 
 //Crear reserva
-app.post('/api/bookings', authenticateToken, async (req, res) => {
+app.post('/api/bookings', authenticateToken, bookingCreateLimiter, async (req, res) => {
   const authenticatedUserId = parseRequestedUserId(req.user?.id);
   const requestedUserId = normalizeNullableInteger(req.body.client_user_id ?? req.body.user_id ?? authenticatedUserId);
   const serviceId = normalizeNullableInteger(req.body.service_id);
@@ -18768,7 +19011,7 @@ app.get('/api/user/:id/collection-method', authenticateToken, async (req, res) =
 });
 
 // Crear método de cobro y cuenta Stripe Connect
-app.post('/api/user/:id/collection-method', authenticateToken, async (req, res) => {
+app.post('/api/user/:id/collection-method', authenticateToken, collectionMethodWriteLimiter, async (req, res) => {
   const requestedUserId = ensureSameUserOrRespond(req, res);
   if (!requestedUserId) return;
 
@@ -19142,8 +19385,319 @@ app.get('/api/payment-methods/default', authenticateToken, async (req, res) => {
   }
 });
 
+app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimiter, async (req, res) => {
+  const bookingId = normalizeNullableInteger(req.params.id);
+  const type = normalizeBookingPaymentType(req.body?.type);
+  const paymentIntentId = typeof (req.body?.payment_intent_id ?? req.body?.paymentIntentId) === 'string'
+    ? (req.body.payment_intent_id ?? req.body.paymentIntentId).trim()
+    : '';
+  const requestedSavePaymentMethod = normalizeBooleanInput(req.body?.save_payment_method, false);
+
+  if (!bookingId) {
+    return res.status(400).json({ error: 'Id inválido.' });
+  }
+  if (!type || !paymentIntentId) {
+    return res.status(400).json({ error: 'payment_intent_id y type son requeridos.' });
+  }
+
+  try {
+    const [[paymentScope]] = await promisePool.query(
+      `
+      SELECT
+        b.id,
+        b.client_user_id,
+        b.provider_user_id_snapshot,
+        p.payment_intent_id,
+        p.status AS payment_status
+      FROM booking b
+      LEFT JOIN payments p ON p.booking_id = b.id AND p.type = ?
+      WHERE b.id = ?
+      LIMIT 1
+      `,
+      [type, bookingId]
+    );
+
+    if (!paymentScope) {
+      return res.status(404).json({ error: 'Reserva no encontrada.' });
+    }
+
+    const { isClientOwner, isStaff } = getBookingAccessFlags(req.user, paymentScope);
+    if (!isClientOwner && !isStaff) {
+      return res.status(403).json({ error: 'No autorizado.' });
+    }
+
+    if (!paymentScope.payment_intent_id) {
+      return res.status(404).json({ error: 'No hay PaymentIntent registrado para esta reserva.' });
+    }
+
+    if (paymentScope.payment_intent_id !== paymentIntentId) {
+      return res.status(409).json({ error: 'El PaymentIntent no pertenece a esta reserva.' });
+    }
+  } catch (scopeError) {
+    console.error('Error validando sincronización de pago:', {
+      bookingId,
+      paymentIntentId,
+      type,
+      error: scopeError.message,
+    });
+    return res.status(500).json({ error: 'No se pudo validar el pago.' });
+  }
+
+  let intent;
+  try {
+    intent = await stripe.paymentIntents.retrieve(paymentIntentId, {
+      expand: ['payment_method', 'latest_charge.payment_method_details'],
+    });
+  } catch (stripeError) {
+    console.error('Error recuperando PaymentIntent para sincronización:', {
+      bookingId,
+      paymentIntentId,
+      type,
+      error: stripeError.message,
+    });
+    return res.status(400).json({ error: 'No se pudo verificar el pago en Stripe.' });
+  }
+
+  let paymentPersistence;
+  try {
+    paymentPersistence = await resolvePaymentIntentPersistence(intent);
+  } catch (persistenceError) {
+    console.error('Error resolviendo PaymentIntent para sincronización:', {
+      bookingId,
+      paymentIntentId,
+      type,
+      error: persistenceError.message,
+    });
+    return res.status(400).json({ error: 'No se pudo leer el estado del pago en Stripe.' });
+  }
+  intent = paymentPersistence.intent || intent;
+  const syncEventType = {
+    succeeded: 'payment_intent.succeeded',
+    processing: 'payment_intent.processing',
+    requires_action: 'payment_intent.requires_action',
+    requires_payment_method: 'payment_intent.payment_failed',
+    canceled: 'payment_intent.canceled',
+  }[intent.status] || `payment_intent.${intent.status || 'unknown'}`;
+
+  const connection = await pool.promise().getConnection();
+  let depositRefundRequest = null;
+  let closureFollowUpEmailMode = null;
+  let shouldReleaseEphemeralPaymentMethods = false;
+
+  try {
+    await connection.beginTransaction();
+
+    const validation = await validateStripePaymentIntentForBookingWebhook(connection, intent, {
+      bookingId,
+      type,
+      eventType: syncEventType,
+    });
+
+    if (!validation.valid) {
+      const details = `Sincronización post-SCA rechazada para PaymentIntent ${intent.id}: ${validation.reason}.`;
+      await flagBookingPaymentForManualReview(connection, validation.bookingId || bookingId, {
+        changedByUserId: req.user?.id || null,
+        nextSettlementStatus: 'manual_review_required',
+        reasonCode: 'stripe_payment_sync_validation_failed',
+        details,
+      });
+      await connection.commit();
+      console.error('Stripe payment sync validation failed:', {
+        bookingId,
+        paymentIntentId,
+        type,
+        reason: validation.reason,
+      });
+      return res.status(409).json({
+        manualReviewRequired: true,
+        error: 'El pago requiere revisión manual.',
+        reason: validation.reason,
+      });
+    }
+
+    await upsertPayment(connection, {
+      bookingId,
+      type,
+      paymentIntentId: intent.id,
+      amountCents: validation.amountCents,
+      status: mapStatus(intent.status),
+      currency: validation.currency,
+      transferGroup: intent.transfer_group || null,
+      paymentMethodId: paymentPersistence.paymentMethodId || null,
+      paymentMethodLast4: paymentPersistence.paymentMethodLast4 || null,
+      lastErrorCode: paymentPersistence.lastErrorCode,
+      lastErrorMessage: paymentPersistence.lastErrorMessage,
+    });
+
+    const [[persistedPayment]] = await connection.query(
+      `SELECT status FROM payments WHERE payment_intent_id = ? LIMIT 1 FOR UPDATE`,
+      [intent.id]
+    );
+    const persistedStatus = String(persistedPayment?.status || mapStatus(intent.status)).trim().toLowerCase();
+
+    if (persistedStatus === 'succeeded' && type === 'deposit') {
+      const depositResult = await applySuccessfulDepositPaymentForBooking(connection, {
+        bookingId,
+        intent,
+        paymentPersistence,
+        saveForFuture: requestedSavePaymentMethod,
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'deposit_succeeded_payment_sync',
+        staleReasonCode: 'late_deposit_succeeded_payment_sync',
+        amountCents: validation.amountCents,
+        currency: validation.currency,
+      });
+      depositRefundRequest = depositResult.refundRequest || null;
+    }
+
+    if (persistedStatus === 'succeeded' && type === 'final') {
+      const [[bookingRow]] = await connection.query(
+        'SELECT id, client_user_id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
+        [bookingId]
+      );
+      if (bookingRow) {
+        await syncBookingSelectedPaymentMethodFromIntent(connection, {
+          bookingId,
+          userId: bookingRow.client_user_id,
+          intent,
+          saveForFuture: requestedSavePaymentMethod,
+        });
+      }
+    }
+
+    if ((intent.status === 'requires_payment_method' || intent.status === 'canceled') && type === 'deposit' && persistedStatus !== 'succeeded') {
+      const [[bookingRow]] = await connection.query(
+        'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
+        [bookingId]
+      );
+      if (bookingRow && normalizeServiceStatus(bookingRow.service_status, 'pending_deposit') === 'pending_deposit') {
+        await transitionBookingStateRecord(connection, bookingRow, {
+          nextSettlementStatus: 'payment_failed',
+          changedByUserId: req.user?.id || null,
+          reasonCode: intent.status === 'canceled'
+            ? 'deposit_canceled_payment_sync'
+            : 'deposit_failed_payment_sync',
+        });
+      }
+    }
+
+    if ((intent.status === 'requires_payment_method' || intent.status === 'canceled') && type === 'final' && persistedStatus !== 'succeeded') {
+      const bookingRow = await getBookingSettlementContext(connection, bookingId, { forUpdate: true });
+      if (bookingRow && normalizeSettlementStatus(bookingRow.settlement_status, 'none') !== 'paid') {
+        const reaction = await applyFinalPaymentFailureReactionWindow(connection, bookingRow, {
+          changedByUserId: req.user?.id || null,
+          details: intent.status === 'canceled'
+            ? 'El cobro final se ha cancelado durante la sincronización post-SCA.'
+            : 'El cobro final ha fallado durante la sincronización post-SCA.',
+          followUpReasonCode: intent.status === 'canceled'
+            ? 'final_payment_canceled_follow_up_payment_sync'
+            : 'final_payment_failed_follow_up_payment_sync',
+          disputeReasonCode: intent.status === 'canceled'
+            ? 'final_payment_canceled_payment_sync'
+            : 'final_payment_failed_payment_sync',
+        });
+        closureFollowUpEmailMode = reaction.emailMode || null;
+      }
+    }
+
+    await connection.commit();
+
+    if (depositRefundRequest?.paymentIntentId) {
+      await executeRefundRequestOrFlagForManualReview(depositRefundRequest, {
+        booking_id: String(depositRefundRequest.bookingId),
+        source: 'late_deposit_succeeded_payment_sync',
+      }, {
+        changedByUserId: req.user?.id || null,
+        failureReasonCode: 'late_deposit_refund_failed',
+        logMessage: 'Error refunding late deposit after payment sync:',
+      });
+      return res.status(409).json({
+        refundPending: true,
+        paymentIntentId: intent.id,
+        error: 'La reserva ya estaba cerrada. El depósito tardío no se ha aplicado y se ha solicitado el reembolso.',
+      });
+    }
+
+    if (persistedPayment?.status === 'succeeded' && type === 'final') {
+      const settlementResult = await finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
+        changedByUserId: req.user?.id || null,
+        reasonCode: 'final_payment_succeeded_payment_sync',
+      });
+      shouldReleaseEphemeralPaymentMethods = settlementResult.settled === true;
+      if (!settlementResult.settled) {
+        return res.status(202).json({
+          manualReviewRequired: true,
+          paymentIntentId: intent.id,
+          reason: settlementResult.reason,
+        });
+      }
+    }
+
+    if (shouldReleaseEphemeralPaymentMethods) {
+      try {
+        await releaseEphemeralBookingPaymentMethodsIfClosed(bookingId);
+      } catch (cleanupError) {
+        console.error('Error releasing ephemeral payment methods after payment sync:', {
+          bookingId,
+          error: cleanupError.message,
+        });
+      }
+    }
+
+    if (closureFollowUpEmailMode) {
+      try {
+        await sendClosureAutoChargeNotificationEmail({
+          bookingId,
+          mode: closureFollowUpEmailMode,
+        });
+      } catch (emailError) {
+        console.error('Error sending closure follow-up email after payment sync:', {
+          bookingId,
+          mode: closureFollowUpEmailMode,
+          error: emailError.message,
+        });
+      }
+    }
+
+    if (persistedPayment?.status === 'succeeded') {
+      return res.status(200).json({
+        confirmed: true,
+        message: type === 'deposit' ? 'Depósito sincronizado' : 'Pago confirmado',
+        paymentIntentId: intent.id,
+      });
+    }
+
+    if (intent.status === 'processing') {
+      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'requires_action') {
+      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    }
+    if (intent.status === 'requires_payment_method') {
+      return res.status(202).json({ requiresPaymentMethod: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+    }
+
+    return res.status(402).json({
+      error: 'El pago no se pudo completar',
+      paymentIntentId: intent.id,
+      status: intent.status,
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    console.error('Error sincronizando pago de reserva:', {
+      bookingId,
+      paymentIntentId,
+      type,
+      error: error.message,
+    });
+    return res.status(500).json({ error: 'No se pudo sincronizar el pago.' });
+  } finally {
+    connection.release();
+  }
+});
+
 // Cobra la comisión 10% (mín 1€)
-app.post('/api/bookings/:id/deposit', authenticateToken, async (req, res) => {
+app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, async (req, res) => {
   await ensureExchangeRatesFresh();
   const id = parseInt(req.params.id, 10);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'Id inválido' });
@@ -19658,7 +20212,7 @@ const round2 = (n) => {
 });
 
 // Cobro final en plataforma + liquidación posterior al profesional
-app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (req, res) => {
+app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingPaymentLimiter, async (req, res) => {
   await ensureExchangeRatesFresh();
   const id = parseInt(req.params.id, 10);
   const { payment_method_id, save_payment_method } = req.body;
@@ -22705,6 +23259,26 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  let webhookProcessing;
+  try {
+    webhookProcessing = await beginStripeWebhookEventProcessing(event);
+  } catch (trackingError) {
+    console.error('Stripe webhook idempotency tracking failed:', {
+      eventId: event?.id || null,
+      eventType: event?.type || null,
+      error: trackingError.message,
+    });
+    return res.status(500).end();
+  }
+
+  if (!webhookProcessing.acquired) {
+    return res.status(200).json({
+      received: true,
+      duplicate: true,
+      status: webhookProcessing.reason,
+    });
+  }
+
   const connection = await pool.promise().getConnection();
   try {
     switch (event.type) {
@@ -22770,6 +23344,11 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           lastErrorCode: paymentPersistence.lastErrorCode,
           lastErrorMessage: paymentPersistence.lastErrorMessage,
         });
+        const [[persistedPaymentState]] = await connection.query(
+          'SELECT status FROM payments WHERE payment_intent_id = ? LIMIT 1 FOR UPDATE',
+          [pi.id]
+        );
+        const persistedPaymentStatus = String(persistedPaymentState?.status || mapStatus(pi.status)).trim().toLowerCase();
 
         if (event.type === 'payment_intent.succeeded' && type === 'deposit') {
           const depositResult = await applySuccessfulDepositPaymentForBooking(connection, {
@@ -22799,12 +23378,12 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
             });
           }
         }
-        if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'deposit') {
+        if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'deposit' && persistedPaymentStatus !== 'succeeded') {
           const [[bookingRow]] = await connection.query(
             'SELECT id, service_status, settlement_status FROM booking WHERE id = ? LIMIT 1 FOR UPDATE',
             [bookingId]
           );
-          if (bookingRow) {
+          if (bookingRow && normalizeServiceStatus(bookingRow.service_status, 'pending_deposit') === 'pending_deposit') {
             await transitionBookingStateRecord(connection, bookingRow, {
               nextSettlementStatus: 'payment_failed',
               reasonCode: event.type === 'payment_intent.canceled'
@@ -22813,7 +23392,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
             });
           }
         }
-        if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'final') {
+        if ((event.type === 'payment_intent.payment_failed' || event.type === 'payment_intent.canceled') && type === 'final' && persistedPaymentStatus !== 'succeeded') {
           const bookingRow = await getBookingSettlementContext(connection, bookingId, { forUpdate: true });
           if (bookingRow && normalizeSettlementStatus(bookingRow.settlement_status, 'none') !== 'paid') {
             const paymentFailureDetails = event.type === 'payment_intent.canceled'
@@ -23025,10 +23604,18 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         break;
     }
 
+    await markStripeWebhookEventProcessed(event);
     res.status(200).json({ received: true });
   } catch (e) {
     console.error('Webhook handling error:', e);
     try { await connection.rollback(); } catch { }
+    try { await markStripeWebhookEventFailed(event, e); } catch (trackingError) {
+      console.error('Stripe webhook idempotency failure update failed:', {
+        eventId: event?.id || null,
+        eventType: event?.type || null,
+        error: trackingError.message,
+      });
+    }
     res.status(500).end();
   } finally {
     connection.release();
