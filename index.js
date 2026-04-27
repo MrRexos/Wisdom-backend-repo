@@ -2093,6 +2093,17 @@ function mapBookingPaymentSummaryForApi(row = null, fallbackCurrency = 'EUR') {
   };
 }
 
+function buildPaymentAmountResponse(amountCents, currency = 'EUR') {
+  const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
+  const normalizedAmountCents = normalizeStripeAmountCents(amountCents);
+
+  return {
+    amount_cents: normalizedAmountCents,
+    currency: normalizedCurrency,
+    amount: fromMinorUnits(normalizedAmountCents, normalizedCurrency),
+  };
+}
+
 function parseJsonObject(value) {
   if (!value) {
     return null;
@@ -5049,12 +5060,23 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
     await cleanupConnection.query(
       `
       UPDATE payment_method
-      SET is_default = 0
+      SET payment_type = NULL,
+          is_default = 0,
+          is_safed = 0
       WHERE user_id = ?
         AND is_safed = 0
         AND payment_type IN (${detachedPaymentMethodIds.map(() => '?').join(', ')})
       `,
       [booking.client_user_id, ...detachedPaymentMethodIds]
+    );
+    await cleanupConnection.query(
+      `
+      UPDATE payments
+      SET payment_method_id = NULL
+      WHERE booking_id = ?
+        AND payment_method_id IN (${detachedPaymentMethodIds.map(() => '?').join(', ')})
+      `,
+      [normalizedBookingId, ...detachedPaymentMethodIds]
     );
     await cleanupConnection.commit();
   } catch (cleanupError) {
@@ -6566,14 +6588,6 @@ async function applySuccessfulDepositPaymentForBooking(connection, {
     };
   }
 
-  await syncBookingSelectedPaymentMethodFromIntent(connection, {
-    bookingId: normalizedBookingId,
-    userId: bookingRow.client_user_id,
-    intent,
-    paymentMethodFallback: paymentPersistence.paymentMethodFallback || null,
-    saveForFuture,
-  });
-
   const normalizedServiceStatus = normalizeServiceStatus(bookingRow.service_status, 'pending_deposit');
   const normalizedSettlementStatus = normalizeSettlementStatus(bookingRow.settlement_status, 'none');
   const depositPatch = {
@@ -6583,6 +6597,14 @@ async function applySuccessfulDepositPaymentForBooking(connection, {
   };
 
   if (normalizedServiceStatus === 'pending_deposit') {
+    await syncBookingSelectedPaymentMethodFromIntent(connection, {
+      bookingId: normalizedBookingId,
+      userId: bookingRow.client_user_id,
+      intent,
+      paymentMethodFallback: paymentPersistence.paymentMethodFallback || null,
+      saveForFuture,
+    });
+
     await transitionBookingStateRecord(connection, bookingRow, {
       nextServiceStatus: 'requested',
       nextSettlementStatus: normalizedSettlementStatus === 'payment_failed' ? 'none' : bookingRow.settlement_status,
@@ -6645,6 +6667,39 @@ async function applySuccessfulDepositPaymentForBooking(connection, {
     return {
       applied: true,
       action: 'refund_pending_for_closed_booking',
+      refundRequest: {
+        bookingId: normalizedBookingId,
+        paymentIntentId: intent.id,
+        reasonCode: staleReasonCode,
+      },
+    };
+  }
+
+  if (normalizedServiceStatus !== 'pending_deposit' && !bookingRow.deposit_confirmed_at) {
+    const nextSettlementStatus = isSettlementStatusProtectedFromAutomaticPayment(normalizedSettlementStatus)
+      ? bookingRow.settlement_status
+      : 'refund_pending';
+
+    await transitionBookingStateRecord(connection, bookingRow, {
+      nextServiceStatus: bookingRow.service_status,
+      nextSettlementStatus,
+      changedByUserId,
+      reasonCode: staleReasonCode,
+      extraPatch: {
+        client_approval_deadline_at: null,
+      },
+    });
+
+    if (depositPaymentRow?.id) {
+      await connection.query(
+        'UPDATE payments SET status = ? WHERE id = ?',
+        ['refund_pending', depositPaymentRow.id]
+      );
+    }
+
+    return {
+      applied: true,
+      action: 'refund_pending_for_non_pending_booking',
       refundRequest: {
         bookingId: normalizedBookingId,
         paymentIntentId: intent.id,
@@ -19915,6 +19970,8 @@ app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimi
 
     await connection.commit();
 
+    const syncedPaymentAmountResponse = buildPaymentAmountResponse(validation.amountCents, validation.currency);
+
     if (depositRefundRequest?.paymentIntentId) {
       await executeRefundRequestOrFlagForManualReview(depositRefundRequest, {
         booking_id: String(depositRefundRequest.bookingId),
@@ -19928,6 +19985,7 @@ app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimi
         refundPending: true,
         paymentIntentId: intent.id,
         error: 'La reserva ya estaba cerrada. El depósito tardío no se ha aplicado y se ha solicitado el reembolso.',
+        ...syncedPaymentAmountResponse,
       });
     }
 
@@ -19977,23 +20035,35 @@ app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimi
         confirmed: true,
         message: type === 'deposit' ? 'Depósito sincronizado' : 'Pago confirmado',
         paymentIntentId: intent.id,
+        ...syncedPaymentAmountResponse,
       });
     }
 
     if (intent.status === 'processing') {
-      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+      return res.status(202).json({ processing: true, paymentIntentId: intent.id, ...syncedPaymentAmountResponse });
     }
     if (intent.status === 'requires_action') {
-      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+      return res.status(202).json({
+        requiresAction: true,
+        clientSecret: intent.client_secret,
+        paymentIntentId: intent.id,
+        ...syncedPaymentAmountResponse,
+      });
     }
     if (intent.status === 'requires_payment_method') {
-      return res.status(202).json({ requiresPaymentMethod: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+      return res.status(202).json({
+        requiresPaymentMethod: true,
+        clientSecret: intent.client_secret,
+        paymentIntentId: intent.id,
+        ...syncedPaymentAmountResponse,
+      });
     }
 
     return res.status(402).json({
       error: 'El pago no se pudo completar',
       paymentIntentId: intent.id,
       status: intent.status,
+      ...syncedPaymentAmountResponse,
     });
   } catch (error) {
     try { await connection.rollback(); } catch {}
@@ -20119,6 +20189,16 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
     if (!isOwner && !isStaff) {
       await connection.rollback();
       return res.status(403).json({ error: 'No autorizado' });
+    }
+
+    const normalizedDepositServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
+    if (normalizedDepositServiceStatus !== 'pending_deposit') {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'El depósito solo puede cobrarse cuando la reserva está pendiente de depósito.',
+        error_code: 'booking_not_pending_deposit',
+        service_status: normalizedDepositServiceStatus,
+      });
     }
 
     // Helpers de redondeo como en el front
@@ -20372,10 +20452,20 @@ const round2 = (n) => {
         }
 
         if (pi.status === 'requires_action') {
-          return res.status(202).json({ requiresAction: true, clientSecret: pi.client_secret, paymentIntentId: pi.id });
+          return res.status(202).json({
+            requiresAction: true,
+            clientSecret: pi.client_secret,
+            paymentIntentId: pi.id,
+            ...buildPaymentAmountResponse(commissionCents, chargeCurrency),
+          });
         }
         if (pi.status === 'requires_payment_method') {
-          return res.status(202).json({ requiresPaymentMethod: true, clientSecret: pi.client_secret, paymentIntentId: pi.id });
+          return res.status(202).json({
+            requiresPaymentMethod: true,
+            clientSecret: pi.client_secret,
+            paymentIntentId: pi.id,
+            ...buildPaymentAmountResponse(commissionCents, chargeCurrency),
+          });
         }
       }
 
@@ -20470,26 +20560,47 @@ const round2 = (n) => {
         error: 'La reserva ya estaba cerrada. El depósito tardío no se ha aplicado y se ha solicitado el reembolso.',
         refundPending: true,
         paymentIntentId: intent.id,
+        ...buildPaymentAmountResponse(commissionCents, chargeCurrency),
       });
     }
 
+    const depositAmountResponse = buildPaymentAmountResponse(commissionCents, chargeCurrency);
     if (intent.status === 'requires_payment_method') {
       return res.status(202).json({
         requiresPaymentMethod: true,
         clientSecret: intent.client_secret,
-        paymentIntentId: intent.id
+        paymentIntentId: intent.id,
+        ...depositAmountResponse,
       });
     }
     if (intent.status === 'requires_action') {
-      return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
+      return res.status(202).json({
+        requiresAction: true,
+        clientSecret: intent.client_secret,
+        paymentIntentId: intent.id,
+        ...depositAmountResponse,
+      });
     }
     if (intent.status === 'processing') {
-      return res.status(202).json({ processing: true, paymentIntentId: intent.id });
+      return res.status(202).json({
+        processing: true,
+        paymentIntentId: intent.id,
+        ...depositAmountResponse,
+      });
     }
     if (intent.status === 'succeeded') {
-      return res.status(200).json({ message: 'Depósito pagado', paymentIntentId: intent.id });
+      return res.status(200).json({
+        message: 'Depósito pagado',
+        paymentIntentId: intent.id,
+        ...depositAmountResponse,
+      });
     }
-    return res.status(200).json({ paymentIntentId: intent.id, status: intent.status, clientSecret: intent.client_secret });
+    return res.status(200).json({
+      paymentIntentId: intent.id,
+      status: intent.status,
+      clientSecret: intent.client_secret,
+      ...depositAmountResponse,
+    });
   } catch (err) {
     try { await connection.rollback(); } catch { }
 
