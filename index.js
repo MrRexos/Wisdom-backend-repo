@@ -60,6 +60,7 @@ const {
   ONE_WEEK_MS,
   ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
   ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
+  PROVIDER_PAYOUT_TIME_ZONE,
 } = require('./src/bookingDomain');
 const MIN_BOOKING_DURATION_ERROR = `La duración debe ser de al menos ${MIN_BOOKING_DURATION_MINUTES} minutos.`;
 const IMG_WISDOM = 'https://storage.googleapis.com/wisdom-images/email_wisdom_logo.png';
@@ -2140,6 +2141,28 @@ function normalizeBooleanInput(value, fallback = false) {
   return fallback;
 }
 
+function normalizeInvoiceVatRate(value, fallback = 21) {
+  const parsedValue = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsedValue) || parsedValue < 0 || parsedValue > 21) {
+    return fallback;
+  }
+  return parsedValue;
+}
+
+function getServerControlledProviderInvoiceTaxConfig() {
+  const isExempt = normalizeBooleanInput(process.env.PROVIDER_INVOICE_TAX_EXEMPT, false);
+  const isReverseCharge = !isExempt && normalizeBooleanInput(process.env.PROVIDER_INVOICE_REVERSE_CHARGE, false);
+  const vatRate = isExempt || isReverseCharge
+    ? 0
+    : normalizeInvoiceVatRate(process.env.PROVIDER_INVOICE_VAT_RATE, 21);
+
+  return {
+    vatRate,
+    isExempt,
+    isReverseCharge,
+  };
+}
+
 function formatStoredCardExpiry(expMonth, expYear) {
   const monthNumber = Number.parseInt(expMonth, 10);
   const yearNumber = Number.parseInt(expYear, 10);
@@ -2192,6 +2215,30 @@ function mapStoredPaymentMethodForApi(row = {}) {
     isSaved: row.is_safed === true || row.is_safed === 1,
     isDefault: row.is_default === true || row.is_default === 1,
     provider: row.provider || 'STRIPE',
+  };
+}
+
+function mapSetupIntentPaymentMethodForApi({ setupIntentId, paymentMethod }) {
+  const normalizedSetupIntentId = normalizeStripeSetupIntentId(setupIntentId);
+  const stripePaymentMethodId = getStripeObjectId(paymentMethod);
+  if (!normalizedSetupIntentId || !stripePaymentMethodId) {
+    return null;
+  }
+
+  const card = paymentMethod?.card || {};
+  const expiryLabel = formatStoredCardExpiry(card.exp_month, card.exp_year);
+
+  return {
+    id: null,
+    payment_method_session_id: normalizedSetupIntentId,
+    last4: card.last4 || null,
+    brand: typeof card.brand === 'string' && card.brand.trim().length > 0 ? card.brand.trim() : null,
+    expiryMonth: card.exp_month ? String(card.exp_month).padStart(2, '0') : null,
+    expiryYear: card.exp_year ? String(card.exp_year).slice(-2).padStart(2, '0') : null,
+    expiryLabel,
+    isSaved: false,
+    isDefault: false,
+    provider: 'STRIPE',
   };
 }
 
@@ -2712,12 +2759,7 @@ function assertBookingStatusUpdateAllowed({
       }
       break;
     case 'finished':
-      if (!isClientOwner && !isProviderOwner) {
-        throwValidationError('No autorizado para finalizar la reserva.');
-      }
-      if (normalizedCurrentServiceStatus !== 'in_progress') {
-        throwValidationError('El servicio solo puede finalizarse cuando está en progreso.');
-      }
+      throwValidationError('El cierre debe enviarse mediante la propuesta formal de cierre.');
       break;
     case 'expired':
       throwValidationError('El estado expired solo puede aplicarse automáticamente.');
@@ -3464,6 +3506,55 @@ async function ensureRefundForPaymentIntent({
     refund_request_id: normalizedRefundRequestId,
   };
 
+  let existingRefund = null;
+  try {
+    const existingRefunds = await stripe.refunds.list({
+      payment_intent: paymentIntentId,
+      limit: 100,
+    });
+    existingRefund = (existingRefunds?.data || []).find((candidateRefund) => {
+      const candidateStatus = String(candidateRefund?.status || '').trim().toLowerCase();
+      const candidateRequestId = normalizeRefundRequestId(candidateRefund?.metadata?.refund_request_id);
+      const candidateAmountCents = normalizeStripeAmountCents(candidateRefund?.amount);
+      return candidateRequestId === normalizedRefundRequestId
+        || (
+          candidateAmountCents === effectiveRefundAmountCents
+          && ['pending', 'requires_action'].includes(candidateStatus)
+        );
+    }) || null;
+  } catch (listRefundsError) {
+    console.error('Error checking existing Stripe refunds before creating a new one:', {
+      paymentIntentId,
+      error: safeStripeErrorForLog(listRefundsError),
+    });
+  }
+
+  if (existingRefund) {
+    const existingRefundStatus = String(existingRefund.status || '').trim().toLowerCase();
+    if (['failed', 'canceled', 'cancelled'].includes(existingRefundStatus)) {
+      const error = new Error(`Stripe ya tiene un reembolso en estado terminal ${existingRefundStatus}.`);
+      error.code = 'stripe_refund_terminal_state';
+      error.refundStatus = existingRefundStatus;
+      error.refundId = existingRefund.id || null;
+      throw error;
+    }
+    if (existingRefundStatus !== 'succeeded') {
+      return existingRefund;
+    }
+
+    await syncPaymentRefundStateFromStripe(paymentIntentId, {
+      reasonCode: 'stripe_refund_synced',
+    });
+
+    await syncProviderPayoutForPaymentRefund(paymentIntentId, {
+      refundedAmountCents: alreadyRefundedAmountCents + effectiveRefundAmountCents,
+      capturedAmountCents,
+      metadata: refundMetadata,
+    });
+
+    return existingRefund;
+  }
+
   const refund = await stripe.refunds.create(
     {
       payment_intent: paymentIntentId,
@@ -3474,6 +3565,19 @@ async function ensureRefundForPaymentIntent({
       idempotencyKey: stableKey(['refund', paymentIntentId, normalizedRefundRequestId]),
     }
   );
+
+  const refundStatus = String(refund?.status || '').trim().toLowerCase();
+  if (refundStatus && refundStatus !== 'succeeded') {
+    if (['failed', 'canceled', 'cancelled'].includes(refundStatus)) {
+      const error = new Error(`Stripe devolvió el reembolso en estado terminal ${refundStatus}.`);
+      error.code = 'stripe_refund_terminal_state';
+      error.refundStatus = refundStatus;
+      error.refundId = refund.id || null;
+      throw error;
+    }
+
+    return refund;
+  }
 
   await syncPaymentRefundStateFromStripe(paymentIntentId, {
     reasonCode: 'stripe_refund_synced',
@@ -5022,6 +5126,14 @@ async function resolveCustomerPaymentMethodFromSetupIntent({
   });
   const setupIntentCustomerId = getStripeObjectId(setupIntent?.customer);
   const setupIntentUserId = normalizeNullableInteger(setupIntent?.metadata?.user_id);
+  const setupIntentMetadata = setupIntent?.metadata || {};
+  const setupIntentCreatedAtMs = Number(setupIntent?.created || 0) * 1000;
+  const isEphemeralBookingSetupIntent = String(setupIntentMetadata.source || '').trim() === 'booking_payment_method_session'
+    && String(setupIntentMetadata.save_payment_method || '').trim() !== '1';
+  const ephemeralTtlMs = Math.max(
+    1,
+    Number(process.env.EPHEMERAL_PAYMENT_METHOD_TTL_HOURS || 24) || 24
+  ) * 60 * 60 * 1000;
   const paymentMethod = setupIntent?.payment_method && typeof setupIntent.payment_method === 'object'
     ? setupIntent.payment_method
     : null;
@@ -5033,6 +5145,11 @@ async function resolveCustomerPaymentMethodFromSetupIntent({
     || (setupIntentUserId && setupIntentUserId !== normalizedUserId)
     || !stripePaymentMethodId
     || !stripePaymentMethodId.startsWith('pm_')
+    || (
+      isEphemeralBookingSetupIntent
+      && setupIntentCreatedAtMs > 0
+      && Date.now() - setupIntentCreatedAtMs > ephemeralTtlMs
+    )
   ) {
     return null;
   }
@@ -5544,6 +5661,128 @@ async function releaseEphemeralBookingPaymentMethodsAfterFailedAttempt(bookingId
     });
     return { released: 0, skipped: false, error: cleanupError };
   }
+}
+
+async function isStripePaymentMethodReferencedLocally(connection, stripePaymentMethodId) {
+  const normalizedPaymentMethodId = typeof stripePaymentMethodId === 'string' && stripePaymentMethodId.trim().startsWith('pm_')
+    ? stripePaymentMethodId.trim()
+    : null;
+  if (!normalizedPaymentMethodId) {
+    return true;
+  }
+
+  const [[row]] = await connection.query(
+    `
+    SELECT
+      EXISTS (
+        SELECT 1
+        FROM payment_method
+        WHERE payment_type = ?
+          AND is_safed = 1
+      ) AS saved_method_exists,
+      EXISTS (
+        SELECT 1
+        FROM payments
+        WHERE payment_method_id = ?
+      ) AS booking_payment_exists,
+      EXISTS (
+        SELECT 1
+        FROM booking b
+        JOIN payment_method pm ON pm.id = b.selected_customer_payment_method_id
+        WHERE pm.payment_type = ?
+      ) AS selected_booking_method_exists
+    `,
+    [normalizedPaymentMethodId, normalizedPaymentMethodId, normalizedPaymentMethodId]
+  );
+
+  return Boolean(
+    row?.saved_method_exists
+    || row?.booking_payment_exists
+    || row?.selected_booking_method_exists
+  );
+}
+
+async function cleanupExpiredEphemeralSetupIntentPaymentMethods({
+  now = new Date(),
+  ttlHours = Number(process.env.EPHEMERAL_PAYMENT_METHOD_TTL_HOURS || 24),
+  limit = 100,
+} = {}) {
+  const normalizedTtlHours = Number.isFinite(ttlHours) && ttlHours > 0 ? ttlHours : 24;
+  const cutoffUnixSeconds = Math.floor((new Date(now).getTime() - normalizedTtlHours * 60 * 60 * 1000) / 1000);
+  if (!Number.isFinite(cutoffUnixSeconds) || cutoffUnixSeconds <= 0 || !stripe?.setupIntents?.list) {
+    return { detached: 0, inspected: 0, skipped: true };
+  }
+
+  const maxToInspect = Math.max(1, Math.min(500, Math.round(Number(limit || 100))));
+  let inspected = 0;
+  let detached = 0;
+  let startingAfter = null;
+
+  while (inspected < maxToInspect) {
+    const page = await stripe.setupIntents.list({
+      limit: Math.min(100, maxToInspect - inspected),
+      created: { lt: cutoffUnixSeconds },
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+    });
+
+    const setupIntents = Array.isArray(page?.data) ? page.data : [];
+    if (!setupIntents.length) {
+      break;
+    }
+
+    const connection = await pool.promise().getConnection();
+    try {
+      for (const setupIntent of setupIntents) {
+        inspected += 1;
+        startingAfter = setupIntent.id;
+
+        const metadata = setupIntent?.metadata || {};
+        const source = String(metadata.source || '').trim();
+        const savePaymentMethod = String(metadata.save_payment_method || '').trim();
+        const stripePaymentMethodId = getStripeObjectId(setupIntent?.payment_method);
+        if (
+          source !== 'booking_payment_method_session'
+          || savePaymentMethod === '1'
+          || setupIntent.status !== 'succeeded'
+          || !stripePaymentMethodId
+        ) {
+          continue;
+        }
+
+        const isReferenced = await isStripePaymentMethodReferencedLocally(connection, stripePaymentMethodId);
+        if (isReferenced) {
+          continue;
+        }
+
+        try {
+          await stripe.paymentMethods.detach(stripePaymentMethodId);
+          detached += 1;
+        } catch (detachError) {
+          const detachCode = typeof detachError?.code === 'string' ? detachError.code : '';
+          const detachMessage = typeof detachError?.message === 'string' ? detachError.message : '';
+          const canIgnoreDetachError = detachCode === 'resource_missing'
+            || detachCode === 'payment_method_unexpected_state'
+            || /already detached/i.test(detachMessage)
+            || /not attached/i.test(detachMessage);
+          if (!canIgnoreDetachError) {
+            console.error('Error detaching expired ephemeral setup-intent payment method:', {
+              setupIntentRef: publicPaymentMethodReferenceForLog(setupIntent.id),
+              paymentMethodRef: publicPaymentMethodReferenceForLog(stripePaymentMethodId),
+              error: safeStripeErrorForLog(detachError),
+            });
+          }
+        }
+      }
+    } finally {
+      connection.release();
+    }
+
+    if (!page?.has_more) {
+      break;
+    }
+  }
+
+  return { detached, inspected, skipped: false };
 }
 
 async function resolvePaymentIntentPersistence(intentLike, { paymentMethodFallback = null } = {}) {
@@ -10576,6 +10815,14 @@ function ensureSameUserOrRespond(req, res, rawUserId = req.params?.id) {
   return requestedUserId;
 }
 
+function requireAuthenticatedAccount(req, res, next) {
+  if (!normalizeNullableInteger(req.user?.id)) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
+
+  return next();
+}
+
 function isStaffUser(user) {
   return Boolean(user && ['admin', 'support'].includes(user.role));
 }
@@ -11807,7 +12054,11 @@ cron.schedule('0 3 * * *', async () => {
       cleanedBookings += 1;
     }
 
-    console.log(`[CRON] Limpieza de reservas pending_deposit ejecutada (${cleanedBookings})`);
+    const ephemeralCleanup = await cleanupExpiredEphemeralSetupIntentPaymentMethods({
+      limit: 200,
+    });
+
+    console.log(`[CRON] Limpieza de reservas pending_deposit ejecutada (${cleanedBookings}); métodos temporales Stripe detached: ${ephemeralCleanup.detached || 0}`);
   } catch (e) {
     console.error('Error en cron cleanup:', e);
   }
@@ -12075,7 +12326,7 @@ cron.schedule('0 9 * * 3', async () => {
     console.error('Error en cron de liberación de payouts:', error);
   }
 }, {
-  timezone: 'Europe/Madrid',
+  timezone: PROVIDER_PAYOUT_TIME_ZONE,
 });
 
 const credentials = JSON.parse(process.env.GCLOUD_KEYFILE_JSON);
@@ -14296,7 +14547,7 @@ app.post('/api/upload-images', upload.array('files'), async (req, res, next) => 
 });
 
 //Ruta para crear un servicio
-app.post('/api/service', (req, res) => {
+app.post('/api/service', requireAuthenticatedAccount, (req, res) => {
   const {
     service_title,
     user_id,
@@ -14324,6 +14575,18 @@ app.post('/api/service', (req, res) => {
     images,
     hobbies
   } = req.body;
+  const authenticatedUserId = normalizeNullableInteger(req.user?.id);
+  const requestedOwnerUserId = normalizeNullableInteger(user_id ?? authenticatedUserId);
+  if (!authenticatedUserId) {
+    return res.status(401).json({ error: 'missing_user' });
+  }
+  if (!requestedOwnerUserId) {
+    return res.status(400).json({ error: 'invalid_user_id' });
+  }
+  if (!isStaffUser(req.user) && requestedOwnerUserId !== authenticatedUserId) {
+    return res.status(403).json({ error: 'service_owner_mismatch' });
+  }
+
   const normalizedUserCanAsk = user_can_ask === undefined || user_can_ask === null ? true : Boolean(user_can_ask);
   const normalizedUserCanConsult = user_can_consult === undefined || user_can_consult === null ? false : Boolean(user_can_consult);
   const normalizedAllowDiscounts = allow_discounts === undefined || allow_discounts === null ? false : Boolean(allow_discounts);
@@ -14359,7 +14622,7 @@ app.post('/api/service', (req, res) => {
       }
 
       const stripeAccountQuery = 'SELECT is_verified, currency FROM user_account WHERE id = ?';
-      connection.query(stripeAccountQuery, [user_id], (accountErr, accountResults) => {
+      connection.query(stripeAccountQuery, [requestedOwnerUserId], (accountErr, accountResults) => {
         if (accountErr) {
           return connection.rollback(() => {
             console.error('Error al consultar el estado del profesional:', accountErr);
@@ -14402,7 +14665,7 @@ app.post('/api/service', (req, res) => {
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?)
             `;
             const serviceValues = [
-              service_title, user_id, description, service_category_id, price_id, latitude, longitude,
+              service_title, requestedOwnerUserId, description, service_category_id, price_id, latitude, longitude,
               action_rate, normalizedUserCanAsk, normalizedUserCanConsult, normalizedPriceConsult, consult_via_id, normalizedIsIndividual, normalizedMinimumNoticePolicy, normalizedAllowDiscounts, normalizedDiscountRate, normalizedHobbies, normalizedExperienceYears, isHiddenValue, null
             ];
 
@@ -14506,7 +14769,7 @@ app.post('/api/service', (req, res) => {
               }
               // 8. Marcar al usuario como profesional si aún no lo es
               const professionalQuery = 'UPDATE user_account SET is_professional = 1, professional_started_datetime = NOW() WHERE id = ? AND is_professional = 0';
-              connection.query(professionalQuery, [user_id], err => {
+              connection.query(professionalQuery, [requestedOwnerUserId], err => {
                 if (err) {
                   return connection.rollback(() => {
                     console.error('Error al actualizar el usuario como profesional:', err);
@@ -14563,16 +14826,20 @@ app.post('/api/service', (req, res) => {
   });
 });
 
-app.delete('/api/services/:id', async (req, res) => {
+app.delete('/api/services/:id', requireAuthenticatedAccount, async (req, res) => {
   const serviceId = Number(req.params.id);
+  const requesterUserId = normalizeNullableInteger(req.user?.id);
   if (!Number.isInteger(serviceId) || serviceId <= 0) {
     return res.status(400).json({ error: 'invalid_service_id' });
+  }
+  if (!requesterUserId) {
+    return res.status(401).json({ error: 'missing_user' });
   }
 
   const connection = await promisePool.getConnection();
   try {
     await connection.beginTransaction();
-    const ownership = await fetchOwnedService(connection, serviceId, req.user.id, { lock: true });
+    const ownership = await fetchOwnedService(connection, serviceId, requesterUserId, { lock: true });
     if (ownership.error) {
       await connection.rollback();
       const mapped = mapOwnershipError(ownership.error);
@@ -14632,10 +14899,14 @@ app.delete('/api/services/:id', async (req, res) => {
   }
 });
 
-app.patch('/api/services/:id/visibility', authenticateToken, async (req, res) => {
+app.patch('/api/services/:id/visibility', authenticateToken, requireAuthenticatedAccount, async (req, res) => {
   const serviceId = Number(req.params.id);
+  const requesterUserId = normalizeNullableInteger(req.user?.id);
   if (!Number.isInteger(serviceId) || serviceId <= 0) {
     return res.status(400).json({ error: 'invalid_service_id' });
+  }
+  if (!requesterUserId) {
+    return res.status(401).json({ error: 'missing_user' });
   }
 
   if (!Object.prototype.hasOwnProperty.call(req.body || {}, 'is_hidden')) {
@@ -14655,7 +14926,7 @@ app.patch('/api/services/:id/visibility', authenticateToken, async (req, res) =>
   const connection = await promisePool.getConnection();
   try {
     await connection.beginTransaction();
-    const ownership = await fetchOwnedService(connection, serviceId, req.user.id, { lock: true });
+    const ownership = await fetchOwnedService(connection, serviceId, requesterUserId, { lock: true });
     if (ownership.error) {
       await connection.rollback();
       const mapped = mapOwnershipError(ownership.error);
@@ -14713,10 +14984,14 @@ app.get('/api/professionals/:id/vacation-mode', authenticateToken, async (req, r
 });
 
 //Ruta cambia vacation mode a true o false i oculta/muestra todos sus servicios
-app.patch('/api/professionals/:id/vacation-mode', async (req, res) => {
+app.patch('/api/professionals/:id/vacation-mode', requireAuthenticatedAccount, async (req, res) => {
   const professionalId = Number(req.params.id);
+  const requesterUserId = normalizeNullableInteger(req.user?.id);
   if (!Number.isInteger(professionalId) || professionalId <= 0) {
     return res.status(400).json({ error: 'invalid_professional_id' });
+  }
+  if (!requesterUserId) {
+    return res.status(401).json({ error: 'missing_user' });
   }
 
   if (!Object.prototype.hasOwnProperty.call(req.body || {}, 'vacation_mode')) {
@@ -14733,7 +15008,7 @@ app.patch('/api/professionals/:id/vacation-mode', async (req, res) => {
     return res.status(error.status || 400).json({ error: error.message || 'invalid_boolean_vacation_mode' });
   }
 
-  const isOwner = req.user && Number(req.user.id) === professionalId;
+  const isOwner = requesterUserId === professionalId;
   const isStaff = req.user && ['admin', 'support'].includes(req.user.role);
   if (!isOwner && !isStaff) {
     return res.status(403).json({ error: 'not_authorized' });
@@ -14791,22 +15066,26 @@ app.patch('/api/professionals/:id/vacation-mode', async (req, res) => {
 });
 
 //Ruta para actualizar un servicio
-app.put('/api/services/:id', async (req, res) => {
+app.put('/api/services/:id', requireAuthenticatedAccount, async (req, res) => {
   const serviceId = Number(req.params.id);
+  const requesterUserId = normalizeNullableInteger(req.user?.id);
   console.log('[TEMP-DEBUG] Actualizar servicio - parámetros recibidos:', {
     serviceId,
     body: req.body,
-    userId: req.user && req.user.id
+    userId: requesterUserId
   });
   if (!Number.isInteger(serviceId) || serviceId <= 0) {
     return res.status(400).json({ error: 'invalid_service_id' });
+  }
+  if (!requesterUserId) {
+    return res.status(401).json({ error: 'missing_user' });
   }
 
   const body = req.body || {};
   const connection = await promisePool.getConnection();
   try {
     await connection.beginTransaction();
-    const ownership = await fetchOwnedService(connection, serviceId, req.user.id, {
+    const ownership = await fetchOwnedService(connection, serviceId, requesterUserId, {
       lock: true,
       includePrice: true,
       includeConsult: true
@@ -18767,6 +19046,7 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
     }
 
     await transitionBookingStateRecord(connection, booking, {
+      nextServiceStatus: 'finished',
       nextSettlementStatus: 'pending_client_approval',
       changedByUserId: req.user?.id || null,
       reasonCode: 'closure_proposal_sent',
@@ -20694,6 +20974,17 @@ app.post('/api/payment-methods/setup-intent/confirm', authenticateToken, booking
 
     const paymentMethodDetails = setupIntentResolution.paymentMethod
       || await stripe.paymentMethods.retrieve(setupIntentResolution.stripePaymentMethodId);
+
+    if (!requestedSavePaymentMethod) {
+      await connection.commit();
+      return res.status(200).json({
+        payment_method: mapSetupIntentPaymentMethodForApi({
+          setupIntentId,
+          paymentMethod: paymentMethodDetails,
+        }),
+      });
+    }
+
     const paymentMethodRecordId = await upsertStoredCustomerPaymentMethod(connection, {
       userId: requestedUserId,
       stripePaymentMethodId: setupIntentResolution.stripePaymentMethodId,
@@ -21010,6 +21301,7 @@ app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimi
     if (persistedPayment?.status === 'succeeded') {
       return res.status(200).json({
         confirmed: true,
+        status: 'succeeded',
         message: type === 'deposit' ? 'Depósito sincronizado' : 'Pago confirmado',
         paymentIntentId: intent.id,
         ...syncedPaymentAmountResponse,
@@ -21640,6 +21932,8 @@ const round2 = (n) => {
     }
     if (intent.status === 'succeeded') {
       return res.status(200).json({
+        confirmed: true,
+        status: intent.status,
         message: 'Depósito pagado',
         paymentIntentId: intent.id,
         ...depositAmountResponse,
@@ -21792,7 +22086,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
     if (!booking) throw new Error('Reserva no encontrada');
     if (isBookingAlreadyFinishedAndPaid(booking)) {
       await connection.rollback();
-      return res.status(200).json({ message: 'Reserva ya pagada.' });
+      return res.status(200).json({ confirmed: true, status: 'succeeded', message: 'Reserva ya pagada.' });
     }
     if (isServiceStatusProtectedFromAutomaticSettlement(booking.service_status)) {
       await connection.rollback();
@@ -22302,7 +22596,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
               if (!settlementResult.settled) {
                 return res.status(202).json({ manualReviewRequired: true, paymentIntentId: intent.id });
               }
-              return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
+              return res.status(200).json({ confirmed: true, status: 'succeeded', message: 'Pago confirmado', paymentIntentId: intent.id });
             }
             if (intent.status === 'requires_action') {
               return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
@@ -22358,7 +22652,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
           if (!settlementResult.settled) {
             return res.status(202).json({ manualReviewRequired: true, paymentIntentId: intent?.id || row.payment_intent_id });
           }
-          return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent?.id || row.payment_intent_id });
+          return res.status(200).json({ confirmed: true, status: 'succeeded', message: 'Pago confirmado', paymentIntentId: intent?.id || row.payment_intent_id });
         }
         if (status === 'requires_action') {
           try {
@@ -22427,6 +22721,8 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       }
 
       return res.status(200).json({
+        confirmed: true,
+        status: 'succeeded',
         message: 'Pago final ya cubierto por el depósito.',
         amount_cents: 0,
         currency: chargeCurrency,
@@ -22714,7 +23010,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       if (!settlementResult.settled) {
         return res.status(202).json({ manualReviewRequired: true, paymentIntentId: intent.id });
       }
-      return res.status(200).json({ message: 'Pago confirmado', paymentIntentId: intent.id });
+      return res.status(200).json({ confirmed: true, status: 'succeeded', message: 'Pago confirmado', paymentIntentId: intent.id });
     }
     if (intent.status === 'requires_action') {
       return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
@@ -22837,7 +23133,9 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         COALESCE(p.currency, b.service_currency_snapshot) AS service_currency,
         cp.proposed_commission_amount_cents,
         cp.proposed_total_amount_cents,
+        cp.status AS closure_status,
         cu.email AS customer_email,
+        cu.stripe_customer_id AS customer_stripe_customer_id,
         cu.phone AS customer_phone,
         cu.first_name AS customer_first_name,
         cu.surname AS customer_surname,
@@ -22918,7 +23216,7 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
 
       try {
         const [paymentRows] = await promisePool.query(
-          `SELECT type, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, currency, status
+          `SELECT type, payment_intent_id, amount_cents, commission_snapshot_cents, final_price_snapshot_cents, currency, status
            FROM payments
            WHERE booking_id = ?
            ORDER BY id DESC`,
@@ -22935,6 +23233,74 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
         finalPayment = pickPayment('final');
       } catch (paymentLookupError) {
         console.error('Error fetching payment snapshots for invoice:', paymentLookupError);
+      }
+
+      const blockedTaxQueryKeys = ['vat_rate', 'reverse_charge', 'exempt'].filter((key) => (
+        Object.prototype.hasOwnProperty.call(req.query || {}, key)
+      ));
+      if (blockedTaxQueryKeys.length > 0) {
+        return res.status(400).json({
+          error: 'invoice_tax_query_not_allowed',
+          blocked_fields: blockedTaxQueryKeys,
+        });
+      }
+
+      const typeParam = String(req.query.type || '').toLowerCase();
+      const invoiceType = (typeParam === 'deposit' || typeParam === 'final')
+        ? typeParam
+        : (data.is_paid ? 'final' : 'deposit');
+      const normalizedServiceStatus = normalizeServiceStatus(data.service_status, 'pending_deposit');
+      const normalizedSettlementStatus = normalizeSettlementStatus(data.settlement_status, 'none');
+      const paymentForInvoice = invoiceType === 'deposit' ? depositPayment : finalPayment;
+      const paymentStatus = String(paymentForInvoice?.status || '').trim().toLowerCase();
+
+      if (!paymentForInvoice || paymentStatus !== 'succeeded') {
+        return res.status(409).json({
+          error: 'invoice_payment_not_confirmed',
+          invoice_type: invoiceType,
+        });
+      }
+
+      if (
+        invoiceType === 'final'
+        && (normalizedServiceStatus !== 'finished' || normalizedSettlementStatus !== 'paid')
+      ) {
+        return res.status(409).json({
+          error: 'invoice_booking_not_paid',
+          invoice_type: invoiceType,
+        });
+      }
+
+      const paymentAmountCents = normalizeStripeAmountCents(paymentForInvoice.amount_cents);
+      if (paymentAmountCents > 0) {
+        let paymentVerification;
+        try {
+          paymentVerification = await verifyPaymentIntentCapturedForSettlement({
+            paymentIntentId: paymentForInvoice.payment_intent_id,
+            expectedAmountCents: paymentAmountCents,
+            expectedCurrency: paymentForInvoice.currency || data.service_currency || 'EUR',
+            expectedCustomerId: data.customer_stripe_customer_id || null,
+            allowRefunded: false,
+          });
+        } catch (verificationError) {
+          console.error('Error verifying Stripe payment before invoice generation:', {
+            bookingId: id,
+            invoiceType,
+            error: safeStripeErrorForLog(verificationError),
+          });
+          return res.status(503).json({
+            error: 'invoice_payment_verification_unavailable',
+            invoice_type: invoiceType,
+          });
+        }
+
+        if (!paymentVerification.valid) {
+          return res.status(409).json({
+            error: 'invoice_payment_integrity_failed',
+            invoice_type: invoiceType,
+            reason: paymentVerification.reason,
+          });
+        }
       }
 
       const doc = new PDFDocument({ margins: { top: 64, left: 64, right: 64, bottom: 64 } });
@@ -22969,11 +23335,6 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
           return '';
         }
       };
-      // Decide invoice type
-      const typeParam = String(req.query.type || '').toLowerCase();
-      const invoiceType = (typeParam === 'deposit' || typeParam === 'final')
-        ? typeParam
-        : (data.is_paid ? 'final' : 'deposit');
       if (invoiceType === 'final') {
         data.provider_tax_id = await resolveProviderTaxIdFromStripeAccount(data.provider_stripe_account_id);
       }
@@ -22985,15 +23346,11 @@ app.get('/api/bookings/:id/invoice', authenticateToken, (req, res) => {
       );
       const toCurrency = (amount) => formatCurrencyAmount(amount, invoiceCurrency);
 
-      // VAT configuration (only used for provider invoice)
-      const vatRateParam = req.query.vat_rate;
-      let vatRateProvider = 21; // default 21%
-      if (vatRateParam !== undefined) {
-        const parsed = parseInt(vatRateParam, 10);
-        if (!Number.isNaN(parsed) && parsed >= 0 && parsed <= 21) vatRateProvider = parsed;
-      }
-      const isExempt = String(req.query.exempt || '').toLowerCase() === 'true';
-      const isReverseCharge = String(req.query.reverse_charge || '').toLowerCase() === 'true';
+      // VAT configuration is server-controlled to keep issued invoices immutable from client input.
+      const providerInvoiceTaxConfig = getServerControlledProviderInvoiceTaxConfig();
+      const vatRateProvider = providerInvoiceTaxConfig.vatRate;
+      const isExempt = providerInvoiceTaxConfig.isExempt;
+      const isReverseCharge = providerInvoiceTaxConfig.isReverseCharge;
 
       // Common header
       let logoX, logoY, logoWidth, logoHeight;
