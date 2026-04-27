@@ -49,11 +49,13 @@ const {
   hasBookingChangeRequestExpired,
   buildTransitionPatch,
   computeSettlementAmounts,
+  canReleaseProviderPayout,
   evaluateAutoChargeEligibility,
   isWithinLastMinuteWindow,
   getAcceptedBookingInactivityStage,
   normalizeLegacyStatusUpdate,
   isProtectedLegacyClosureMutation,
+  ONE_WEEK_MS,
   ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES,
   ACCEPTED_BOOKING_INACTIVITY_AUTO_CANCEL_REASON_CODE,
 } = require('./src/bookingDomain');
@@ -2996,12 +2998,16 @@ async function resolveProviderPayoutSourceAllocations(paymentRow, {
   targetAmountCents,
   currency,
   existingTransfers = [],
+  now = new Date(),
+  minimumSourceChargeAgeMs = ONE_WEEK_MS,
 } = {}) {
   let remainingAmountCents = normalizeStripeAmountCents(targetAmountCents);
   if (remainingAmountCents <= 0) {
     return [];
   }
 
+  const normalizedNow = parseDateTimeInput(now) || new Date();
+  const normalizedMinimumSourceChargeAgeMs = Math.max(0, Number(minimumSourceChargeAgeMs || 0));
   const normalizedCurrency = normalizeCurrencyCode(currency, 'EUR');
   const usedBySourceTransaction = new Map();
   for (const transfer of existingTransfers || []) {
@@ -3042,6 +3048,7 @@ async function resolveProviderPayoutSourceAllocations(paymentRow, {
   });
 
   const allocations = [];
+  let youngestBlockedSourceEligibleAt = null;
   for (const candidate of candidates) {
     if (remainingAmountCents <= 0) {
       break;
@@ -3052,6 +3059,19 @@ async function resolveProviderPayoutSourceAllocations(paymentRow, {
     const sourceTransactionId = getStripeObjectId(latestCharge);
     if (!intent || !latestCharge || !sourceTransactionId || intent.status !== 'succeeded') {
       continue;
+    }
+
+    if (normalizedMinimumSourceChargeAgeMs > 0) {
+      const sourceCreatedAt = getStripeObjectCreatedAt(latestCharge) || getStripeObjectCreatedAt(intent);
+      const sourceEligibleAt = sourceCreatedAt
+        ? new Date(sourceCreatedAt.getTime() + normalizedMinimumSourceChargeAgeMs)
+        : null;
+      if (!sourceEligibleAt || sourceEligibleAt.getTime() > normalizedNow.getTime()) {
+        if (!youngestBlockedSourceEligibleAt || (sourceEligibleAt && sourceEligibleAt.getTime() > youngestBlockedSourceEligibleAt.getTime())) {
+          youngestBlockedSourceEligibleAt = sourceEligibleAt;
+        }
+        continue;
+      }
     }
 
     const chargeCurrency = normalizeCurrencyCode(latestCharge.currency || intent.currency, null);
@@ -3087,6 +3107,14 @@ async function resolveProviderPayoutSourceAllocations(paymentRow, {
   }
 
   if (remainingAmountCents > 0) {
+    if (youngestBlockedSourceEligibleAt) {
+      const error = new Error('El cargo que financia la liquidación aún no cumple la retención mínima.');
+      error.code = 'provider_payout_source_charge_not_matured';
+      error.eligibleAt = youngestBlockedSourceEligibleAt;
+      error.remainingAmountCents = remainingAmountCents;
+      throw error;
+    }
+
     const error = new Error('No hay cargos de Stripe suficientes para vincular la liquidación del profesional.');
     error.code = 'provider_payout_source_transaction_insufficient';
     error.remainingAmountCents = remainingAmountCents;
@@ -4020,8 +4048,84 @@ function getMinimumChargeAmountCentsForCurrency(currency = 'EUR') {
   return Math.max(0, toMinorUnits(minimumChargeAmount, currency));
 }
 
+function convertMinorUnitsBetweenCurrencies(amountCents, fromCurrency, toCurrency) {
+  const sourceCurrency = normalizeCurrencyCode(fromCurrency, normalizeCurrencyCode(toCurrency, 'EUR'));
+  const targetCurrency = normalizeCurrencyCode(toCurrency, sourceCurrency || 'EUR');
+  const normalizedAmountCents = normalizeStripeAmountCents(amountCents);
+
+  if (!sourceCurrency || sourceCurrency === targetCurrency) {
+    return normalizedAmountCents;
+  }
+
+  return toMinorUnits(
+    convertAmount(
+      fromMinorUnits(normalizedAmountCents, sourceCurrency),
+      sourceCurrency,
+      targetCurrency
+    ),
+    targetCurrency
+  );
+}
+
+function resolveClosureDepositAlreadyPaidAmountCents({ booking, depositPayment, targetCurrency }) {
+  const normalizedTargetCurrency = normalizeCurrencyCode(targetCurrency, 'EUR');
+  if (depositPayment) {
+    return convertMinorUnitsBetweenCurrencies(
+      depositPayment.amount_cents,
+      normalizeCurrencyCode(depositPayment.currency, normalizedTargetCurrency),
+      normalizedTargetCurrency
+    );
+  }
+
+  return normalizeStripeAmountCents(booking?.deposit_amount_cents_snapshot);
+}
+
+function buildClosureFinancialMismatch(proposal, expectedSnapshot) {
+  const comparableFields = [
+    ['deposit_already_paid_amount_cents', 'depositAlreadyPaidAmountCents'],
+    ['amount_due_from_client_cents', 'amountDueFromClientCents'],
+    ['amount_to_refund_cents', 'amountToRefundCents'],
+    ['provider_payout_amount_cents', 'providerPayoutAmountCents'],
+    ['platform_amount_cents', 'platformAmountCents'],
+  ];
+
+  for (const [proposalField, expectedField] of comparableFields) {
+    const actualAmountCents = normalizeStripeAmountCents(proposal?.[proposalField]);
+    const expectedAmountCents = normalizeStripeAmountCents(expectedSnapshot?.[expectedField]);
+    if (actualAmountCents !== expectedAmountCents) {
+      return {
+        field: proposalField,
+        actualAmountCents,
+        expectedAmountCents,
+      };
+    }
+  }
+
+  return null;
+}
+
+function serializeClosureFinancialSnapshot(financialSnapshot) {
+  if (!financialSnapshot) {
+    return null;
+  }
+
+  const currency = normalizeCurrencyCode(financialSnapshot.currency, 'EUR');
+  return {
+    currency,
+    deposit_already_paid_amount_cents: financialSnapshot.depositAlreadyPaidAmountCents,
+    deposit_already_paid: fromMinorUnits(financialSnapshot.depositAlreadyPaidAmountCents, currency),
+    amount_due_from_client_cents: financialSnapshot.amountDueFromClientCents,
+    amount_due_from_client: fromMinorUnits(financialSnapshot.amountDueFromClientCents, currency),
+    amount_to_refund_cents: financialSnapshot.amountToRefundCents,
+    amount_to_refund: fromMinorUnits(financialSnapshot.amountToRefundCents, currency),
+    provider_payout_amount_cents: financialSnapshot.providerPayoutAmountCents,
+    platform_amount_cents: financialSnapshot.platformAmountCents,
+  };
+}
+
 function buildClosureFinancialSnapshot({
   booking,
+  depositPayment = null,
   proposedBaseAmountCents,
   proposedFinalDurationMinutes = null,
   zeroChargeMode = false,
@@ -4042,7 +4146,11 @@ function buildClosureFinancialSnapshot({
   const proposedTotalAmountCents = proposalPricing.final === null
     ? 0
     : toMinorUnits(proposalPricing.final, bookingCurrency);
-  const depositAlreadyPaidAmountCents = Number(booking?.deposit_amount_cents_snapshot || 0);
+  const depositAlreadyPaidAmountCents = resolveClosureDepositAlreadyPaidAmountCents({
+    booking,
+    depositPayment,
+    targetCurrency: bookingCurrency,
+  });
   const settlementAmounts = computeSettlementAmounts({
     depositAlreadyPaidAmountCents,
     proposedTotalAmountCents,
@@ -4061,6 +4169,7 @@ function buildClosureFinancialSnapshot({
 
   return {
     priceTypeSnapshot,
+    currency: bookingCurrency,
     estimatedDurationMinutes,
     estimatedTotalAmountCents,
     proposedBaseAmountCents: normalizedProposedBaseAmountCents,
@@ -4081,6 +4190,7 @@ function buildClosureFinancialSnapshot({
 
 async function upsertActiveClosureProposal(connection, {
   booking,
+  depositPayment = null,
   createdByUserId,
   proposedBaseAmountCents,
   proposedFinalDurationMinutes = null,
@@ -4088,6 +4198,7 @@ async function upsertActiveClosureProposal(connection, {
 }) {
   const financialSnapshot = buildClosureFinancialSnapshot({
     booking,
+    depositPayment,
     proposedBaseAmountCents,
     proposedFinalDurationMinutes,
     zeroChargeMode,
@@ -5229,6 +5340,16 @@ function getStripeObjectId(value) {
     return value.id.trim() || null;
   }
   return null;
+}
+
+function getStripeObjectCreatedAt(value) {
+  const createdTimestamp = Number(value?.created);
+  if (!Number.isFinite(createdTimestamp) || createdTimestamp <= 0) {
+    return null;
+  }
+
+  const createdAt = new Date(createdTimestamp * 1000);
+  return Number.isNaN(createdAt.getTime()) ? null : createdAt;
 }
 
 function normalizeStripeAmountCents(value) {
@@ -9752,27 +9873,38 @@ async function releasePendingProviderPayouts({
         p.booking_id,
         p.type,
         p.payment_intent_id,
+        p.amount_cents,
+        p.status AS payment_status,
         p.transfer_group,
         p.currency,
         p.provider_payout_amount_cents,
         p.provider_payout_status,
         p.provider_payout_eligible_at,
+        b.service_status,
+        b.settlement_status,
         deposit.id AS deposit_payment_id,
         deposit.payment_intent_id AS deposit_payment_intent_id,
+        deposit.amount_cents AS deposit_amount_cents,
+        deposit.status AS deposit_payment_status,
+        deposit.currency AS deposit_payment_currency,
         COALESCE(b.provider_user_id_snapshot, s.user_id) AS provider_user_id,
         provider.stripe_account_id
       FROM payments p
       INNER JOIN booking b ON b.id = p.booking_id
       LEFT JOIN service s ON s.id = b.service_id
       LEFT JOIN user_account provider ON provider.id = COALESCE(b.provider_user_id_snapshot, s.user_id)
-      LEFT JOIN payments deposit ON deposit.booking_id = p.booking_id
+      INNER JOIN payments deposit ON deposit.booking_id = p.booking_id
         AND deposit.type = 'deposit'
         AND deposit.status = 'succeeded'
       WHERE p.provider_payout_status = 'pending_release'
+        AND p.status = 'succeeded'
+        AND b.service_status = 'finished'
+        AND b.settlement_status = 'paid'
         AND p.provider_payout_amount_cents IS NOT NULL
         AND p.provider_payout_amount_cents > 0
         AND p.provider_payout_eligible_at IS NOT NULL
         AND p.provider_payout_eligible_at <= ?
+        AND (COALESCE(p.amount_cents, 0) = 0 OR p.payment_intent_id IS NOT NULL)
       ORDER BY provider_user_id ASC, p.provider_payout_eligible_at ASC, p.id ASC
       LIMIT ?
       FOR UPDATE
@@ -9791,6 +9923,28 @@ async function releasePendingProviderPayouts({
 
     const groupedRows = new Map();
     for (const row of rows) {
+      const releaseCandidateIsSafe = canReleaseProviderPayout({
+        booking: {
+          service_status: row.service_status,
+          settlement_status: row.settlement_status,
+        },
+        payment: {
+          status: row.payment_status,
+          provider_payout_status: row.provider_payout_status,
+          provider_payout_amount_cents: row.provider_payout_amount_cents,
+          provider_payout_eligible_at: row.provider_payout_eligible_at,
+        },
+        depositPayment: {
+          status: row.deposit_payment_status,
+          amount_cents: row.deposit_amount_cents,
+        },
+        now: normalizedNow,
+      });
+      if (!releaseCandidateIsSafe) {
+        skippedPayments += 1;
+        continue;
+      }
+
       if (!row?.stripe_account_id || !String(row.stripe_account_id).startsWith('acct_')) {
         skippedPayments += 1;
         continue;
@@ -9854,6 +10008,7 @@ async function releasePendingProviderPayouts({
               targetAmountCents: missingAmountCents,
               currency: group.currency,
               existingTransfers,
+              now: normalizedNow,
             });
 
             for (const allocation of allocations) {
@@ -17139,6 +17294,13 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
       return res.status(409).json({ error: 'Ya existe una propuesta de cierre activa.' });
     }
 
+    const depositPayment = await getPaymentRow(connection, bookingId, 'deposit');
+    const depositPaymentStatus = String(depositPayment?.status || '').trim().toLowerCase();
+    if (!depositPayment || depositPaymentStatus !== 'succeeded' || depositPayment.amount_cents === null || depositPayment.amount_cents === undefined) {
+      await connection.rollback();
+      return res.status(412).json({ error: 'Depósito no confirmado (requerido).' });
+    }
+
     const bookingCurrency = normalizeCurrencyCode(booking.service_currency_snapshot, 'EUR');
     const priceTypeSnapshot = String(booking.price_type_snapshot || '').trim().toLowerCase();
     const unitPriceAmount = booking.unit_price_amount_cents_snapshot == null
@@ -17203,7 +17365,18 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
         ...booking,
         id: bookingId,
       },
+      depositPayment,
       createdByUserId: req.user?.id || null,
+      proposedBaseAmountCents,
+      proposedFinalDurationMinutes,
+      zeroChargeMode,
+    });
+    const proposalFinancialSnapshot = buildClosureFinancialSnapshot({
+      booking: {
+        ...booking,
+        id: bookingId,
+      },
+      depositPayment,
       proposedBaseAmountCents,
       proposedFinalDurationMinutes,
       zeroChargeMode,
@@ -17226,6 +17399,7 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
       return res.status(200).json({
         message: 'Reserva completada automáticamente.',
         closure_proposal_id: proposalId,
+        closure_breakdown: serializeClosureFinancialSnapshot(proposalFinancialSnapshot),
         zero_charge_completed: true,
       });
     }
@@ -17244,6 +17418,7 @@ app.post('/api/bookings/:id/closure-proposal', authenticateToken, async (req, re
     return res.status(200).json({
       message: 'Propuesta de cierre enviada.',
       closure_proposal_id: proposalId,
+      closure_breakdown: serializeClosureFinancialSnapshot(proposalFinancialSnapshot),
     });
   } catch (error) {
     try { await connection.rollback(); } catch {}
@@ -19544,8 +19719,11 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
              cp.proposed_commission_amount_cents,
              cp.proposed_total_amount_cents,
              cp.proposed_final_duration_minutes,
+             cp.deposit_already_paid_amount_cents,
              cp.amount_due_from_client_cents,
              cp.amount_to_refund_cents,
+             cp.provider_payout_amount_cents,
+             cp.platform_amount_cents,
              cp.zero_charge_mode,
              cp.auto_charge_scheduled_at,
              cust.email AS customer_email, cust.stripe_customer_id AS customer_id, cust.currency AS customer_currency,
@@ -19664,6 +19842,24 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       if (!hasClosureProposal || booking.closure_status !== 'active') {
         await connection.rollback();
         return res.status(409).json({ error: 'La propuesta de cierre ya no está disponible.' });
+      }
+
+      const expectedClosureSnapshot = buildClosureFinancialSnapshot({
+        booking,
+        depositPayment,
+        proposedBaseAmountCents: booking.proposed_base_amount_cents ?? booking.estimated_base_amount_cents ?? 0,
+        proposedFinalDurationMinutes: booking.proposed_final_duration_minutes,
+        zeroChargeMode: booking.zero_charge_mode === true || booking.zero_charge_mode === 1,
+      });
+      const closureFinancialMismatch = buildClosureFinancialMismatch(booking, expectedClosureSnapshot);
+      if (closureFinancialMismatch) {
+        await connection.rollback();
+        return res.status(409).json({
+          error: 'Los importes del cierre han cambiado. Actualiza la reserva antes de aceptar y pagar.',
+          error_code: 'closure_amounts_outdated',
+          mismatch: closureFinancialMismatch,
+          closure_breakdown: serializeClosureFinancialSnapshot(expectedClosureSnapshot),
+        });
       }
 
       if (preflightSettlement.amountDueFromClientCents > 0) {

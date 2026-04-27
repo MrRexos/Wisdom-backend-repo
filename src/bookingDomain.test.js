@@ -8,6 +8,7 @@ const {
   MIN_BOOKING_DURATION_MINUTES,
   buildBookingSchedule,
   buildTransitionPatch,
+  canReleaseProviderPayout,
   canReportBookingIssue,
   canEditBooking,
   computeSettlementAmounts,
@@ -375,6 +376,52 @@ test("computeSettlementAmounts charges the delta when the final total exceeds th
       providerPayoutAmountCents: 1500,
       platformAmountCents: 150,
     }
+  );
+});
+
+test("canReleaseProviderPayout requires finished paid booking and succeeded payments", () => {
+  const now = "2026-04-27T10:00:00.000Z";
+  const booking = {
+    service_status: "finished",
+    settlement_status: "paid",
+  };
+  const payment = {
+    status: "succeeded",
+    provider_payout_status: "pending_release",
+    provider_payout_amount_cents: 9000,
+    provider_payout_eligible_at: "2026-04-27T09:59:00.000Z",
+  };
+  const depositPayment = {
+    status: "succeeded",
+  };
+
+  assert.equal(canReleaseProviderPayout({ booking, payment, depositPayment, now }), true);
+  assert.equal(
+    canReleaseProviderPayout({
+      booking: { ...booking, settlement_status: "awaiting_payment" },
+      payment,
+      depositPayment,
+      now,
+    }),
+    false
+  );
+  assert.equal(
+    canReleaseProviderPayout({
+      booking,
+      payment: { ...payment, status: "requires_payment_method" },
+      depositPayment,
+      now,
+    }),
+    false
+  );
+  assert.equal(
+    canReleaseProviderPayout({
+      booking,
+      payment: { ...payment, provider_payout_eligible_at: "2026-04-27T10:01:00.000Z" },
+      depositPayment,
+      now,
+    }),
+    false
   );
 });
 

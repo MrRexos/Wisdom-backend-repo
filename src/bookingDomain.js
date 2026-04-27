@@ -426,6 +426,25 @@ function computeSettlementAmounts({
   };
 }
 
+function canReleaseProviderPayout({
+  booking = {},
+  payment = {},
+  depositPayment = {},
+  now = new Date(),
+} = {}) {
+  const normalizedNow = parseDateInput(now) || new Date();
+  const payoutEligibleAt = parseDateInput(payment?.provider_payout_eligible_at);
+
+  return normalizeServiceStatus(booking?.service_status, "pending_deposit") === "finished"
+    && normalizeSettlementStatus(booking?.settlement_status, "none") === "paid"
+    && String(payment?.status || "").trim().toLowerCase() === "succeeded"
+    && String(depositPayment?.status || "").trim().toLowerCase() === "succeeded"
+    && String(payment?.provider_payout_status || "").trim().toLowerCase() === "pending_release"
+    && normalizeAmountCents(payment?.provider_payout_amount_cents) > 0
+    && payoutEligibleAt !== null
+    && payoutEligibleAt.getTime() <= normalizedNow.getTime();
+}
+
 function evaluateAutoChargeEligibility({
   priceType,
   estimatedTotalAmountCents,
@@ -913,6 +932,7 @@ module.exports = {
   getAcceptedBookingInactivityStage,
   canReportBookingIssue,
   computeSettlementAmounts,
+  canReleaseProviderPayout,
   evaluateAutoChargeEligibility,
   buildBookingSchedule,
   deriveLegacyBookingStatus,
