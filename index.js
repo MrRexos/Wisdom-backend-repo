@@ -679,6 +679,14 @@ const mapStatus = (piStatus) => {
 const stableKey = (parts) => parts.join(':');
 const MAX_OPEN_GENERAL_PROBLEM_ISSUES_PER_BOOKING = 5;
 const BOOKING_PAYMENT_TYPES = new Set(['deposit', 'final']);
+const SETTLEMENT_STATUSES_PROTECTED_FROM_AUTOMATIC_PAYMENT = new Set([
+  'manual_review_required',
+  'in_dispute',
+]);
+const SETTLEMENT_STATUSES_ELIGIBLE_FOR_FINAL_PAYMENT_REACTION = new Set([
+  'pending_client_approval',
+  'awaiting_payment',
+]);
 const PAYMENT_STATUSES_PROTECTED_FROM_SUCCESS_REGRESSION = new Set([
   'refund_pending',
   'partially_refunded',
@@ -696,6 +704,12 @@ const FINANCIAL_PAYMENT_STATUSES = new Set([
   'dispute_won',
   'dispute_lost',
 ]);
+
+function isSettlementStatusProtectedFromAutomaticPayment(value) {
+  return SETTLEMENT_STATUSES_PROTECTED_FROM_AUTOMATIC_PAYMENT.has(
+    normalizeSettlementStatus(value, 'none')
+  );
+}
 
 // Redondeos consistentes con frontend (BookingScreen)
 const round1 = (n) => {
@@ -4175,6 +4189,127 @@ function isSecondaryClientApprovalWindowActive(booking, now = new Date()) {
     && normalizedNow.getTime() >= initialDeadline.getTime();
 }
 
+async function applyFinalPaymentFailureReactionWindow(connection, booking, {
+  changedByUserId = null,
+  details = 'El cobro final no se ha podido completar automáticamente.',
+  followUpReasonCode = 'final_payment_failed_follow_up',
+  disputeReasonCode = 'final_payment_failed_dispute',
+} = {}) {
+  if (!booking?.id) {
+    return { handled: false, reason: 'booking_not_found' };
+  }
+
+  const normalizedSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+  if (isSettlementStatusProtectedFromAutomaticPayment(normalizedSettlementStatus)) {
+    return {
+      handled: false,
+      reason: 'protected_settlement_status',
+      settlementStatus: normalizedSettlementStatus,
+    };
+  }
+
+  if (!SETTLEMENT_STATUSES_ELIGIBLE_FOR_FINAL_PAYMENT_REACTION.has(normalizedSettlementStatus)) {
+    return {
+      handled: false,
+      reason: 'settlement_status_not_recoverable',
+      settlementStatus: normalizedSettlementStatus,
+    };
+  }
+
+  const providerUserId = booking.provider_user_id_snapshot || booking.effective_provider_user_id || null;
+  if (!isSecondaryClientApprovalWindowActive(booking)) {
+    await transitionBookingStateRecord(connection, booking, {
+      nextServiceStatus: booking.service_status,
+      nextSettlementStatus: 'pending_client_approval',
+      changedByUserId,
+      reasonCode: followUpReasonCode,
+      note: details,
+      extraPatch: {
+        client_approval_deadline_at: buildSecondaryClientApprovalDeadline(),
+      },
+    });
+
+    return {
+      handled: true,
+      action: 'follow_up_scheduled',
+      emailMode: 'approval_follow_up',
+      settlementStatus: 'pending_client_approval',
+    };
+  }
+
+  await upsertBookingIssueReport(connection, {
+    bookingId: booking.id,
+    reportedAgainstUserId: providerUserId,
+    issueType: 'payment_dispute',
+    status: 'open',
+    details,
+  });
+  await transitionBookingStateRecord(connection, booking, {
+    nextServiceStatus: booking.service_status,
+    nextSettlementStatus: 'in_dispute',
+    changedByUserId,
+    reasonCode: disputeReasonCode,
+    note: details,
+    extraPatch: {
+      client_approval_deadline_at: null,
+    },
+  });
+
+  return {
+    handled: true,
+    action: 'dispute_opened',
+    emailMode: 'manual_review_required',
+    settlementStatus: 'in_dispute',
+  };
+}
+
+async function scheduleFinalPaymentFailureReactionWindow(bookingId, options = {}) {
+  const normalizedBookingId = normalizeNullableInteger(bookingId);
+  if (!normalizedBookingId) {
+    return { handled: false, reason: 'invalid_booking_id' };
+  }
+
+  const connection = await pool.promise().getConnection();
+  try {
+    await connection.beginTransaction();
+    const booking = await getBookingSettlementContext(connection, normalizedBookingId, { forUpdate: true });
+    if (!booking) {
+      await connection.rollback();
+      return { handled: false, reason: 'booking_not_found' };
+    }
+
+    const result = await applyFinalPaymentFailureReactionWindow(connection, booking, options);
+    await connection.commit();
+    return result;
+  } catch (error) {
+    try { await connection.rollback(); } catch {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function sendFinalPaymentReactionEmailIfNeeded(bookingId, reaction, logContext = 'final payment reaction') {
+  if (!reaction?.emailMode) {
+    return false;
+  }
+
+  try {
+    await sendClosureAutoChargeNotificationEmail({
+      bookingId,
+      mode: reaction.emailMode,
+    });
+    return true;
+  } catch (emailError) {
+    console.error(`Error sending ${logContext} email:`, {
+      bookingId,
+      mode: reaction.emailMode,
+      error: emailError.message,
+    });
+    return false;
+  }
+}
+
 async function getLatestClosureProposal(connection, bookingId, { forUpdate = false } = {}) {
   const normalizedBookingId = normalizeNullableInteger(bookingId);
   if (!normalizedBookingId) {
@@ -5324,11 +5459,16 @@ async function flagBookingPaymentForManualReview(connection, bookingId, {
     details,
   });
 
+  const currentSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+  const safeNextSettlementStatus = isSettlementStatusProtectedFromAutomaticPayment(currentSettlementStatus)
+    ? currentSettlementStatus
+    : nextSettlementStatus;
+
   await transitionBookingStateRecord(connection, booking, {
     nextServiceStatus: normalizeServiceStatus(booking.service_status, 'pending_deposit') === 'finished'
       ? 'finished'
       : booking.service_status,
-    nextSettlementStatus,
+    nextSettlementStatus: safeNextSettlementStatus,
     changedByUserId,
     reasonCode,
     extraPatch: {
@@ -5728,7 +5868,8 @@ async function markRefundFailureForManualReview({
       await connection.query(
         `
         UPDATE payments
-        SET last_error_code = ?,
+        SET status = CASE WHEN status = 'refund_pending' THEN 'refund_failed' ELSE status END,
+            last_error_code = ?,
             last_error_message = ?
         WHERE payment_intent_id = ?
         `,
@@ -5808,6 +5949,59 @@ async function executeRefundRequestOrFlagForManualReview(refundRequest, metadata
     });
     return false;
   }
+}
+
+async function processPendingStripeRefundRetries({ limit = 50 } = {}) {
+  const normalizedLimit = Math.max(1, Math.min(100, Math.round(Number(limit || 50))));
+  const [rows] = await pool.promise().query(
+    `
+    SELECT
+      p.id AS payment_id,
+      p.booking_id,
+      p.payment_intent_id,
+      p.type
+    FROM payments p
+    INNER JOIN booking b ON b.id = p.booking_id
+    WHERE p.status = 'refund_pending'
+      AND p.payment_intent_id IS NOT NULL
+      AND b.settlement_status = 'refund_pending'
+    ORDER BY p.updated_at ASC, p.id ASC
+    LIMIT ?
+    `,
+    [normalizedLimit]
+  );
+
+  let attempted = 0;
+  let succeeded = 0;
+  let failed = 0;
+  for (const row of rows || []) {
+    attempted += 1;
+    const ok = await executeRefundRequestOrFlagForManualReview({
+      bookingId: row.booking_id,
+      paymentIntentId: row.payment_intent_id,
+      reasonCode: 'refund_pending_retry',
+    }, {
+      booking_id: String(row.booking_id),
+      payment_id: String(row.payment_id),
+      payment_type: String(row.type || ''),
+      source: 'refund_pending_retry',
+    }, {
+      failureReasonCode: 'refund_pending_retry_failed',
+      logMessage: 'Error retrying pending booking refund:',
+    });
+
+    if (ok) {
+      succeeded += 1;
+    } else {
+      failed += 1;
+    }
+  }
+
+  return {
+    attempted,
+    succeeded,
+    failed,
+  };
 }
 
 async function applySuccessfulDepositPaymentForBooking(connection, {
@@ -5999,6 +6193,16 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
       return { settled: false, reason: 'booking_not_found' };
     }
 
+    const currentSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
+    if (isSettlementStatusProtectedFromAutomaticPayment(currentSettlementStatus)) {
+      await initialConnection.rollback();
+      return {
+        settled: false,
+        reason: 'booking_protected_from_automatic_settlement',
+        settlementStatus: currentSettlementStatus,
+      };
+    }
+
     depositPayment = await getPaymentRow(initialConnection, normalizedBookingId, 'deposit');
     finalPayment = await getPaymentRow(initialConnection, normalizedBookingId, 'final');
     if (!depositPayment) {
@@ -6119,6 +6323,16 @@ async function finalizeBookingSettlementAfterSuccessfulPayment(bookingId, {
     if (!currentBooking) {
       await finalizeConnection.rollback();
       return { settled: false, reason: 'booking_not_found_after_processing' };
+    }
+
+    const currentSettlementStatus = normalizeSettlementStatus(currentBooking.settlement_status, 'none');
+    if (isSettlementStatusProtectedFromAutomaticPayment(currentSettlementStatus)) {
+      await finalizeConnection.rollback();
+      return {
+        settled: false,
+        reason: 'booking_protected_from_automatic_settlement',
+        settlementStatus: currentSettlementStatus,
+      };
     }
 
     await upsertPayment(finalizeConnection, {
@@ -6295,6 +6509,26 @@ async function resolvePaymentIntentIdFromStripeDispute(dispute) {
   }
 
   const chargeId = getStripeObjectId(dispute?.charge);
+  if (!chargeId) {
+    return null;
+  }
+
+  const charge = await stripe.charges.retrieve(chargeId);
+  return getStripeObjectId(charge?.payment_intent);
+}
+
+async function resolvePaymentIntentIdFromStripeRefund(refund) {
+  const directPaymentIntentId = getStripeObjectId(refund?.payment_intent);
+  if (directPaymentIntentId) {
+    return directPaymentIntentId;
+  }
+
+  const chargePaymentIntentId = getStripeObjectId(refund?.charge?.payment_intent);
+  if (chargePaymentIntentId) {
+    return chargePaymentIntentId;
+  }
+
+  const chargeId = getStripeObjectId(refund?.charge);
   if (!chargeId) {
     return null;
   }
@@ -10343,6 +10577,18 @@ cron.schedule('*/10 * * * *', async () => {
     }
   } catch (error) {
     console.error('Error en cron de autocobro de cierres:', error);
+  }
+});
+
+// cron cada 10 minutos para reintentar reembolsos pendientes que pudieron quedar encolados
+cron.schedule('*/10 * * * *', async () => {
+  try {
+    const result = await processPendingStripeRefundRetries({ limit: 50 });
+    if (result.attempted > 0) {
+      console.log('[CRON] Reintentos de reembolso pendientes', result);
+    }
+  } catch (error) {
+    console.error('Error en cron de reintentos de reembolso:', error);
   }
 });
 
@@ -19264,6 +19510,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
   let finalChosenCents;      // usado para cobrar
   let chargeCurrency = 'EUR';
   let depositPayment = null;
+  let preflightPaymentMethod = null;
 
   const connection = await pool.promise().getConnection();
   try {
@@ -19275,6 +19522,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       SELECT
              b.id,
              b.client_user_id AS user_id,
+             b.provider_user_id_snapshot,
              b.service_status,
              b.settlement_status,
              b.requested_duration_minutes AS service_duration,
@@ -19299,7 +19547,9 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
              cp.amount_due_from_client_cents,
              cp.amount_to_refund_cents,
              cp.zero_charge_mode,
+             cp.auto_charge_scheduled_at,
              cust.email AS customer_email, cust.stripe_customer_id AS customer_id, cust.currency AS customer_currency,
+             COALESCE(s.user_id, b.provider_user_id_snapshot) AS effective_provider_user_id,
              provider.stripe_account_id,
              p.price AS unit_price,
              COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
@@ -19405,11 +19655,112 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     let normalizedSettlementStatus = normalizeSettlementStatus(booking.settlement_status, 'none');
     const hasClosureProposal = booking.closure_proposal_id !== null && booking.closure_proposal_id !== undefined;
     const isLegacyFinishedFlow = normalizedServiceStatus === 'finished' && !hasClosureProposal;
+    const preflightSettlement = buildActualBookingSettlementSnapshot({
+      booking,
+      depositPayment,
+    });
 
     if (normalizedSettlementStatus === 'pending_client_approval') {
       if (!hasClosureProposal || booking.closure_status !== 'active') {
         await connection.rollback();
         return res.status(409).json({ error: 'La propuesta de cierre ya no está disponible.' });
+      }
+
+      if (preflightSettlement.amountDueFromClientCents > 0) {
+        if (!usablePaymentMethodId) {
+          const reaction = await applyFinalPaymentFailureReactionWindow(connection, booking, {
+            changedByUserId: req.user?.id || null,
+            details: 'El cliente ha intentado aceptar el cierre, pero no hay ningún método de pago final disponible.',
+            followUpReasonCode: 'final_payment_missing_method_follow_up',
+            disputeReasonCode: 'final_payment_missing_method_dispute',
+          });
+          await connection.commit();
+
+          if (reaction.emailMode) {
+            try {
+              await sendClosureAutoChargeNotificationEmail({
+                bookingId: id,
+                mode: reaction.emailMode,
+              });
+            } catch (emailError) {
+              console.error('Error sending final payment missing method follow-up email:', {
+                bookingId: id,
+                mode: reaction.emailMode,
+                error: emailError.message,
+              });
+            }
+          }
+
+          return res.status(reaction.action === 'dispute_opened' ? 409 : 202).json({
+            requiresPaymentMethod: reaction.action !== 'dispute_opened',
+            manualReviewRequired: reaction.action === 'dispute_opened',
+            followUpScheduled: reaction.action === 'follow_up_scheduled',
+            error: 'No hay método de pago disponible. Proporcione payment_method_id.',
+          });
+        }
+
+        try {
+          preflightPaymentMethod = await stripe.paymentMethods.retrieve(usablePaymentMethodId);
+          if (preflightPaymentMethod.customer && preflightPaymentMethod.customer !== customerId) {
+            const reaction = await applyFinalPaymentFailureReactionWindow(connection, booking, {
+              changedByUserId: req.user?.id || null,
+              details: 'El método de pago final pertenece a otro cliente de Stripe.',
+              followUpReasonCode: 'final_payment_invalid_method_follow_up',
+              disputeReasonCode: 'final_payment_invalid_method_dispute',
+            });
+            await connection.commit();
+
+            if (reaction.emailMode) {
+              try {
+                await sendClosureAutoChargeNotificationEmail({
+                  bookingId: id,
+                  mode: reaction.emailMode,
+                });
+              } catch (emailError) {
+                console.error('Error sending final payment invalid method follow-up email:', {
+                  bookingId: id,
+                  mode: reaction.emailMode,
+                  error: emailError.message,
+                });
+              }
+            }
+
+            return res.status(409).json({
+              error: 'payment_method_id pertenece a otro customer.',
+              followUpScheduled: reaction.action === 'follow_up_scheduled',
+              manualReviewRequired: reaction.action === 'dispute_opened',
+            });
+          }
+        } catch (paymentMethodError) {
+          const reaction = await applyFinalPaymentFailureReactionWindow(connection, booking, {
+            changedByUserId: req.user?.id || null,
+            details: `No se pudo verificar el método de pago final en Stripe: ${paymentMethodError.message}`,
+            followUpReasonCode: 'final_payment_invalid_method_follow_up',
+            disputeReasonCode: 'final_payment_invalid_method_dispute',
+          });
+          await connection.commit();
+
+          if (reaction.emailMode) {
+            try {
+              await sendClosureAutoChargeNotificationEmail({
+                bookingId: id,
+                mode: reaction.emailMode,
+              });
+            } catch (emailError) {
+              console.error('Error sending final payment method verification follow-up email:', {
+                bookingId: id,
+                mode: reaction.emailMode,
+                error: emailError.message,
+              });
+            }
+          }
+
+          return res.status(400).json({
+            error: 'No se pudo verificar el método de pago.',
+            followUpScheduled: reaction.action === 'follow_up_scheduled',
+            manualReviewRequired: reaction.action === 'dispute_opened',
+          });
+        }
       }
 
       await updateClosureProposalStatus(
@@ -19644,10 +19995,19 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
               return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
             }
             if (intent.status === 'requires_payment_method') {
+              const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
+                changedByUserId: req.user?.id || null,
+                details: 'El intento de pago final requiere un nuevo método de pago.',
+                followUpReasonCode: 'final_payment_requires_method_follow_up',
+                disputeReasonCode: 'final_payment_requires_method_dispute',
+              });
+              await sendFinalPaymentReactionEmailIfNeeded(id, reaction, 'final payment requires method');
               return res.status(202).json({
                 requiresPaymentMethod: true,
                 clientSecret: intent.client_secret,
                 paymentIntentId: intent.id,
+                followUpScheduled: reaction.action === 'follow_up_scheduled',
+                manualReviewRequired: reaction.action === 'dispute_opened',
               });
             }
             if (intent.status === 'processing') {
@@ -19661,10 +20021,19 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
 
         // Si ya existe un intent y está esperando método de pago, devuelve el clientSecret para confirmarlo en el cliente
         if (intent && status === 'requires_payment_method') {
+          const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
+            changedByUserId: req.user?.id || null,
+            details: 'El cobro final existente requiere un nuevo método de pago.',
+            followUpReasonCode: 'final_payment_requires_method_follow_up',
+            disputeReasonCode: 'final_payment_requires_method_dispute',
+          });
+          await sendFinalPaymentReactionEmailIfNeeded(id, reaction, 'existing final payment requires method');
           return res.status(202).json({
             requiresPaymentMethod: true,
             clientSecret: intent.client_secret,
             paymentIntentId: intent.id,
+            followUpScheduled: reaction.action === 'follow_up_scheduled',
+            manualReviewRequired: reaction.action === 'dispute_opened',
           });
         }
 
@@ -19758,7 +20127,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
     }
 
     // Recuperar y adjuntar si es necesario
-    let pm = await stripe.paymentMethods.retrieve(pmToUse);
+    let pm = preflightPaymentMethod || await stripe.paymentMethods.retrieve(pmToUse);
 
     if (pm.customer && pm.customer !== customerId) {
       return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
@@ -19936,10 +20305,19 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
           });
         }
         if (pi.status === 'requires_payment_method') {
+          const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
+            changedByUserId: req.user?.id || null,
+            details: paymentPersistence.lastErrorMessage || stripeError.message || 'El cobro final requiere un nuevo método de pago.',
+            followUpReasonCode: 'final_payment_failed_follow_up',
+            disputeReasonCode: 'final_payment_failed_dispute',
+          });
+          await sendFinalPaymentReactionEmailIfNeeded(id, reaction, 'final payment Stripe failure');
           return res.status(202).json({
             requiresPaymentMethod: true,
             clientSecret: pi.client_secret,
-            paymentIntentId: pi.id
+            paymentIntentId: pi.id,
+            followUpScheduled: reaction.action === 'follow_up_scheduled',
+            manualReviewRequired: reaction.action === 'dispute_opened',
           });
         }
       }
@@ -19951,7 +20329,19 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
         });
       }
 
-      return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
+      const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
+        changedByUserId: req.user?.id || null,
+        details: `No se pudo procesar el pago final en Stripe: ${stripeError.message}`,
+        followUpReasonCode: 'final_payment_failed_follow_up',
+        disputeReasonCode: 'final_payment_failed_dispute',
+      });
+      await sendFinalPaymentReactionEmailIfNeeded(id, reaction, 'final payment Stripe failure');
+
+      return res.status(400).json({
+        error: 'No se pudo procesar el pago final.',
+        followUpScheduled: reaction.action === 'follow_up_scheduled',
+        manualReviewRequired: reaction.action === 'dispute_opened',
+      });
     }
 
     const paymentPersistence = await resolvePaymentIntentPersistence(intent, {
@@ -20024,16 +20414,38 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       return res.status(202).json({ requiresAction: true, clientSecret: intent.client_secret, paymentIntentId: intent.id });
     }
     if (intent.status === 'requires_payment_method') {
+      const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
+        changedByUserId: req.user?.id || null,
+        details: paymentPersistence.lastErrorMessage || 'El pago final requiere un nuevo método de pago.',
+        followUpReasonCode: 'final_payment_requires_method_follow_up',
+        disputeReasonCode: 'final_payment_requires_method_dispute',
+      });
+      await sendFinalPaymentReactionEmailIfNeeded(id, reaction, 'final payment requires method');
       return res.status(202).json({
         requiresPaymentMethod: true,
         clientSecret: intent.client_secret,
         paymentIntentId: intent.id,
+        followUpScheduled: reaction.action === 'follow_up_scheduled',
+        manualReviewRequired: reaction.action === 'dispute_opened',
       });
     }
     if (intent.status === 'processing') {
       return res.status(202).json({ processing: true, paymentIntentId: intent.id });
     }
-    return res.status(402).json({ error: 'El pago no se pudo completar', paymentIntentId: intent.id, status: intent.status });
+    const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
+      changedByUserId: req.user?.id || null,
+      details: `El pago final quedó en estado ${intent.status}.`,
+      followUpReasonCode: 'final_payment_failed_follow_up',
+      disputeReasonCode: 'final_payment_failed_dispute',
+    });
+    await sendFinalPaymentReactionEmailIfNeeded(id, reaction, 'final payment incomplete');
+    return res.status(402).json({
+      error: 'El pago no se pudo completar',
+      paymentIntentId: intent.id,
+      status: intent.status,
+      followUpScheduled: reaction.action === 'follow_up_scheduled',
+      manualReviewRequired: reaction.action === 'dispute_opened',
+    });
   } catch (err) {
     try { await connection.rollback(); } catch { }
     console.error('Error en pago final de reserva:', {
@@ -20044,7 +20456,24 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, async (r
       stripeError: err.type || err.code || null,
       stripeMessage: err.decline_code || err.param || null,
     });
-    return res.status(400).json({ error: 'No se pudo procesar el pago final.' });
+    const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
+      changedByUserId: req.user?.id || null,
+      details: `No se pudo procesar el pago final: ${err.message}`,
+      followUpReasonCode: 'final_payment_failed_follow_up',
+      disputeReasonCode: 'final_payment_failed_dispute',
+    }).catch((reactionError) => {
+      console.error('Error scheduling final payment follow-up after route failure:', {
+        bookingId: id,
+        error: reactionError.message,
+      });
+      return null;
+    });
+    await sendFinalPaymentReactionEmailIfNeeded(id, reaction, 'final payment route failure');
+    return res.status(400).json({
+      error: 'No se pudo procesar el pago final.',
+      followUpScheduled: reaction?.action === 'follow_up_scheduled',
+      manualReviewRequired: reaction?.action === 'dispute_opened',
+    });
   } finally {
     connection.release(); // release solo en finally
   }
@@ -22194,43 +22623,16 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
             const paymentFailureDetails = event.type === 'payment_intent.canceled'
               ? 'El cobro final se ha cancelado automáticamente.'
               : 'El cobro final ha fallado automáticamente.';
-            const isPendingClientApproval = normalizeSettlementStatus(
-              bookingRow.settlement_status,
-              'none'
-            ) === 'pending_client_approval';
-
-            if (isPendingClientApproval && !isSecondaryClientApprovalWindowActive(bookingRow)) {
-              await transitionBookingStateRecord(connection, bookingRow, {
-                nextServiceStatus: bookingRow.service_status,
-                nextSettlementStatus: 'pending_client_approval',
-                reasonCode: event.type === 'payment_intent.canceled'
-                  ? 'final_payment_canceled_follow_up_webhook'
-                  : 'final_payment_failed_follow_up_webhook',
-                extraPatch: {
-                  client_approval_deadline_at: buildSecondaryClientApprovalDeadline(),
-                },
-              });
-              closureFollowUpEmailMode = 'approval_follow_up';
-            } else if (isPendingClientApproval) {
-              await upsertBookingIssueReport(connection, {
-                bookingId,
-                reportedAgainstUserId: bookingRow.provider_user_id_snapshot || bookingRow.effective_provider_user_id || null,
-                issueType: 'payment_dispute',
-                status: 'open',
-                details: paymentFailureDetails,
-              });
-              await transitionBookingStateRecord(connection, bookingRow, {
-                nextServiceStatus: bookingRow.service_status,
-                nextSettlementStatus: 'in_dispute',
-                reasonCode: event.type === 'payment_intent.canceled'
-                  ? 'final_payment_canceled_webhook'
-                  : 'final_payment_failed_webhook',
-                extraPatch: {
-                  client_approval_deadline_at: null,
-                },
-              });
-              closureFollowUpEmailMode = 'manual_review_required';
-            }
+            const reaction = await applyFinalPaymentFailureReactionWindow(connection, bookingRow, {
+              details: paymentFailureDetails,
+              followUpReasonCode: event.type === 'payment_intent.canceled'
+                ? 'final_payment_canceled_follow_up_webhook'
+                : 'final_payment_failed_follow_up_webhook',
+              disputeReasonCode: event.type === 'payment_intent.canceled'
+                ? 'final_payment_canceled_webhook'
+                : 'final_payment_failed_webhook',
+            });
+            closureFollowUpEmailMode = reaction.emailMode || null;
           }
         }
         if (event.type === 'payment_intent.canceled' && type === 'final') {
@@ -22296,6 +22698,36 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
             console.error('Error sending deposit notification email:', mailErr);
           }
         }
+        break;
+      }
+
+      case 'refund.failed':
+      case 'refund.updated': {
+        const refund = event.data.object;
+        const refundStatus = String(refund?.status || '').trim().toLowerCase();
+        if (event.type === 'refund.updated' && refundStatus !== 'failed') {
+          break;
+        }
+
+        const piId = await resolvePaymentIntentIdFromStripeRefund(refund);
+        if (!piId) break;
+
+        const [[payment]] = await connection.query(
+          'SELECT booking_id FROM payments WHERE payment_intent_id = ? LIMIT 1',
+          [piId]
+        );
+        if (!payment?.booking_id) break;
+
+        await markRefundFailureForManualReview({
+          bookingId: payment.booking_id,
+          paymentIntentId: piId,
+          reasonCode: 'stripe_refund_failed_webhook',
+          source: event.type,
+          error: {
+            code: refund?.failure_reason || refundStatus || 'refund_failed',
+            message: `Stripe notificó un reembolso fallido (${getStripeObjectId(refund) || 'sin id'}). Motivo: ${refund?.failure_reason || refundStatus || 'desconocido'}.`,
+          },
+        });
         break;
       }
 
