@@ -51,6 +51,7 @@ const {
   buildTransitionPatch,
   computeSettlementAmounts,
   canReleaseProviderPayout,
+  isFirstWednesdayMorningPayoutWindow,
   evaluateAutoChargeEligibility,
   isWithinLastMinuteWindow,
   getAcceptedBookingInactivityStage,
@@ -692,6 +693,79 @@ function buildInternalRequestId(prefix, parts = []) {
 
 function buildRefundRequestId(parts = []) {
   return buildInternalRequestId('rr', parts);
+}
+
+const PUBLIC_PAYMENT_METHOD_PREFIX = 'payment_method_';
+const STRIPE_PAYMENT_METHOD_ID_REGEX = /\bpm_[A-Za-z0-9_]+\b/g;
+
+function buildPublicPaymentMethodReference(recordId) {
+  const normalizedRecordId = normalizeNullableInteger(recordId);
+  return normalizedRecordId ? `${PUBLIC_PAYMENT_METHOD_PREFIX}${normalizedRecordId}` : null;
+}
+
+function parsePublicPaymentMethodReference(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmedValue = value.trim();
+  if (!trimmedValue.startsWith(PUBLIC_PAYMENT_METHOD_PREFIX)) {
+    return null;
+  }
+
+  const rawRecordId = trimmedValue.slice(PUBLIC_PAYMENT_METHOD_PREFIX.length);
+  if (!/^\d+$/.test(rawRecordId)) {
+    return null;
+  }
+
+  return normalizeNullableInteger(rawRecordId);
+}
+
+function redactStripePaymentMethodIds(value) {
+  if (typeof value === 'string') {
+    return value.replace(STRIPE_PAYMENT_METHOD_ID_REGEX, '[stripe_payment_method_redacted]');
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactStripePaymentMethodIds(item));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entryValue]) => [
+        key,
+        redactStripePaymentMethodIds(entryValue),
+      ])
+    );
+  }
+
+  return value;
+}
+
+function safeStripeErrorForLog(error) {
+  if (!error || typeof error !== 'object') {
+    return redactStripePaymentMethodIds(String(error || 'unknown_error'));
+  }
+
+  return {
+    type: error.type || null,
+    code: error.code || null,
+    declineCode: error.decline_code || null,
+    param: error.param || null,
+    requestId: error.requestId || error.request_id || null,
+    statusCode: error.statusCode || error.status || null,
+  };
+}
+
+function publicPaymentMethodReferenceForLog(value) {
+  const storedReferenceId = parsePublicPaymentMethodReference(value);
+  if (storedReferenceId) {
+    return buildPublicPaymentMethodReference(storedReferenceId);
+  }
+
+  return typeof value === 'string' && value.trim().startsWith('pm_')
+    ? '[new_stripe_payment_method]'
+    : null;
 }
 
 function normalizeRefundRequestId(value) {
@@ -2081,10 +2155,10 @@ function mapStoredPaymentMethodForApi(row = {}) {
 
   const parsedExpiry = parseStoredCardExpiry(row.expiry_date);
   const last4 = row.card_number ? String(row.card_number).slice(-4) : null;
+  const recordId = normalizeNullableInteger(row.selected_customer_payment_method_id ?? row.id);
 
   return {
-    record_id: normalizeNullableInteger(row.selected_customer_payment_method_id ?? row.id),
-    id: stripePaymentMethodId,
+    id: buildPublicPaymentMethodReference(recordId),
     last4,
     brand: typeof row.brand === 'string' && row.brand.trim().length > 0 ? row.brand.trim() : null,
     expiryMonth: parsedExpiry.month,
@@ -2111,7 +2185,7 @@ function mapBookingPaymentSummaryForApi(row = null, fallbackCurrency = 'EUR') {
     status: row.status || null,
     currency: summaryCurrency,
     amount,
-    payment_method_id: row.payment_method_id || null,
+    payment_method_id: null,
     last4: row.payment_method_last4 || null,
     brand: typeof row.payment_method_brand === 'string' && row.payment_method_brand.trim().length > 0
       ? row.payment_method_brand.trim()
@@ -2577,6 +2651,14 @@ function assertBookingStatusUpdateAllowed({
     };
   }
 
+  if (['canceled', 'expired', 'finished'].includes(normalizedCurrentServiceStatus)) {
+    throwValidationError('La reserva ya está cerrada y no puede cambiar de estado desde este endpoint.');
+  }
+
+  if (['pending_deposit', 'requested'].includes(normalizedNextServiceStatus)) {
+    throwValidationError('No se puede retroceder el estado de la reserva desde este endpoint.');
+  }
+
   switch (normalizedNextServiceStatus) {
     case 'accepted':
       if (!isProviderOwner) {
@@ -2607,6 +2689,9 @@ function assertBookingStatusUpdateAllowed({
     case 'canceled':
       if (!isClientOwner && !isProviderOwner) {
         throwValidationError('No autorizado para cancelar la reserva.');
+      }
+      if (!['requested', 'accepted', 'in_progress'].includes(normalizedCurrentServiceStatus)) {
+        throwValidationError('La reserva no se puede cancelar desde este estado.');
       }
       if (
         normalizedCancellationReasonCode === 'rejected'
@@ -4773,6 +4858,71 @@ async function getStoredCustomerPaymentMethodByStripeId(conn, userId, stripePaym
   return rows[0] || null;
 }
 
+async function getStoredCustomerPaymentMethodByPublicReference(conn, userId, paymentMethodReference, { forUpdate = false } = {}) {
+  const normalizedUserId = normalizeNullableInteger(userId);
+  const paymentMethodRecordId = parsePublicPaymentMethodReference(paymentMethodReference);
+
+  if (!normalizedUserId || !paymentMethodRecordId) {
+    return null;
+  }
+
+  const [rows] = await conn.query(
+    `
+    SELECT
+      id,
+      user_id,
+      payment_type AS customer_payment_method_stripe_id,
+      provider,
+      brand,
+      card_number,
+      expiry_date,
+      is_safed,
+      is_default
+    FROM payment_method
+    WHERE id = ?
+      AND user_id = ?
+      AND payment_type IS NOT NULL
+      AND payment_type LIKE 'pm_%'
+    LIMIT 1
+    ${forUpdate ? 'FOR UPDATE' : ''}
+    `,
+    [paymentMethodRecordId, normalizedUserId]
+  );
+
+  return rows[0] || null;
+}
+
+async function resolveCustomerPaymentMethodInput(conn, userId, paymentMethodInput, { forUpdate = false } = {}) {
+  const normalizedInput = typeof paymentMethodInput === 'string' ? paymentMethodInput.trim() : '';
+  if (!normalizedInput) {
+    return null;
+  }
+
+  const storedPaymentMethod = await getStoredCustomerPaymentMethodByPublicReference(
+    conn,
+    userId,
+    normalizedInput,
+    { forUpdate }
+  );
+  if (storedPaymentMethod?.customer_payment_method_stripe_id) {
+    return {
+      stripePaymentMethodId: storedPaymentMethod.customer_payment_method_stripe_id,
+      storedPaymentMethod,
+      publicReference: buildPublicPaymentMethodReference(storedPaymentMethod.id),
+    };
+  }
+
+  if (normalizedInput.startsWith('pm_')) {
+    return {
+      stripePaymentMethodId: normalizedInput,
+      storedPaymentMethod: null,
+      publicReference: null,
+    };
+  }
+
+  return null;
+}
+
 async function upsertStoredCustomerPaymentMethod(conn, {
   userId,
   stripePaymentMethodId,
@@ -5099,8 +5249,8 @@ async function releaseEphemeralBookingPaymentMethodsIfClosed(bookingId) {
 
       console.error('Error detaching ephemeral Stripe payment method:', {
         bookingId: normalizedBookingId,
-        paymentMethodId,
-        error: detachError.message,
+        paymentMethodRef: publicPaymentMethodReferenceForLog(paymentMethodId),
+        error: safeStripeErrorForLog(detachError),
       });
     }
   }
@@ -5204,7 +5354,7 @@ async function resolvePaymentIntentPersistence(intentLike, { paymentMethodFallba
       intent?.last_payment_error?.payment_method?.card?.last4 ||
       null,
     lastErrorCode: lastError?.code || lastError?.decline_code || null,
-    lastErrorMessage: lastError?.message || null,
+    lastErrorMessage: redactStripePaymentMethodIds(lastError?.message || null),
   };
 }
 
@@ -8416,9 +8566,11 @@ async function processPendingClosureAutoCharge(bookingId) {
   } catch (error) {
     console.error('Error processing closure auto-charge:', {
       bookingId: normalizedBookingId,
-      error: error.message,
+      error: error?.type && String(error.type).startsWith('Stripe')
+        ? safeStripeErrorForLog(error)
+        : redactStripePaymentMethodIds(error.message),
     });
-    const failureDetails = `El cobro automático ha fallado: ${error.message}`;
+    const failureDetails = 'El cobro automático ha fallado con el método de pago guardado.';
     if (!isSecondaryReminderWindow) {
       try {
         await scheduleClosureFollowUpWindow({
@@ -10600,6 +10752,15 @@ async function releasePendingProviderPayouts({
   limit = 500,
 } = {}) {
   const normalizedNow = parseDateTimeInput(now) || new Date();
+  if (!isFirstWednesdayMorningPayoutWindow(normalizedNow)) {
+    return {
+      releasedPayments: 0,
+      releasedAmountCents: 0,
+      skippedPayments: 0,
+      deferredUntilNextPayoutWindow: true,
+    };
+  }
+
   const connection = await pool.promise().getConnection();
 
   try {
@@ -11520,7 +11681,7 @@ cron.schedule('*/10 * * * *', async () => {
   }
 });
 
-// cron semanal para liberar payouts acumulados el miércoles por la mañana tras 7 días de retención
+// cron semanal; la función solo libera fondos si es el primer miércoles por la mañana en Europe/Madrid
 cron.schedule('0 9 * * 3', async () => {
   try {
     const result = await releasePendingProviderPayouts();
@@ -16559,6 +16720,14 @@ app.post('/api/bookings', authenticateToken, bookingCreateLimiter, async (req, r
       return res.status(404).json({ error: 'Servicio no encontrado.' });
     }
 
+    if (Number(requestedUserId) === Number(serviceSnapshot.provider_user_id_snapshot)) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'No puedes reservar tu propio servicio.',
+        error_code: 'self_booking_not_allowed',
+      });
+    }
+
     const availabilityError = getServiceBookingAvailabilityError(serviceSnapshot);
     if (availabilityError) {
       await connection.rollback();
@@ -17728,6 +17897,14 @@ app.patch('/api/bookings/:id/update-data', authenticateToken, async (req, res) =
     if (requestsManualSettlementMutation && !isStaff) {
       await connection.rollback();
       return res.status(403).json({ error: 'Solo soporte puede modificar el estado de pago manualmente.' });
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'address_id') && !isStaff) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'La dirección solo puede modificarse mediante la solicitud formal de modificación.',
+        error_code: 'booking_address_change_request_required',
+      });
     }
 
     const extraPatch = {};
@@ -20025,7 +20202,7 @@ app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimi
       bookingId,
       paymentIntentId,
       type,
-      error: stripeError.message,
+      error: safeStripeErrorForLog(stripeError),
     });
     return res.status(400).json({ error: 'No se pudo verificar el pago en Stripe.' });
   }
@@ -20038,7 +20215,7 @@ app.post('/api/bookings/:id/payment-sync', authenticateToken, bookingPaymentLimi
       bookingId,
       paymentIntentId,
       type,
-      error: persistenceError.message,
+      error: redactStripePaymentMethodIds(persistenceError.message),
     });
     return res.status(400).json({ error: 'No se pudo leer el estado del pago en Stripe.' });
   }
@@ -20296,7 +20473,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
     userId: req.user?.id,
     userRole: req.user?.role,
     timestamp: new Date().toISOString(),
-    paymentMethodId: payment_method_id || null,
+    paymentMethodRef: publicPaymentMethodReferenceForLog(payment_method_id),
     savePaymentMethod: requestedSavePaymentMethod,
   });
 
@@ -20305,6 +20482,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
   let commissionCents;
   let chargeCurrency = 'EUR';
   let depositSuccessResult = null;
+  let resolvedPaymentMethodId = null;
 
   const connection = await pool.promise().getConnection();
   try {
@@ -20315,6 +20493,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
       SELECT
              b.id,
              b.client_user_id AS user_id,
+             b.provider_user_id_snapshot,
              b.service_status,
              b.settlement_status,
              b.requested_duration_minutes AS service_duration,
@@ -20330,6 +20509,7 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
              cp.proposed_commission_amount_cents,
              cp.proposed_total_amount_cents,
              s.id AS service_id,
+             s.user_id AS effective_provider_user_id,
              p.price AS unit_price,
              COALESCE(p.price_type, b.price_type_snapshot) AS price_type,
              COALESCE(p.currency, b.service_currency_snapshot) AS service_currency,
@@ -20394,6 +20574,13 @@ app.post('/api/bookings/:id/deposit', authenticateToken, bookingPaymentLimiter, 
       await connection.rollback();
       return res.status(403).json({ error: 'No autorizado' });
     }
+    if (Number(booking.user_id) === Number(booking.provider_user_id_snapshot || booking.effective_provider_user_id)) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'No puedes reservar tu propio servicio.',
+        error_code: 'self_booking_not_allowed',
+      });
+    }
 
     const normalizedDepositServiceStatus = normalizeServiceStatus(booking.service_status, 'pending_deposit');
     if (normalizedDepositServiceStatus !== 'pending_deposit') {
@@ -20432,6 +20619,17 @@ const round2 = (n) => {
       userId: booking.user_id,
       email: booking.customer_email,
     });
+    const paymentMethodResolution = await resolveCustomerPaymentMethodInput(
+      connection,
+      booking.user_id,
+      payment_method_id,
+      { forUpdate: true }
+    );
+    resolvedPaymentMethodId = paymentMethodResolution?.stripePaymentMethodId || null;
+    if (payment_method_id && !resolvedPaymentMethodId) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Método de pago inválido.' });
+    }
 
     const existingDepositPayment = await getPaymentRow(connection, id, 'deposit');
     assertPaymentCurrencyMatchesBooking(existingDepositPayment, bookingCurrency, {
@@ -20575,21 +20773,21 @@ const round2 = (n) => {
         }
       }
 
-      if (['requires_payment_method', 'requires_confirmation'].includes(intent.status) && payment_method_id) {
-        pm = await stripe.paymentMethods.retrieve(payment_method_id);
+      if (['requires_payment_method', 'requires_confirmation'].includes(intent.status) && resolvedPaymentMethodId) {
+        pm = await stripe.paymentMethods.retrieve(resolvedPaymentMethodId);
         if (pm.customer && pm.customer !== customerId) {
           return res.status(409).json({ error: 'payment_method_id pertenece a otro customer.' });
         }
         if (!pm.customer) {
           try {
-            pm = await stripe.paymentMethods.attach(payment_method_id, { customer: customerId });
+            pm = await stripe.paymentMethods.attach(resolvedPaymentMethodId, { customer: customerId });
           } catch (eAttach) {
-            console.error('No se pudo adjuntar el PM al customer (depósito):', eAttach);
+            console.error('No se pudo adjuntar el PM al customer (depósito):', safeStripeErrorForLog(eAttach));
             return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
           }
         }
         await stripe.paymentIntents.update(intent.id, {
-          payment_method: payment_method_id,
+          payment_method: resolvedPaymentMethodId,
           setup_future_usage: 'off_session',
           metadata: buildBookingPaymentIntentMetadata({
             bookingId: id,
@@ -20600,7 +20798,7 @@ const round2 = (n) => {
         confirmIdemKey = buildBookingPaymentIntentConfirmIdempotencyKey({
           paymentId: payment.id,
           paymentIntentId: intent.id,
-          paymentMethodId: payment_method_id,
+          paymentMethodId: resolvedPaymentMethodId,
         });
         intent = await stripe.paymentIntents.confirm(
           intent.id,
@@ -20628,14 +20826,7 @@ const round2 = (n) => {
       console.error('Error de Stripe al crear/recuperar PaymentIntent:', {
         bookingId: id,
         userId: req.user?.id,
-        stripeError: {
-          type: stripeError.type,
-          code: stripeError.code,
-          message: stripeError.message,
-          declineCode: stripeError.decline_code,
-          param: stripeError.param,
-          requestId: stripeError.requestId
-        },
+        stripeError: safeStripeErrorForLog(stripeError),
         paymentData: {
           amountCents: commissionCents,
           customerId,
@@ -20666,7 +20857,7 @@ const round2 = (n) => {
             status: mapStatus(persistedPi.status),
             currency: chargeCurrency,
             transferGroup,
-            paymentMethodId: paymentPersistence.paymentMethodId || payment_method_id || null,
+            paymentMethodId: paymentPersistence.paymentMethodId || resolvedPaymentMethodId || null,
             paymentMethodLast4: paymentPersistence.paymentMethodLast4 || null,
             lastErrorCode: paymentPersistence.lastErrorCode,
             lastErrorMessage: paymentPersistence.lastErrorMessage,
@@ -20723,7 +20914,7 @@ const round2 = (n) => {
         status: mapStatus(intent.status),
         currency: chargeCurrency,
         transferGroup,
-        paymentMethodId: paymentPersistence.paymentMethodId || payment_method_id || null,
+        paymentMethodId: paymentPersistence.paymentMethodId || resolvedPaymentMethodId || null,
         paymentMethodLast4: paymentPersistence.paymentMethodLast4,
         lastErrorCode: paymentPersistence.lastErrorCode,
         lastErrorMessage: paymentPersistence.lastErrorMessage,
@@ -20832,14 +21023,12 @@ const round2 = (n) => {
   } catch (err) {
     try { await connection.rollback(); } catch { }
 
-    // Log detallado del error para debugging
     console.error('Error en depósito de reserva:', {
       bookingId: id,
       userId: req.user?.id,
-      error: err.message,
-      stack: err.stack,
-      stripeError: err.type || err.code || null,
-      stripeMessage: err.decline_code || err.param || null
+      error: err?.type && String(err.type).startsWith('Stripe')
+        ? safeStripeErrorForLog(err)
+        : redactStripePaymentMethodIds(err.message),
     });
 
     if (err?.financialIntegrity) {
@@ -20849,23 +21038,16 @@ const round2 = (n) => {
       });
     }
 
-    // Si es un error de Stripe, devolver más detalles
     if (err.type && err.type.startsWith('Stripe')) {
       return res.status(400).json({
-        error: 'Error de Stripe en el depósito',
-        details: {
-          type: err.type,
-          code: err.code,
-          message: err.message,
-          declineCode: err.decline_code,
-          param: err.param
-        }
+        error: 'No se pudo procesar el depósito con el método de pago indicado.',
+        error_code: err.code || 'stripe_deposit_failed',
       });
     }
 
     return res.status(400).json({
       error: 'No se pudo crear el depósito.',
-      details: err.message
+      details: redactStripePaymentMethodIds(err.message)
     });
   } finally {
     connection.release(); // release solo en finally (evita doble release)
@@ -20885,7 +21067,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
     userId: req.user?.id,
     userRole: req.user?.role,
     timestamp: new Date().toISOString(),
-    paymentMethodId: payment_method_id || null,
+    paymentMethodRef: publicPaymentMethodReferenceForLog(payment_method_id),
     savePaymentMethod: requestedSavePaymentMethod,
   });
 
@@ -20901,6 +21083,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
   let chargeCurrency = 'EUR';
   let depositPayment = null;
   let preflightPaymentMethod = null;
+  let resolvedPaymentMethodId = null;
 
   const connection = await pool.promise().getConnection();
   try {
@@ -21007,6 +21190,13 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       await connection.rollback();
       return res.status(403).json({ error: 'No autorizado' });
     }
+    if (Number(booking.user_id) === Number(booking.provider_user_id_snapshot || booking.effective_provider_user_id)) {
+      await connection.rollback();
+      return res.status(409).json({
+        error: 'No puedes reservar tu propio servicio.',
+        error_code: 'self_booking_not_allowed',
+      });
+    }
     console.log('Información de reserva obtenida (pago final):', {
       bookingId: id,
       userId: booking.user_id,
@@ -21023,7 +21213,18 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       userId: booking.user_id,
       email: booking.customer_email,
     }));
-    const usablePaymentMethodId = payment_method_id || await getBookingSelectedStripePaymentMethodId(connection, id, { forUpdate: true });
+    const paymentMethodResolution = await resolveCustomerPaymentMethodInput(
+      connection,
+      booking.user_id,
+      payment_method_id,
+      { forUpdate: true }
+    );
+    resolvedPaymentMethodId = paymentMethodResolution?.stripePaymentMethodId || null;
+    if (payment_method_id && !resolvedPaymentMethodId) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Método de pago inválido.' });
+    }
+    const usablePaymentMethodId = resolvedPaymentMethodId || await getBookingSelectedStripePaymentMethodId(connection, id, { forUpdate: true });
 
     // Verificar depósito succeeded
     const [dep] = await connection.query(
@@ -21375,7 +21576,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
               try {
                 pm2 = await stripe.paymentMethods.attach(pmId, { customer: customerId });
               } catch (e1) {
-                console.error('No se pudo adjuntar el PM al customer:', e1);
+                console.error('No se pudo adjuntar el PM al customer:', safeStripeErrorForLog(e1));
                 return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
               }
             }
@@ -21477,7 +21678,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
               return res.status(202).json({ processing: true, paymentIntentId: intent.id });
             }
           } catch (e1) {
-            console.error('Error al adjuntar/confirmar PM en intent existente:', e1);
+            console.error('Error al adjuntar/confirmar PM en intent existente:', safeStripeErrorForLog(e1));
             // Continúa con el manejo estándar según estado actual
           }
         }
@@ -21532,7 +21733,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
         // Fallback: si llega aquí, informar del estado actual
         return res.status(409).json({ error: 'Ya existe un cobro final en curso o realizado.', status, paymentIntentId: row.payment_intent_id });
       } catch (e) {
-        console.error('Error recuperando PaymentIntent existente:', e);
+        console.error('Error recuperando PaymentIntent existente:', safeStripeErrorForLog(e));
         return res.status(409).json({ error: 'Cobro final existente no recuperable', status: row.status, paymentIntentId: row.payment_intent_id });
       }
     }
@@ -21600,7 +21801,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       try {
         pm = await stripe.paymentMethods.attach(pmToUse, { customer: customerId });
       } catch (e) {
-        console.error('No se pudo adjuntar el PM al customer:', e);
+        console.error('No se pudo adjuntar el PM al customer:', safeStripeErrorForLog(e));
         return res.status(400).json({ error: 'No se pudo adjuntar el método de pago al cliente.' });
       }
     }
@@ -21698,14 +21899,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
       console.error('Error de Stripe al crear/recuperar PaymentIntent (pago final):', {
         bookingId: id,
         userId: req.user?.id,
-        stripeError: {
-          type: stripeError.type,
-          code: stripeError.code,
-          message: stripeError.message,
-          declineCode: stripeError.decline_code,
-          param: stripeError.param,
-          requestId: stripeError.requestId,
-        },
+        stripeError: safeStripeErrorForLog(stripeError),
         paymentData: {
           amountCents: amountToCharge,
           customerId,
@@ -21770,7 +21964,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
         if (pi.status === 'requires_payment_method') {
           const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
             changedByUserId: req.user?.id || null,
-            details: paymentPersistence.lastErrorMessage || stripeError.message || 'El cobro final requiere un nuevo método de pago.',
+            details: paymentPersistence.lastErrorMessage || 'El cobro final requiere un nuevo método de pago.',
             followUpReasonCode: 'final_payment_failed_follow_up',
             disputeReasonCode: 'final_payment_failed_dispute',
           });
@@ -21794,7 +21988,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
 
       const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
         changedByUserId: req.user?.id || null,
-        details: `No se pudo procesar el pago final en Stripe: ${stripeError.message}`,
+        details: 'No se pudo procesar el pago final con el método de pago indicado.',
         followUpReasonCode: 'final_payment_failed_follow_up',
         disputeReasonCode: 'final_payment_failed_dispute',
       });
@@ -21914,10 +22108,9 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
     console.error('Error en pago final de reserva:', {
       bookingId: id,
       userId: req.user?.id,
-      error: err.message,
-      stack: err.stack,
-      stripeError: err.type || err.code || null,
-      stripeMessage: err.decline_code || err.param || null,
+      error: err?.type && String(err.type).startsWith('Stripe')
+        ? safeStripeErrorForLog(err)
+        : redactStripePaymentMethodIds(err.message),
     });
     if (err?.financialIntegrity) {
       return res.status(err.statusCode || 409).json({
@@ -21927,7 +22120,7 @@ app.post('/api/bookings/:id/final-payment-transfer', authenticateToken, bookingP
     }
     const reaction = await scheduleFinalPaymentFailureReactionWindow(id, {
       changedByUserId: req.user?.id || null,
-      details: `No se pudo procesar el pago final: ${err.message}`,
+      details: 'No se pudo procesar el pago final con el método de pago indicado.',
       followUpReasonCode: 'final_payment_failed_follow_up',
       disputeReasonCode: 'final_payment_failed_dispute',
     }).catch((reactionError) => {
@@ -23680,16 +23873,26 @@ app.post('/api/services/:id/reviews', authenticateToken, async (req, res) => {
   try {
     const reviewTrackingSupported = await reviewTableHasBookingIdColumn();
 
-    if (reviewTrackingSupported && normalizedBookingId) {
+    if (reviewTrackingSupported && !normalizedBookingId) {
+      return res.status(400).json({
+        error: 'booking_id es requerido para valorar un servicio.',
+        error_code: 'booking_id_required_for_review',
+      });
+    }
+
+    if (reviewTrackingSupported) {
       const [bookingRows] = await promisePool.query(
         `
         SELECT
-          id,
-          client_user_id,
-          service_id,
-          service_status,
-          settlement_status
+          booking.id,
+          booking.client_user_id,
+          booking.provider_user_id_snapshot,
+          s.user_id AS effective_provider_user_id,
+          booking.service_id,
+          booking.service_status,
+          booking.settlement_status
         FROM booking
+        LEFT JOIN service s ON s.id = booking.service_id
         WHERE id = ?
         LIMIT 1
         `,
@@ -23707,6 +23910,13 @@ app.post('/api/services/:id/reviews', authenticateToken, async (req, res) => {
 
       if (Number(booking.service_id) !== Number(serviceId)) {
         return res.status(400).json({ error: 'La reserva no corresponde a este servicio.' });
+      }
+
+      if (Number(booking.client_user_id) === Number(booking.provider_user_id_snapshot || booking.effective_provider_user_id)) {
+        return res.status(409).json({
+          error: 'No puedes valorar una reserva de tu propio servicio.',
+          error_code: 'self_booking_review_not_allowed',
+        });
       }
 
       if (

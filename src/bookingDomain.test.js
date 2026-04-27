@@ -24,6 +24,7 @@ const {
   deriveRequestedEndDateTime,
   deriveExpiresAt,
   hasRequestedStartDateTimePassed,
+  isFirstWednesdayMorningPayoutWindow,
   isDurationMinutesInRange,
   isWithinLastMinuteWindow,
   normalizeMinimumNoticeMinutes,
@@ -379,8 +380,8 @@ test("computeSettlementAmounts charges the delta when the final total exceeds th
   );
 });
 
-test("canReleaseProviderPayout requires finished paid booking and captured deposit", () => {
-  const now = "2026-04-27T10:00:00.000Z";
+test("canReleaseProviderPayout requires finished paid booking, captured deposit and the first Wednesday morning window", () => {
+  const now = "2026-04-01T07:00:00.000Z";
   const booking = {
     service_status: "finished",
     settlement_status: "paid",
@@ -389,7 +390,7 @@ test("canReleaseProviderPayout requires finished paid booking and captured depos
     status: "succeeded",
     provider_payout_status: "pending_release",
     provider_payout_amount_cents: 9000,
-    provider_payout_eligible_at: "2026-04-27T09:59:00.000Z",
+    provider_payout_eligible_at: "2026-04-01T06:59:00.000Z",
   };
   const depositPayment = {
     status: "succeeded",
@@ -435,12 +436,29 @@ test("canReleaseProviderPayout requires finished paid booking and captured depos
   assert.equal(
     canReleaseProviderPayout({
       booking,
-      payment: { ...payment, provider_payout_eligible_at: "2026-04-27T10:01:00.000Z" },
+      payment: { ...payment, provider_payout_eligible_at: "2026-04-01T07:01:00.000Z" },
       depositPayment,
       now,
     }),
     false
   );
+  assert.equal(
+    canReleaseProviderPayout({
+      booking,
+      payment,
+      depositPayment,
+      now: "2026-04-08T07:00:00.000Z",
+    }),
+    false
+  );
+});
+
+test("isFirstWednesdayMorningPayoutWindow only opens on the first Wednesday morning in Madrid", () => {
+  assert.equal(isFirstWednesdayMorningPayoutWindow("2026-04-01T07:00:00.000Z"), true);
+  assert.equal(isFirstWednesdayMorningPayoutWindow("2026-04-01T05:59:59.000Z"), false);
+  assert.equal(isFirstWednesdayMorningPayoutWindow("2026-04-01T10:00:00.000Z"), false);
+  assert.equal(isFirstWednesdayMorningPayoutWindow("2026-04-08T07:00:00.000Z"), false);
+  assert.equal(isFirstWednesdayMorningPayoutWindow("2026-04-02T07:00:00.000Z"), false);
 });
 
 test("evaluateAutoChargeEligibility blocks budget closures and allows small hourly adjustments", () => {

@@ -37,6 +37,9 @@ const ONE_DAY_MS = 24 * ONE_HOUR_MS;
 const THREE_DAYS_MS = 3 * ONE_DAY_MS;
 const ONE_WEEK_MS = 7 * ONE_DAY_MS;
 const AUTO_CHARGE_TOLERANCE_FACTOR = 1.2;
+const PROVIDER_PAYOUT_TIME_ZONE = "Europe/Madrid";
+const PROVIDER_PAYOUT_MORNING_START_HOUR = 8;
+const PROVIDER_PAYOUT_MORNING_END_HOUR = 12;
 const ACCEPTED_BOOKING_INACTIVITY_REMINDER_STAGES = Object.freeze([
   Object.freeze({
     key: "1h",
@@ -66,6 +69,64 @@ const LEGACY_CLOSURE_MUTATION_FIELDS = Object.freeze([
 
 function isValidDate(value) {
   return value instanceof Date && !Number.isNaN(value.getTime());
+}
+
+function getZonedDateTimeParts(value, timeZone = PROVIDER_PAYOUT_TIME_ZONE) {
+  const date = parseDateInput(value) || new Date();
+
+  try {
+    const formatter = new Intl.DateTimeFormat("en-GB", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    });
+    const parts = formatter.formatToParts(date).reduce((acc, part) => {
+      if (part.type !== "literal") {
+        acc[part.type] = part.value;
+      }
+      return acc;
+    }, {});
+
+    return {
+      year: Number(parts.year),
+      month: Number(parts.month),
+      day: Number(parts.day),
+      hour: Number(parts.hour) === 24 ? 0 : Number(parts.hour),
+      minute: Number(parts.minute),
+      second: Number(parts.second),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isFirstWednesdayMorningPayoutWindow(now = new Date(), {
+  timeZone = PROVIDER_PAYOUT_TIME_ZONE,
+  startHour = PROVIDER_PAYOUT_MORNING_START_HOUR,
+  endHour = PROVIDER_PAYOUT_MORNING_END_HOUR,
+} = {}) {
+  const parts = getZonedDateTimeParts(now, timeZone);
+  if (
+    !parts
+    || !Number.isInteger(parts.year)
+    || !Number.isInteger(parts.month)
+    || !Number.isInteger(parts.day)
+    || !Number.isInteger(parts.hour)
+  ) {
+    return false;
+  }
+
+  const dayOfWeek = new Date(Date.UTC(parts.year, parts.month - 1, parts.day)).getUTCDay();
+  return dayOfWeek === 3
+    && parts.day >= 1
+    && parts.day <= 7
+    && parts.hour >= startHour
+    && parts.hour < endHour;
 }
 
 function parseDateInput(value) {
@@ -443,7 +504,8 @@ function canReleaseProviderPayout({
     && String(payment?.provider_payout_status || "").trim().toLowerCase() === "pending_release"
     && normalizeAmountCents(payment?.provider_payout_amount_cents) > 0
     && payoutEligibleAt !== null
-    && payoutEligibleAt.getTime() <= normalizedNow.getTime();
+    && payoutEligibleAt.getTime() <= normalizedNow.getTime()
+    && isFirstWednesdayMorningPayoutWindow(normalizedNow);
 }
 
 function evaluateAutoChargeEligibility({
@@ -934,6 +996,7 @@ module.exports = {
   canReportBookingIssue,
   computeSettlementAmounts,
   canReleaseProviderPayout,
+  isFirstWednesdayMorningPayoutWindow,
   evaluateAutoChargeEligibility,
   buildBookingSchedule,
   deriveLegacyBookingStatus,
